@@ -1,0 +1,162 @@
+package vehicle
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/librescoot/update-service/internal/redis"
+)
+
+// Service represents the vehicle service client
+type Service struct {
+	redis           *redis.Client
+	vehicleHashKey  string
+	previousState   string
+	stateRestored   bool
+	rebootCheckChan chan struct{}
+	dryRun          bool
+}
+
+// New creates a new vehicle service client
+func New(redis *redis.Client, vehicleHashKey string, dryRun bool) *Service {
+	return &Service{
+		redis:           redis,
+		vehicleHashKey:  vehicleHashKey,
+		stateRestored:   true,
+		rebootCheckChan: make(chan struct{}),
+		dryRun:          dryRun,
+	}
+}
+
+// SetUpdatingState sets the vehicle state to "updating" and saves the previous state
+func (s *Service) SetUpdatingState() error {
+	// Get current state
+	currentState, err := s.redis.GetVehicleState(s.vehicleHashKey)
+	if err != nil {
+		return fmt.Errorf("failed to get current vehicle state: %w", err)
+	}
+
+	// Save current state
+	s.previousState = currentState
+	s.stateRestored = false
+
+	// Set state to "updating"
+	if err := s.redis.SetVehicleState(s.vehicleHashKey, "updating"); err != nil {
+		return fmt.Errorf("failed to set vehicle state to updating: %w", err)
+	}
+
+	return nil
+}
+
+// RestorePreviousState restores the vehicle state to the previous state
+func (s *Service) RestorePreviousState() error {
+	if s.stateRestored {
+		return nil
+	}
+
+	if err := s.redis.SetVehicleState(s.vehicleHashKey, s.previousState); err != nil {
+		return fmt.Errorf("failed to restore previous vehicle state: %w", err)
+	}
+
+	s.stateRestored = true
+	return nil
+}
+
+// GetCurrentState gets the current vehicle state
+func (s *Service) GetCurrentState() (string, error) {
+	return s.redis.GetVehicleState(s.vehicleHashKey)
+}
+
+// IsSafeForDbcUpdate checks if it's safe to update the DBC
+// DBC updates should not turn off the DBC, but should allow locking
+func (s *Service) IsSafeForDbcUpdate() (bool, error) {
+	// Get current state
+	_, err := s.redis.GetVehicleState(s.vehicleHashKey)
+	if err != nil {
+		return false, fmt.Errorf("failed to get current vehicle state: %w", err)
+	}
+
+	// DBC updates can be applied in any state
+	// The vehicle service will handle preventing DBC power-off during updates
+	return true, nil
+}
+
+// IsSafeForMdbReboot checks if it's safe to reboot the MDB
+// MDB should only be rebooted when the scooter is in stand-by mode
+func (s *Service) IsSafeForMdbReboot() (bool, error) {
+	// Get current state
+	currentState, err := s.redis.GetVehicleState(s.vehicleHashKey)
+	if err != nil {
+		return false, fmt.Errorf("failed to get current vehicle state: %w", err)
+	}
+
+	// MDB can only be rebooted in stand-by mode
+	return currentState == "stand-by", nil
+}
+
+// ScheduleMdbRebootCheck schedules a check for MDB reboot safety
+// It will periodically check if it's safe to reboot the MDB
+// and signal on the rebootCheckChan when it's safe
+func (s *Service) ScheduleMdbRebootCheck(interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				safe, err := s.IsSafeForMdbReboot()
+				if err != nil {
+					// Log error and continue
+					continue
+				}
+
+				if safe {
+					// Signal that it's safe to reboot
+					select {
+					case s.rebootCheckChan <- struct{}{}:
+						// Signal sent
+						return
+					default:
+						// Channel not ready, continue
+					}
+				}
+			}
+		}
+	}()
+}
+
+// WaitForSafeReboot waits for the MDB reboot check to signal that it's safe to reboot
+// It returns true if it's safe to reboot, false if the context is cancelled
+func (s *Service) WaitForSafeReboot() bool {
+	select {
+	case <-s.rebootCheckChan:
+		return true
+	}
+}
+
+// TriggerReboot triggers a reboot of the specified component
+func (s *Service) TriggerReboot(component string) error {
+	// For MDB, check if it's safe to reboot
+	if component == "mdb" {
+		safe, err := s.IsSafeForMdbReboot()
+		if err != nil {
+			return fmt.Errorf("failed to check if safe for MDB reboot: %w", err)
+		}
+
+		if !safe {
+			return fmt.Errorf("not safe to reboot MDB")
+		}
+	}
+
+	// Check if we're in dry-run mode
+	if s.dryRun {
+		// In dry-run mode, just log that we would reboot
+		return fmt.Errorf("DRY-RUN: Would reboot %s, but dry-run mode is enabled", component)
+	}
+
+	// TODO: Implement actual reboot logic
+	// This would involve sending the appropriate command to the vehicle service
+	// For now, just log the reboot
+	return nil
+}
