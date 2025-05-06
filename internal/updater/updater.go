@@ -405,24 +405,22 @@ func (u *Updater) isUpdateNeeded(component string, release Release) bool {
 		return true
 	}
 
-	// Extract the commit hash from the release tag name
-	// Tag format: nightly-20250506-9988af09cfbfb9cf19469c723e598d3b461bc7eb
+	// Extract the timestamp part from the release tag (format: nightly-20250506T214046)
 	parts := strings.Split(release.TagName, "-")
-	if len(parts) < 3 {
+	if len(parts) < 2 {
 		u.logger.Printf("Invalid release tag format: %s", release.TagName)
-		// If the tag format is invalid, assume an update is needed
 		return true
 	}
 
-	releaseCommit := parts[2]
+	// Convert to lowercase for comparison with Redis version_id
+	normalizedReleaseVersion := strings.ToLower(parts[1])
 	
-	// Compare the installed version with the release version
-	if currentVersion != releaseCommit {
-		u.logger.Printf("Update needed for %s: current=%s, release=%s", component, currentVersion, releaseCommit)
+	if currentVersion != normalizedReleaseVersion {
+		u.logger.Printf("Update needed for %s: current=%s, release=%s", component, currentVersion, normalizedReleaseVersion)
 		return true
 	}
 	
-	u.logger.Printf("No update needed for %s: current=%s, release=%s", component, currentVersion, releaseCommit)
+	u.logger.Printf("No update needed for %s: current=%s, release=%s", component, currentVersion, normalizedReleaseVersion)
 	return false
 }
 
