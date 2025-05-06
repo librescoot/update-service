@@ -24,6 +24,8 @@ type Updater struct {
 	githubAPI   *GitHubAPI
 	updateState map[string]string
 	stateMutex  sync.Mutex
+	otaMessages <-chan string
+	cleanupSub  func()
 }
 
 // New creates a new updater
@@ -46,14 +48,176 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, veh
 func (u *Updater) Start() error {
 	u.logger.Printf("Starting updater with check interval: %v", u.config.CheckInterval)
 
+	// Subscribe to OTA status channel
+	var err error
+	u.otaMessages, u.cleanupSub, err = u.redis.SubscribeToOTAStatus(config.OtaChannel)
+	if err != nil {
+		return fmt.Errorf("failed to subscribe to OTA status channel: %w", err)
+	}
+
+	// Start the OTA status message handler
+	go u.handleOTAStatusMessages()
+
 	// Start the update check loop
 	go u.updateCheckLoop()
 
 	return nil
 }
 
+// handleOTAStatusMessages handles messages from the OTA status channel
+func (u *Updater) handleOTAStatusMessages() {
+	u.logger.Printf("Started OTA status message handler")
+
+	for {
+		select {
+		case <-u.ctx.Done():
+			u.logger.Printf("OTA status message handler stopped")
+			return
+		case msg, ok := <-u.otaMessages:
+			if !ok {
+				u.logger.Printf("OTA status channel closed")
+				return
+			}
+
+			u.logger.Printf("Received OTA status message: %s", msg)
+
+			// Handle different message types
+			switch msg {
+			case "status":
+				// Get the current OTA status
+				status, err := u.redis.GetOTAStatus(config.OtaStatusHashKey)
+				if err != nil {
+					u.logger.Printf("Failed to get OTA status: %v", err)
+					continue
+				}
+
+				u.logger.Printf("Current OTA status: %v", status)
+
+				// Process the status update for all tracked components
+				u.processOTAStatus(status)
+				
+			case "update-type":
+				// We can ignore update-type messages for now
+				u.logger.Printf("Received update-type message, ignoring")
+				
+			default:
+				u.logger.Printf("Unexpected OTA message: %s", msg)
+			}
+		}
+	}
+}
+
+// processOTAStatus processes an OTA status update
+func (u *Updater) processOTAStatus(status map[string]string) {
+	// Check if we're tracking any components
+	u.stateMutex.Lock()
+	components := make([]string, 0, len(u.updateState))
+	for component := range u.updateState {
+		components = append(components, component)
+	}
+	u.stateMutex.Unlock()
+	
+	if len(components) == 0 {
+		u.logger.Printf("No components being tracked, ignoring OTA status update")
+		return
+	}
+	
+	// Process the status for each tracked component
+	for _, component := range components {
+		u.processComponentStatus(component, status)
+	}
+}
+
+// processComponentStatus processes an OTA status update for a specific component
+func (u *Updater) processComponentStatus(component string, status map[string]string) {
+	u.logger.Printf("Processing status update for component: %s", component)
+
+	// Check if we're tracking this component
+	u.stateMutex.Lock()
+	_, tracking := u.updateState[component]
+	u.stateMutex.Unlock()
+
+	if !tracking {
+		u.logger.Printf("Ignoring OTA status update for untracked component: %s", component)
+		return
+	}
+
+	// Check if update is complete or waiting for reboot
+	if status["status"] == "complete" || status["status"] == "installation-complete-waiting-reboot" {
+		isWaitingReboot := status["status"] == "installation-complete-waiting-reboot"
+		
+		if isWaitingReboot {
+			u.logger.Printf("Update installed for %s, waiting for reboot", component)
+		} else {
+			u.logger.Printf("Update complete for %s", component)
+		}
+		
+		u.stateMutex.Lock()
+		u.updateState[component] = "complete"
+		u.stateMutex.Unlock()
+
+		// Handle post-update actions
+		if component == "dbc" {
+			// Restore vehicle state
+			if err := u.vehicle.RestorePreviousState(); err != nil {
+				u.logger.Printf("Failed to restore vehicle state: %v", err)
+			}
+
+			// If installation is complete and waiting for reboot, trigger reboot
+			if isWaitingReboot {
+				u.logger.Printf("Reboot needed for DBC")
+				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
+					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+				}
+			}
+		} else if component == "mdb" {
+			// If installation is complete and waiting for reboot, trigger reboot
+			if isWaitingReboot {
+				u.logger.Printf("Reboot needed for MDB")
+
+				// Check if it's safe to reboot
+				safe, err := u.vehicle.IsSafeForMdbReboot()
+				if err != nil {
+					u.logger.Printf("Failed to check if safe for MDB reboot: %v", err)
+					return
+				}
+
+				if safe {
+					if err := u.vehicle.TriggerReboot("mdb"); err != nil {
+						u.logger.Printf("Failed to trigger MDB reboot: %v", err)
+					}
+				} else {
+					u.logger.Printf("Not safe to reboot MDB, scheduling reboot check")
+					u.vehicle.ScheduleMdbRebootCheck(u.config.MdbRebootCheckInterval)
+					go u.waitForMdbReboot()
+				}
+			}
+		}
+	}
+
+	// Check if update failed
+	if status["status"] == "failed" {
+		u.logger.Printf("Update failed for %s: %s", component, status["error"])
+		u.stateMutex.Lock()
+		u.updateState[component] = "failed"
+		u.stateMutex.Unlock()
+
+		// Restore vehicle state if DBC update
+		if component == "dbc" {
+			if err := u.vehicle.RestorePreviousState(); err != nil {
+				u.logger.Printf("Failed to restore vehicle state: %v", err)
+			}
+		}
+	}
+}
+
 // Stop stops the updater
 func (u *Updater) Stop() {
+	// Clean up the subscription if it exists
+	if u.cleanupSub != nil {
+		u.cleanupSub()
+	}
+	
 	u.cancel()
 }
 
@@ -107,7 +271,14 @@ func (u *Updater) checkForUpdates() {
 
 	u.logger.Printf("Found %d releases", len(releases))
 
-	// Process releases for each component and channel
+	// Find available updates for each component
+	type updateInfo struct {
+		component string
+		release   Release
+		assetURL  string
+	}
+	var updates []updateInfo
+
 	for _, component := range u.config.Components {
 		// Get the latest release for the component and channel
 		release, found := u.findLatestRelease(releases, component, u.config.DefaultChannel)
@@ -118,9 +289,11 @@ func (u *Updater) checkForUpdates() {
 
 		// Find the .mender asset for the component
 		var menderAsset string
+		var assetURL string
 		for _, asset := range release.Assets {
 			if strings.Contains(asset.Name, component) && strings.HasSuffix(asset.Name, ".mender") {
 				menderAsset = asset.Name
+				assetURL = asset.BrowserDownloadURL
 				break
 			}
 		}
@@ -130,14 +303,54 @@ func (u *Updater) checkForUpdates() {
 		// Check if update is needed
 		if u.isUpdateNeeded(component, release) {
 			u.logger.Printf("Update needed for component %s", component)
-
-			// Initiate update
-			if err := u.initiateUpdate(component, release); err != nil {
-				u.logger.Printf("Failed to initiate update for component %s: %v", component, err)
-				continue
+			
+			if assetURL != "" {
+				updates = append(updates, updateInfo{
+					component: component,
+					release:   release,
+					assetURL:  assetURL,
+				})
+			} else {
+				u.logger.Printf("No .mender asset URL found for component %s", component)
 			}
 		} else {
 			u.logger.Printf("No update needed for component %s", component)
+		}
+	}
+
+	// Sequence updates: MDB first, then DBC
+	if len(updates) > 0 {
+		// Sort updates: MDB first, then DBC
+		var mdbUpdate *updateInfo
+		var dbcUpdate *updateInfo
+
+		for i := range updates {
+			if updates[i].component == "mdb" {
+				mdbUpdate = &updates[i]
+			} else if updates[i].component == "dbc" {
+				dbcUpdate = &updates[i]
+			}
+		}
+
+		// Apply MDB update first if available
+		if mdbUpdate != nil {
+			u.logger.Printf("Initiating MDB update first")
+			if err := u.initiateUpdate(mdbUpdate.component, mdbUpdate.release); err != nil {
+				u.logger.Printf("Failed to initiate MDB update: %v", err)
+			}
+		}
+
+		// Apply DBC update if available and MDB update is not in progress
+		if dbcUpdate != nil {
+			if mdbUpdate != nil {
+				u.logger.Printf("DBC update will be applied after MDB update completes")
+				// TODO: Implement a mechanism to queue the DBC update after MDB completes
+			} else {
+				u.logger.Printf("Initiating DBC update")
+				if err := u.initiateUpdate(dbcUpdate.component, dbcUpdate.release); err != nil {
+					u.logger.Printf("Failed to initiate DBC update: %v", err)
+				}
+			}
 		}
 	}
 }
@@ -178,9 +391,39 @@ func (u *Updater) findLatestRelease(releases []Release, component, channel strin
 
 // isUpdateNeeded checks if an update is needed for the given component
 func (u *Updater) isUpdateNeeded(component string, release Release) bool {
-	// TODO: Implement proper version checking
-	// For now, always return true for testing
-	return true
+	// Get the currently installed version
+	currentVersion, err := u.redis.GetComponentVersion(component)
+	if err != nil {
+		u.logger.Printf("Failed to get current %s version: %v", component, err)
+		// If we can't get the current version, assume an update is needed
+		return true
+	}
+
+	// If no version is installed, an update is needed
+	if currentVersion == "" {
+		u.logger.Printf("No %s version found, update needed", component)
+		return true
+	}
+
+	// Extract the commit hash from the release tag name
+	// Tag format: nightly-20250506-9988af09cfbfb9cf19469c723e598d3b461bc7eb
+	parts := strings.Split(release.TagName, "-")
+	if len(parts) < 3 {
+		u.logger.Printf("Invalid release tag format: %s", release.TagName)
+		// If the tag format is invalid, assume an update is needed
+		return true
+	}
+
+	releaseCommit := parts[2]
+	
+	// Compare the installed version with the release version
+	if currentVersion != releaseCommit {
+		u.logger.Printf("Update needed for %s: current=%s, release=%s", component, currentVersion, releaseCommit)
+		return true
+	}
+	
+	u.logger.Printf("No update needed for %s: current=%s, release=%s", component, currentVersion, releaseCommit)
+	return false
 }
 
 // initiateUpdate initiates the update process for the given component
@@ -224,7 +467,7 @@ func (u *Updater) updateDBC(assetURL string) error {
 
 	if !safe {
 		u.logger.Printf("Not safe to update DBC, scheduling retry")
-		// TODO: Implement retry logic
+		// This never actually happens, we just don't reboot the DBC
 		return fmt.Errorf("not safe to update DBC")
 	}
 
@@ -241,11 +484,6 @@ func (u *Updater) updateDBC(assetURL string) error {
 		return fmt.Errorf("failed to push DBC update URL: %w", err)
 	}
 
-	// Note: We don't set the checksum as we don't have it
-
-	// Monitor update progress
-	go u.monitorUpdate("dbc")
-
 	return nil
 }
 
@@ -257,102 +495,7 @@ func (u *Updater) updateMDB(assetURL string) error {
 		return fmt.Errorf("failed to push MDB update URL: %w", err)
 	}
 
-	// Note: We don't set the checksum as we don't have it
-
-	// Monitor update progress
-	go u.monitorUpdate("mdb")
-
 	return nil
-}
-
-// monitorUpdate monitors the update progress for the given component
-func (u *Updater) monitorUpdate(component string) {
-	u.logger.Printf("Monitoring update progress for %s", component)
-
-	// Poll OTA status
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-u.ctx.Done():
-			u.logger.Printf("Update monitoring stopped for %s", component)
-			return
-		case <-ticker.C:
-			status, err := u.redis.GetOTAStatus(config.OtaStatusHashKey)
-			if err != nil {
-				u.logger.Printf("Failed to get OTA status: %v", err)
-				continue
-			}
-
-			u.logger.Printf("OTA status for %s: %v", component, status)
-
-			// Check if update is complete
-			if status["status"] == "complete" {
-				u.logger.Printf("Update complete for %s", component)
-				u.stateMutex.Lock()
-				u.updateState[component] = "complete"
-				u.stateMutex.Unlock()
-
-				// Handle post-update actions
-				if component == "dbc" {
-					// Restore vehicle state
-					if err := u.vehicle.RestorePreviousState(); err != nil {
-						u.logger.Printf("Failed to restore vehicle state: %v", err)
-					}
-
-					// Check if reboot is needed
-					if status["reboot-needed"] == "true" {
-						u.logger.Printf("Reboot needed for DBC")
-						if err := u.vehicle.TriggerReboot("dbc"); err != nil {
-							u.logger.Printf("Failed to trigger DBC reboot: %v", err)
-						}
-					}
-				} else if component == "mdb" {
-					// Check if reboot is needed
-					if status["reboot-needed"] == "true" {
-						u.logger.Printf("Reboot needed for MDB")
-
-						// Check if it's safe to reboot
-						safe, err := u.vehicle.IsSafeForMdbReboot()
-						if err != nil {
-							u.logger.Printf("Failed to check if safe for MDB reboot: %v", err)
-							return
-						}
-
-						if safe {
-							if err := u.vehicle.TriggerReboot("mdb"); err != nil {
-								u.logger.Printf("Failed to trigger MDB reboot: %v", err)
-							}
-						} else {
-							u.logger.Printf("Not safe to reboot MDB, scheduling reboot check")
-							u.vehicle.ScheduleMdbRebootCheck(u.config.MdbRebootCheckInterval)
-							go u.waitForMdbReboot()
-						}
-					}
-				}
-
-				return
-			}
-
-			// Check if update failed
-			if status["status"] == "failed" {
-				u.logger.Printf("Update failed for %s: %s", component, status["error"])
-				u.stateMutex.Lock()
-				u.updateState[component] = "failed"
-				u.stateMutex.Unlock()
-
-				// Restore vehicle state if DBC update
-				if component == "dbc" {
-					if err := u.vehicle.RestorePreviousState(); err != nil {
-						u.logger.Printf("Failed to restore vehicle state: %v", err)
-					}
-				}
-
-				return
-			}
-		}
-	}
 }
 
 // waitForMdbReboot waits for the MDB to be safe to reboot

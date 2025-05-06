@@ -8,6 +8,7 @@ import (
 // Fixed keys for Redis
 const (
 	OtaStatusHashKey = "ota"
+	OtaChannel       = "ota"
 	VehicleHashKey   = "vehicle"
 )
 

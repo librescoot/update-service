@@ -155,8 +155,6 @@ func (s *Service) TriggerReboot(component string) error {
 		return fmt.Errorf("DRY-RUN: Would reboot %s, but dry-run mode is enabled", component)
 	}
 
-	// TODO: Implement actual reboot logic
-	// This would involve sending the appropriate command to the vehicle service
-	// For now, just log the reboot
-	return nil
+	// Trigger reboot via pm-service
+	return s.redis.TriggerReboot()
 }

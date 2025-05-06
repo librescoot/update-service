@@ -62,6 +62,37 @@ func (c *Client) GetOTAStatus(otaHashKey string) (map[string]string, error) {
 	return c.client.HGetAll(c.ctx, otaHashKey).Result()
 }
 
+// SubscribeToOTAStatus subscribes to the OTA status channel
+// It returns a channel that will receive messages when the OTA status changes
+func (c *Client) SubscribeToOTAStatus(channel string) (<-chan string, func(), error) {
+	pubsub := c.client.Subscribe(c.ctx, channel)
+	
+	// Check if subscription was successful
+	_, err := pubsub.Receive(c.ctx)
+	if err != nil {
+		pubsub.Close()
+		return nil, nil, fmt.Errorf("failed to subscribe to channel %s: %w", channel, err)
+	}
+	
+	// Create a string channel to convert redis.Message to string
+	msgChan := make(chan string)
+	
+	// Start a goroutine to convert redis.Message to string
+	go func() {
+		defer close(msgChan)
+		for msg := range pubsub.Channel() {
+			select {
+			case <-c.ctx.Done():
+				return
+			case msgChan <- msg.Payload:
+			}
+		}
+	}()
+	
+	// Return the string channel and a cleanup function
+	return msgChan, func() { pubsub.Close() }, nil
+}
+
 // WaitForOTAStatus waits for the OTA status to match the expected status
 // It polls the OTA status hash at the specified interval until the status matches
 // or the context is cancelled
@@ -88,4 +119,23 @@ func (c *Client) WaitForOTAStatus(otaHashKey, statusField, expectedStatus string
 			}
 		}
 	}
+}
+
+// GetComponentVersion gets the installed version of a component from Redis
+func (c *Client) GetComponentVersion(component string) (string, error) {
+	versionHash := fmt.Sprintf("version:%s", component)
+	versionID, err := c.client.HGet(c.ctx, versionHash, "version_id").Result()
+	if err != nil {
+		if err == redis.Nil {
+			// Version not found, return empty string
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to get %s version: %w", component, err)
+	}
+	return versionID, nil
+}
+
+// TriggerReboot triggers a system reboot via Redis
+func (c *Client) TriggerReboot() error {
+	return c.client.LPush(c.ctx, "scooter:power", "reboot").Err()
 }
