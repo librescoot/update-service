@@ -205,11 +205,22 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 				}
 			}
 		} else if component == "mdb" {
-			// If installation is complete and waiting for reboot, trigger reboot
+			// If installation is complete and waiting for reboot, notify vehicle service first
 			if isWaitingReboot {
+				u.logger.Printf("Update installed for MDB, waiting for reboot")
+				
+				// Notify vehicle service that MDB update is complete
+				// This allows the vehicle service to set the appropriate power state
+				if err := u.redis.PushUpdateCommand("complete"); err != nil {
+					u.logger.Printf("Failed to send complete command: %v", err)
+				}
+				
+				// Wait a moment for the vehicle service to process the command and update state
+				time.Sleep(2 * time.Second)
+				
 				u.logger.Printf("Reboot needed for MDB")
-
-				// Check if it's safe to reboot
+				
+				// Now check if it's safe to reboot
 				safe, err := u.vehicle.IsSafeForMdbReboot()
 				if err != nil {
 					u.logger.Printf("Failed to check if safe for MDB reboot: %v", err)
