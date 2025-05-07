@@ -52,6 +52,11 @@ func (c *Client) PushUpdateURL(updateKey, url string) error {
 	return c.client.LPush(c.ctx, updateKey, url).Err()
 }
 
+// PushUpdateCommand pushes an update command to the scooter:update list
+func (c *Client) PushUpdateCommand(command string) error {
+	return c.client.LPush(c.ctx, "scooter:update", command).Err()
+}
+
 // SetUpdateChecksum sets the update checksum in Redis
 func (c *Client) SetUpdateChecksum(checksumKey, checksum string) error {
 	return c.client.Set(c.ctx, checksumKey, checksum, 0).Err()
@@ -66,17 +71,17 @@ func (c *Client) GetOTAStatus(otaHashKey string) (map[string]string, error) {
 // It returns a channel that will receive messages when the OTA status changes
 func (c *Client) SubscribeToOTAStatus(channel string) (<-chan string, func(), error) {
 	pubsub := c.client.Subscribe(c.ctx, channel)
-	
+
 	// Check if subscription was successful
 	_, err := pubsub.Receive(c.ctx)
 	if err != nil {
 		pubsub.Close()
 		return nil, nil, fmt.Errorf("failed to subscribe to channel %s: %w", channel, err)
 	}
-	
+
 	// Create a string channel to convert redis.Message to string
 	msgChan := make(chan string)
-	
+
 	// Start a goroutine to convert redis.Message to string
 	go func() {
 		defer close(msgChan)
@@ -88,7 +93,7 @@ func (c *Client) SubscribeToOTAStatus(channel string) (<-chan string, func(), er
 			}
 		}
 	}()
-	
+
 	// Return the string channel and a cleanup function
 	return msgChan, func() { pubsub.Close() }, nil
 }

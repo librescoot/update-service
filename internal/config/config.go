@@ -74,7 +74,7 @@ func New(
 		MdbRebootCheckInterval: 5 * time.Minute,
 		UpdateRetryInterval:    15 * time.Minute,
 		// Operational modes
-		DryRun:                 dryRun,
+		DryRun: dryRun,
 	}
 }
 

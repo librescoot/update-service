@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/librescoot/update-service/internal/config"
+	"github.com/librescoot/update-service/internal/inhibitor"
 	"github.com/librescoot/update-service/internal/redis"
 	"github.com/librescoot/update-service/internal/vehicle"
 )
@@ -18,6 +19,7 @@ type Updater struct {
 	config      *config.Config
 	redis       *redis.Client
 	vehicle     *vehicle.Service
+	inhibitor   *inhibitor.Client
 	logger      *log.Logger
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -29,12 +31,13 @@ type Updater struct {
 }
 
 // New creates a new updater
-func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, vehicleService *vehicle.Service, logger *log.Logger) *Updater {
+func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, vehicleService *vehicle.Service, inhibitorClient *inhibitor.Client, logger *log.Logger) *Updater {
 	updaterCtx, cancel := context.WithCancel(ctx)
 	return &Updater{
 		config:      cfg,
 		redis:       redisClient,
 		vehicle:     vehicleService,
+		inhibitor:   inhibitorClient,
 		logger:      logger,
 		ctx:         updaterCtx,
 		cancel:      cancel,
@@ -95,11 +98,11 @@ func (u *Updater) handleOTAStatusMessages() {
 
 				// Process the status update for all tracked components
 				u.processOTAStatus(status)
-				
+
 			case "update-type":
 				// We can ignore update-type messages for now
 				u.logger.Printf("Received update-type message, ignoring")
-				
+
 			default:
 				u.logger.Printf("Unexpected OTA message: %s", msg)
 			}
@@ -116,12 +119,12 @@ func (u *Updater) processOTAStatus(status map[string]string) {
 		components = append(components, component)
 	}
 	u.stateMutex.Unlock()
-	
+
 	if len(components) == 0 {
 		u.logger.Printf("No components being tracked, ignoring OTA status update")
 		return
 	}
-	
+
 	// Process the status for each tracked component
 	for _, component := range components {
 		u.processComponentStatus(component, status)
@@ -142,25 +145,56 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 		return
 	}
 
-	// Check if update is complete or waiting for reboot
-	if status["status"] == "complete" || status["status"] == "installation-complete-waiting-reboot" {
+	// Check status
+	switch status["status"] {
+	case "downloading":
+		u.logger.Printf("Update downloading for %s", component)
+
+		// Add download inhibit to delay power state changes
+		if err := u.inhibitor.AddDownloadInhibit(component); err != nil {
+			u.logger.Printf("Failed to add download inhibit for %s: %v", component, err)
+		}
+
+	case "installing":
+		u.logger.Printf("Update installing for %s", component)
+
+		// Remove download inhibit if it exists
+		if err := u.inhibitor.RemoveDownloadInhibit(component); err != nil {
+			u.logger.Printf("Failed to remove download inhibit for %s: %v", component, err)
+		}
+
+		// Add install inhibit to defer power state changes
+		if err := u.inhibitor.AddInstallInhibit(component); err != nil {
+			u.logger.Printf("Failed to add install inhibit for %s: %v", component, err)
+		}
+
+	case "complete", "installation-complete-waiting-reboot":
 		isWaitingReboot := status["status"] == "installation-complete-waiting-reboot"
-		
+
 		if isWaitingReboot {
 			u.logger.Printf("Update installed for %s, waiting for reboot", component)
 		} else {
 			u.logger.Printf("Update complete for %s", component)
 		}
-		
+
 		u.stateMutex.Lock()
 		u.updateState[component] = "complete"
 		u.stateMutex.Unlock()
 
+		// Remove inhibits
+		if err := u.inhibitor.RemoveDownloadInhibit(component); err != nil {
+			u.logger.Printf("Failed to remove download inhibit for %s: %v", component, err)
+		}
+
+		if err := u.inhibitor.RemoveInstallInhibit(component); err != nil {
+			u.logger.Printf("Failed to remove install inhibit for %s: %v", component, err)
+		}
+
 		// Handle post-update actions
 		if component == "dbc" {
-			// Restore vehicle state
-			if err := u.vehicle.RestorePreviousState(); err != nil {
-				u.logger.Printf("Failed to restore vehicle state: %v", err)
+			// Notify vehicle service that DBC update is complete
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
 			}
 
 			// If installation is complete and waiting for reboot, trigger reboot
@@ -193,19 +227,26 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 				}
 			}
 		}
-	}
 
-	// Check if update failed
-	if status["status"] == "failed" {
+	case "failed":
 		u.logger.Printf("Update failed for %s: %s", component, status["error"])
 		u.stateMutex.Lock()
 		u.updateState[component] = "failed"
 		u.stateMutex.Unlock()
 
-		// Restore vehicle state if DBC update
+		// Remove inhibits
+		if err := u.inhibitor.RemoveDownloadInhibit(component); err != nil {
+			u.logger.Printf("Failed to remove download inhibit for %s: %v", component, err)
+		}
+
+		if err := u.inhibitor.RemoveInstallInhibit(component); err != nil {
+			u.logger.Printf("Failed to remove install inhibit for %s: %v", component, err)
+		}
+
+		// Notify vehicle service that DBC update is complete if it was a DBC update
 		if component == "dbc" {
-			if err := u.vehicle.RestorePreviousState(); err != nil {
-				u.logger.Printf("Failed to restore vehicle state: %v", err)
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
 			}
 		}
 	}
@@ -217,7 +258,7 @@ func (u *Updater) Stop() {
 	if u.cleanupSub != nil {
 		u.cleanupSub()
 	}
-	
+
 	u.cancel()
 }
 
@@ -225,7 +266,7 @@ func (u *Updater) Stop() {
 func (u *Updater) hasUpdatesInProgress() bool {
 	u.stateMutex.Lock()
 	defer u.stateMutex.Unlock()
-	
+
 	for _, state := range u.updateState {
 		if state == "updating" {
 			return true
@@ -297,13 +338,13 @@ func (u *Updater) checkForUpdates() {
 				break
 			}
 		}
-		
+
 		u.logger.Printf("Found release for component %s: %s (asset: %s)", component, release.TagName, menderAsset)
 
 		// Check if update is needed
 		if u.isUpdateNeeded(component, release) {
 			u.logger.Printf("Update needed for component %s", component)
-			
+
 			if assetURL != "" {
 				updates = append(updates, updateInfo{
 					component: component,
@@ -414,12 +455,12 @@ func (u *Updater) isUpdateNeeded(component string, release Release) bool {
 
 	// Convert to lowercase for comparison with Redis version_id
 	normalizedReleaseVersion := strings.ToLower(parts[1])
-	
+
 	if currentVersion != normalizedReleaseVersion {
 		u.logger.Printf("Update needed for %s: current=%s, release=%s", component, currentVersion, normalizedReleaseVersion)
 		return true
 	}
-	
+
 	u.logger.Printf("No update needed for %s: current=%s, release=%s", component, currentVersion, normalizedReleaseVersion)
 	return false
 }
@@ -469,16 +510,16 @@ func (u *Updater) updateDBC(assetURL string) error {
 		return fmt.Errorf("not safe to update DBC")
 	}
 
-	// Set vehicle state to "updating"
-	if err := u.vehicle.SetUpdatingState(); err != nil {
-		return fmt.Errorf("failed to set vehicle state to updating: %w", err)
+	// Notify vehicle service that DBC update is starting
+	if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+		return fmt.Errorf("failed to send start-dbc command: %w", err)
 	}
 
 	// Push update URL to SMUT
 	u.logger.Printf("Pushing DBC update URL to Redis key %s: %s", u.config.DbcUpdateKey, assetURL)
 	if err := u.redis.PushUpdateURL(u.config.DbcUpdateKey, assetURL); err != nil {
-		// Restore vehicle state
-		u.vehicle.RestorePreviousState()
+		// Notify vehicle service that DBC update is complete (failed)
+		u.redis.PushUpdateCommand("complete-dbc")
 		return fmt.Errorf("failed to push DBC update URL: %w", err)
 	}
 
@@ -487,9 +528,16 @@ func (u *Updater) updateDBC(assetURL string) error {
 
 // updateMDB updates the MDB component
 func (u *Updater) updateMDB(assetURL string) error {
+	// Notify vehicle service that update is starting
+	if err := u.redis.PushUpdateCommand("start"); err != nil {
+		return fmt.Errorf("failed to send start command: %w", err)
+	}
+
 	// Push update URL to SMUT
 	u.logger.Printf("Pushing MDB update URL to Redis key %s: %s", u.config.MdbUpdateKey, assetURL)
 	if err := u.redis.PushUpdateURL(u.config.MdbUpdateKey, assetURL); err != nil {
+		// Notify vehicle service that update is complete (failed)
+		u.redis.PushUpdateCommand("complete")
 		return fmt.Errorf("failed to push MDB update URL: %w", err)
 	}
 
