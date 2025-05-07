@@ -1,24 +1,38 @@
-.PHONY: build clean run test
+BIN := update-service
+GIT_REV := $(shell git describe --tags --always 2>/dev/null)
+ifdef GIT_REV
+LDFLAGS := -X main.version=$(GIT_REV)
+else
+LDFLAGS :=
+endif
+BUILDFLAGS := -tags netgo,osusergo
+MAIN := ./cmd/update-service
 
-# Binary name
-BINARY_NAME=update-service
+.PHONY: build host arm amd64 dist clean test fmt tidy all run run-dev
 
-# Build the binary
-build:
-	go build -o $(BINARY_NAME) ./cmd/update-service
+build: host
+host:
+	go build -ldflags "$(LDFLAGS)" -o ${BIN}-host ${MAIN}
 
-# Clean build artifacts
+amd64:
+	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" $(BUILDFLAGS) -o ${BIN}-amd64 ${MAIN}
+
+arm:
+	GOOS=linux GOARCH=arm GOARM=7 go build -ldflags "$(LDFLAGS)" $(BUILDFLAGS) -o ${BIN}-arm ${MAIN}
+
+dist:
+	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS) -s -w" $(BUILDFLAGS) -o ${BIN}-arm-dist ${MAIN}
+
 clean:
-	go clean
-	rm -f $(BINARY_NAME)
+	rm -f ${BIN} ${BIN}-host ${BIN}-amd64 ${BIN}-arm ${BIN}-arm-dist
 
 # Run the service
-run: build
-	./$(BINARY_NAME)
+run: host
+	./${BIN}-host
 
 # Run with shorter check interval for development
-run-dev: build
-	./$(BINARY_NAME) -check-interval=1m -default-channel=nightly -dry-run
+run-dev: host
+	./${BIN}-host -check-interval=1m -default-channel=nightly -dry-run
 
 # Run tests
 test:
@@ -32,9 +46,5 @@ fmt:
 tidy:
 	go mod tidy
 
-# Build and install
-install: build
-	cp $(BINARY_NAME) /usr/local/bin/
-
 # All-in-one setup
-all: tidy fmt build test
+all: tidy fmt test arm amd64
