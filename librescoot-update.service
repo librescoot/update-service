@@ -1,7 +1,7 @@
 [Unit]
 Description=Librescoot Update Service
-After=network.target redis.service
-Wants=redis.service
+After=network-online.target redis.service
+Wants=network-online.target redis.service
 
 [Service]
 Type=simple
