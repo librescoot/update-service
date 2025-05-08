@@ -198,8 +198,11 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 			}
 
 			// If installation is complete and waiting for reboot, trigger reboot
+			// Note: Do NOT restore previous vehicle state before rebooting DBC
+			// as this could cause vehicle-service to turn off dashboard power
 			if isWaitingReboot {
 				u.logger.Printf("Reboot needed for DBC")
+				
 				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
 					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
 				}

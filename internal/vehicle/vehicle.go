@@ -137,8 +137,16 @@ func (s *Service) WaitForSafeReboot() bool {
 
 // TriggerReboot triggers a reboot of the specified component
 func (s *Service) TriggerReboot(component string) error {
-	// For MDB, check if it's safe to reboot
-	if component == "mdb" {
+	// Check if we're in dry-run mode
+	if s.dryRun {
+		// In dry-run mode, just log that we would reboot
+		return fmt.Errorf("DRY-RUN: Would reboot %s, but dry-run mode is enabled", component)
+	}
+
+	// Handle component-specific reboot logic
+	switch component {
+	case "mdb":
+		// For MDB, check if it's safe to reboot
 		safe, err := s.IsSafeForMdbReboot()
 		if err != nil {
 			return fmt.Errorf("failed to check if safe for MDB reboot: %w", err)
@@ -147,14 +155,19 @@ func (s *Service) TriggerReboot(component string) error {
 		if !safe {
 			return fmt.Errorf("not safe to reboot MDB")
 		}
+		
+		// Trigger MDB reboot via pm-service
+		return s.redis.TriggerReboot()
+		
+	case "dbc":
+		// For DBC, we need to cycle the DASHBOARD_POWER rail via vehicle-service
+		// This will cause the DBC to reboot
+		if err := s.redis.PushUpdateCommand("cycle-dashboard-power"); err != nil {
+			return fmt.Errorf("failed to send cycle-dashboard-power command: %w", err)
+		}
+		return nil
+		
+	default:
+		return fmt.Errorf("unknown component: %s", component)
 	}
-
-	// Check if we're in dry-run mode
-	if s.dryRun {
-		// In dry-run mode, just log that we would reboot
-		return fmt.Errorf("DRY-RUN: Would reboot %s, but dry-run mode is enabled", component)
-	}
-
-	// Trigger reboot via pm-service
-	return s.redis.TriggerReboot()
 }
