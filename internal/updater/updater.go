@@ -41,7 +41,7 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, veh
 		logger:      logger,
 		ctx:         updaterCtx,
 		cancel:      cancel,
-		githubAPI:   NewGitHubAPI(updaterCtx, cfg.GitHubReleasesURL),
+		githubAPI:   NewGitHubAPI(updaterCtx, cfg.GitHubReleasesURL, logger),
 		updateState: make(map[string]string),
 		stateMutex:  sync.Mutex{},
 	}
