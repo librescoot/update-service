@@ -144,3 +144,41 @@ func (c *Client) GetComponentVersion(component string) (string, error) {
 func (c *Client) TriggerReboot() error {
 	return c.client.LPush(c.ctx, "scooter:power", "reboot").Err()
 }
+
+// SubscribeToDashboardReady subscribes to the dashboard ready channel
+// and returns a channel that will receive a signal when the dashboard is ready
+// The context can be used to cancel the subscription
+func (c *Client) SubscribeToDashboardReady(ctx context.Context, channel string) <-chan struct{} {
+	// Create a pubsub instance
+	pubsub := c.client.Subscribe(ctx, channel)
+
+	// Check if subscription was successful
+	_, err := pubsub.Receive(ctx)
+	if err != nil {
+		pubsub.Close()
+		return nil
+	}
+
+	// Create a signal channel
+	readyChan := make(chan struct{})
+
+	// Start a goroutine to monitor for the "ready" message
+	go func() {
+		defer pubsub.Close()
+		defer close(readyChan)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg := <-pubsub.Channel():
+				if msg.Payload == "ready" {
+					readyChan <- struct{}{}
+					return
+				}
+			}
+		}
+	}()
+
+	return readyChan
+}

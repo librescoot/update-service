@@ -3,7 +3,11 @@ package updater
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,34 +20,40 @@ import (
 
 // Updater represents the update orchestrator
 type Updater struct {
-	config      *config.Config
-	redis       *redis.Client
-	vehicle     *vehicle.Service
-	inhibitor   *inhibitor.Client
-	logger      *log.Logger
-	ctx         context.Context
-	cancel      context.CancelFunc
-	githubAPI   *GitHubAPI
-	updateState map[string]string
-	stateMutex  sync.Mutex
-	otaMessages <-chan string
-	cleanupSub  func()
+	config           *config.Config
+	redis            *redis.Client
+	vehicle          *vehicle.Service
+	inhibitor        *inhibitor.Client
+	logger           *log.Logger
+	ctx              context.Context
+	cancel           context.CancelFunc
+	githubAPI        *GitHubAPI
+	updateState      map[string]string
+	stateMutex       sync.Mutex
+	otaMessages      <-chan string
+	cleanupSub       func()
+	httpServer       *http.Server
+	httpServerMutex  sync.Mutex
+	dbcUpdateFile    string
+	dbcDownloadReady chan struct{}
 }
 
 // New creates a new updater
 func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, vehicleService *vehicle.Service, inhibitorClient *inhibitor.Client, logger *log.Logger) *Updater {
 	updaterCtx, cancel := context.WithCancel(ctx)
 	return &Updater{
-		config:      cfg,
-		redis:       redisClient,
-		vehicle:     vehicleService,
-		inhibitor:   inhibitorClient,
-		logger:      logger,
-		ctx:         updaterCtx,
-		cancel:      cancel,
-		githubAPI:   NewGitHubAPI(updaterCtx, cfg.GitHubReleasesURL, logger),
-		updateState: make(map[string]string),
-		stateMutex:  sync.Mutex{},
+		config:           cfg,
+		redis:            redisClient,
+		vehicle:          vehicleService,
+		inhibitor:        inhibitorClient,
+		logger:           logger,
+		ctx:              updaterCtx,
+		cancel:           cancel,
+		githubAPI:        NewGitHubAPI(updaterCtx, cfg.GitHubReleasesURL, logger),
+		updateState:      make(map[string]string),
+		stateMutex:       sync.Mutex{},
+		httpServerMutex:  sync.Mutex{},
+		dbcDownloadReady: make(chan struct{}),
 	}
 }
 
@@ -146,11 +156,25 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 	}
 
 	// Check status
-	switch status["status"] {
+	currentStatus := status["status"]
+	
+	// Update our internal state map first
+	u.stateMutex.Lock()
+	prevState := u.updateState[component]
+	u.updateState[component] = currentStatus
+	u.stateMutex.Unlock()
+	
+	u.logger.Printf("Component %s state changed: %s -> %s", component, prevState, currentStatus)
+
+	// Variable to track if waiting for reboot
+	isWaitingReboot := currentStatus == "installation-complete-waiting-reboot"
+
+	switch currentStatus {
 	case "downloading":
 		u.logger.Printf("Update downloading for %s", component)
 
-		// Add download inhibit to delay power state changes
+		// MDB updates should set a delay inhibit (can be interrupted if needed)
+		// DBC updates should also set a delay inhibit since they're less critical
 		if err := u.inhibitor.AddDownloadInhibit(component); err != nil {
 			u.logger.Printf("Failed to add download inhibit for %s: %v", component, err)
 		}
@@ -163,101 +187,93 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 			u.logger.Printf("Failed to remove download inhibit for %s: %v", component, err)
 		}
 
-		// Add install inhibit to defer power state changes
+		// MDB updates that are already installing should block power state changes
+		// DBC updates should also block once installing since interrupting would be problematic
 		if err := u.inhibitor.AddInstallInhibit(component); err != nil {
 			u.logger.Printf("Failed to add install inhibit for %s: %v", component, err)
 		}
 
-	case "complete", "installation-complete-waiting-reboot":
-		isWaitingReboot := status["status"] == "installation-complete-waiting-reboot"
-
-		if isWaitingReboot {
-			u.logger.Printf("Update installed for %s, waiting for reboot", component)
-		} else {
-			u.logger.Printf("Update complete for %s", component)
-		}
-
-		u.stateMutex.Lock()
-		u.updateState[component] = "complete"
-		u.stateMutex.Unlock()
-
-		// Remove inhibits
-		if err := u.inhibitor.RemoveDownloadInhibit(component); err != nil {
-			u.logger.Printf("Failed to remove download inhibit for %s: %v", component, err)
-		}
-
-		if err := u.inhibitor.RemoveInstallInhibit(component); err != nil {
-			u.logger.Printf("Failed to remove install inhibit for %s: %v", component, err)
-		}
-
-		// Handle post-update actions
+		// If this is the DBC starting installation, make sure dashboard power stays on
 		if component == "dbc" {
+			if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+				u.logger.Printf("Failed to send start-dbc command: %v", err)
+			}
+		}
+
+	case "installation-complete-waiting-reboot":
+		u.logger.Printf("Update installed for %s, waiting for reboot", component)
+		
+		// Keep inhibitors active until after reboot for DBC
+		if component == "dbc" {
+			// For DBC, we keep the install inhibit active until after reboot
+			// to ensure the DBC doesn't get powered off prematurely
+			u.logger.Printf("Keeping install inhibit active for DBC until rebooted")
+			
 			// Notify vehicle service that DBC update is complete
 			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
 				u.logger.Printf("Failed to send complete-dbc command: %v", err)
 			}
 
-			// If installation is complete and waiting for reboot, trigger reboot
-			// Note: Do NOT restore previous vehicle state before rebooting DBC
-			// as this could cause vehicle-service to turn off dashboard power
-			if isWaitingReboot {
-				u.logger.Printf("Reboot needed for DBC")
-				
-				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
-					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
-				}
+			// Trigger DBC reboot to apply update
+			u.logger.Printf("Reboot needed for DBC")
+			if err := u.vehicle.TriggerReboot("dbc"); err != nil {
+				u.logger.Printf("Failed to trigger DBC reboot: %v", err)
 			}
 		} else if component == "mdb" {
-			// If installation is complete and waiting for reboot, notify vehicle service first
-			if isWaitingReboot {
-				u.logger.Printf("Update installed for MDB, waiting for reboot")
-				
-				// Notify vehicle service that MDB update is complete
-				// This allows the vehicle service to set the appropriate power state
-				if err := u.redis.PushUpdateCommand("complete"); err != nil {
-					u.logger.Printf("Failed to send complete command: %v", err)
-				}
-				
-				// Wait a moment for the vehicle service to process the command and update state
-				time.Sleep(2 * time.Second)
-				
-				u.logger.Printf("Reboot needed for MDB")
-				
-				// Now check if it's safe to reboot
-				safe, err := u.vehicle.IsSafeForMdbReboot()
-				if err != nil {
-					u.logger.Printf("Failed to check if safe for MDB reboot: %v", err)
-					return
-				}
+			// For MDB, we can remove the inhibits now
+			u.removeUpdateInhibits(component)
+			
+			u.logger.Printf("Update installed for MDB, waiting for reboot")
+			
+			// Notify vehicle service that MDB update is complete
+			// This allows the vehicle service to set the appropriate power state
+			if err := u.redis.PushUpdateCommand("complete"); err != nil {
+				u.logger.Printf("Failed to send complete command: %v", err)
+			}
+			
+			// Wait a moment for the vehicle service to process the command and update state
+			time.Sleep(2 * time.Second)
+			
+			u.logger.Printf("Reboot needed for MDB")
+			
+			// Now check if it's safe to reboot
+			safe, err := u.vehicle.IsSafeForMdbReboot()
+			if err != nil {
+				u.logger.Printf("Failed to check if safe for MDB reboot: %v", err)
+				return
+			}
 
-				if safe {
-					if err := u.vehicle.TriggerReboot("mdb"); err != nil {
-						u.logger.Printf("Failed to trigger MDB reboot: %v", err)
-					}
-				} else {
-					u.logger.Printf("Not safe to reboot MDB, scheduling reboot check")
-					u.vehicle.ScheduleMdbRebootCheck(u.config.MdbRebootCheckInterval)
-					go u.waitForMdbReboot()
+			if safe {
+				if err := u.vehicle.TriggerReboot("mdb"); err != nil {
+					u.logger.Printf("Failed to trigger MDB reboot: %v", err)
 				}
+			} else {
+				u.logger.Printf("Not safe to reboot MDB, scheduling reboot check")
+				u.vehicle.ScheduleMdbRebootCheck(u.config.MdbRebootCheckInterval)
+				go u.waitForMdbReboot()
+			}
+		}
+
+	case "complete":
+		u.logger.Printf("Update complete for %s", component)
+		
+		// Remove all inhibits
+		u.removeUpdateInhibits(component)
+		
+		// For DBC, notify vehicle service that update is complete
+		if component == "dbc" {
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
 			}
 		}
 
 	case "failed":
 		u.logger.Printf("Update failed for %s: %s", component, status["error"])
-		u.stateMutex.Lock()
-		u.updateState[component] = "failed"
-		u.stateMutex.Unlock()
-
-		// Remove inhibits
-		if err := u.inhibitor.RemoveDownloadInhibit(component); err != nil {
-			u.logger.Printf("Failed to remove download inhibit for %s: %v", component, err)
-		}
-
-		if err := u.inhibitor.RemoveInstallInhibit(component); err != nil {
-			u.logger.Printf("Failed to remove install inhibit for %s: %v", component, err)
-		}
-
-		// Notify vehicle service that DBC update is complete if it was a DBC update
+		
+		// Remove all inhibits on failure
+		u.removeUpdateInhibits(component)
+		
+		// For DBC, notify vehicle service that update is complete (failed)
 		if component == "dbc" {
 			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
 				u.logger.Printf("Failed to send complete-dbc command: %v", err)
@@ -273,7 +289,36 @@ func (u *Updater) Stop() {
 		u.cleanupSub()
 	}
 
+	// Stop the HTTP server if running
+	u.stopHttpServer()
+
 	u.cancel()
+}
+
+// stopHttpServer stops the HTTP server if it's running
+func (u *Updater) stopHttpServer() {
+	u.httpServerMutex.Lock()
+	defer u.httpServerMutex.Unlock()
+
+	if u.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		u.logger.Printf("Shutting down HTTP server")
+		if err := u.httpServer.Shutdown(ctx); err != nil {
+			u.logger.Printf("HTTP server shutdown error: %v", err)
+		}
+		u.httpServer = nil
+	}
+
+	// Clean up the downloaded file if it exists
+	if u.dbcUpdateFile != "" {
+		u.logger.Printf("Cleaning up downloaded file: %s", u.dbcUpdateFile)
+		if err := os.Remove(u.dbcUpdateFile); err != nil {
+			u.logger.Printf("Error removing downloaded file: %v", err)
+		}
+		u.dbcUpdateFile = ""
+	}
 }
 
 // hasUpdatesInProgress checks if any component updates are in progress
@@ -373,7 +418,7 @@ func (u *Updater) checkForUpdates() {
 		}
 	}
 
-	// Sequence updates: MDB first, then DBC
+	// Sequence updates: Apply both MDB and DBC updates sequentially
 	if len(updates) > 0 {
 		// Sort updates: MDB first, then DBC
 		var mdbUpdate *updateInfo
@@ -387,25 +432,9 @@ func (u *Updater) checkForUpdates() {
 			}
 		}
 
-		// Apply MDB update first if available
-		if mdbUpdate != nil {
-			u.logger.Printf("Initiating MDB update first")
-			if err := u.initiateUpdate(mdbUpdate.component, mdbUpdate.release); err != nil {
-				u.logger.Printf("Failed to initiate MDB update: %v", err)
-			}
-		}
-
-		// Apply DBC update if available and MDB update is not in progress
-		if dbcUpdate != nil {
-			if mdbUpdate != nil {
-				u.logger.Printf("DBC update will be applied after MDB update completes")
-				// TODO: Implement a mechanism to queue the DBC update after MDB completes
-			} else {
-				u.logger.Printf("Initiating DBC update")
-				if err := u.initiateUpdate(dbcUpdate.component, dbcUpdate.release); err != nil {
-					u.logger.Printf("Failed to initiate DBC update: %v", err)
-				}
-			}
+		// Queue both updates to be processed sequentially
+		if mdbUpdate != nil || dbcUpdate != nil {
+			go u.processUpdatesSequentially(mdbUpdate, dbcUpdate)
 		}
 	}
 }
@@ -564,6 +593,293 @@ func (u *Updater) waitForMdbReboot() {
 		u.logger.Printf("Safe to reboot MDB now")
 		if err := u.vehicle.TriggerReboot("mdb"); err != nil {
 			u.logger.Printf("Failed to trigger MDB reboot: %v", err)
+		}
+	}
+}
+
+// removeUpdateInhibits removes all inhibits for a component
+func (u *Updater) removeUpdateInhibits(component string) {
+	// Remove download inhibit if it exists
+	if err := u.inhibitor.RemoveDownloadInhibit(component); err != nil {
+		// Log but don't fail if the inhibit doesn't exist
+		if !strings.Contains(err.Error(), "does not exist") {
+			u.logger.Printf("Failed to remove download inhibit for %s: %v", component, err)
+		}
+	}
+
+	// Remove install inhibit if it exists
+	if err := u.inhibitor.RemoveInstallInhibit(component); err != nil {
+		// Log but don't fail if the inhibit doesn't exist
+		if !strings.Contains(err.Error(), "does not exist") {
+			u.logger.Printf("Failed to remove install inhibit for %s: %v", component, err)
+		}
+	}
+}
+
+// processUpdatesSequentially handles the sequential processing of MDB and DBC updates
+func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
+	// Track if we have active updates
+	u.stateMutex.Lock()
+	activeUpdates := u.hasUpdatesInProgress()
+	u.stateMutex.Unlock()
+
+	if activeUpdates {
+		u.logger.Printf("Updates already in progress, skipping this update cycle")
+		return
+	}
+
+	// Create a local HTTP server to serve DBC updates if both updates are present
+	dbcLocalURL := ""
+	if mdbUpdate != nil && dbcUpdate != nil {
+		var err error
+		dbcLocalURL, err = u.setupLocalUpdateServer(dbcUpdate.assetURL)
+		if err != nil {
+			u.logger.Printf("Failed to set up local update server for DBC: %v", err)
+			// Continue with the original URL if local server setup fails
+			dbcLocalURL = ""
+		}
+	}
+
+	// Apply MDB update first if available
+	if mdbUpdate != nil {
+		u.logger.Printf("Initiating MDB update")
+		if err := u.initiateUpdate(mdbUpdate.component, mdbUpdate.release); err != nil {
+			u.logger.Printf("Failed to initiate MDB update: %v", err)
+			return // Stop processing if MDB update fails
+		}
+
+		// Wait for MDB update to complete before proceeding to DBC
+		complete := u.waitForComponentUpdate("mdb", 30*time.Minute)
+		if !complete {
+			u.logger.Printf("MDB update timed out or failed, skipping DBC update")
+			return
+		}
+		u.logger.Printf("MDB update completed successfully")
+	}
+
+	// Now apply DBC update if available
+	if dbcUpdate != nil {
+		// Ensure dashboard power is on before starting DBC update
+		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+			u.logger.Printf("Failed to send start-dbc command: %v", err)
+			return
+		}
+
+		// Wait for dashboard to be ready (subscribe to dashboard ready signal)
+		u.logger.Printf("Waiting for dashboard to be ready")
+		dashboardReady := u.waitForDashboardReady(30 * time.Second)
+		if !dashboardReady {
+			u.logger.Printf("Dashboard not ready after timeout, proceeding with update anyway")
+		} else {
+			u.logger.Printf("Dashboard is ready, proceeding with DBC update")
+		}
+
+		// Use local URL if available, otherwise use original URL
+		dbcUpdate.release.Tag = "local" // Mark the release as local for proper initiation
+		urlToUse := dbcUpdate.assetURL
+		if dbcLocalURL != "" {
+			urlToUse = dbcLocalURL
+			u.logger.Printf("Using local URL for DBC update: %s", dbcLocalURL)
+		}
+
+		// Initiate the DBC update
+		time.Sleep(3 * time.Second) // Wait a bit to ensure dashboard is fully ready
+		dbcUpdate.assetURL = urlToUse // Update the URL to use
+		u.logger.Printf("Initiating DBC update")
+		if err := u.initiateUpdate(dbcUpdate.component, dbcUpdate.release); err != nil {
+			u.logger.Printf("Failed to initiate DBC update: %v", err)
+			return
+		}
+
+		// Wait for DBC update to complete
+		complete := u.waitForComponentUpdate("dbc", 30*time.Minute)
+		if !complete {
+			u.logger.Printf("DBC update timed out or failed")
+		} else {
+			u.logger.Printf("DBC update completed successfully")
+			
+			// Reboot DBC to apply the update
+			if err := u.vehicle.TriggerReboot("dbc"); err != nil {
+				u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+			} else {
+				u.logger.Printf("DBC reboot triggered successfully")
+			}
+		}
+	}
+}
+
+// waitForComponentUpdate waits for a component update to complete within the given timeout
+func (u *Updater) waitForComponentUpdate(component string, timeout time.Duration) bool {
+	startTime := time.Now()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check if the component update has completed
+			u.stateMutex.Lock()
+			status, exists := u.updateState[component]
+			u.stateMutex.Unlock()
+
+			if exists && (status == "complete" || status == "failed") {
+				return status == "complete"
+			}
+
+			// Check if we've timed out
+			if time.Since(startTime) > timeout {
+				u.logger.Printf("%s update timed out after %v", component, timeout)
+				return false
+			}
+		case <-u.ctx.Done():
+			return false
+		}
+	}
+}
+
+// waitForDashboardReady waits for the dashboard to be ready
+func (u *Updater) waitForDashboardReady(timeout time.Duration) bool {
+	// Subscribe to the dashboard ready channel
+	ctx, cancel := context.WithTimeout(u.ctx, timeout)
+	defer cancel()
+
+	dashboardReadyChan := u.redis.SubscribeToDashboardReady(ctx, "dashboard")
+	if dashboardReadyChan == nil {
+		u.logger.Printf("Failed to subscribe to dashboard ready channel")
+		return false
+	}
+
+	select {
+	case <-dashboardReadyChan:
+		u.logger.Printf("Dashboard ready signal received")
+		return true
+	case <-ctx.Done():
+		u.logger.Printf("Timed out waiting for dashboard ready")
+		return false
+	}
+}
+
+// setupLocalUpdateServer sets up a local HTTP server to serve the DBC update file
+// Returns the local URL where the file can be accessed by the DBC
+func (u *Updater) setupLocalUpdateServer(remoteURL string) (string, error) {
+	// First stop any existing server
+	u.stopHttpServer()
+
+	// Create a temporary directory for downloaded files
+	tempDir, err := os.MkdirTemp("", "update-service")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	// Extract filename from the remote URL
+	urlParts := strings.Split(remoteURL, "/")
+	fileName := urlParts[len(urlParts)-1]
+	if fileName == "" {
+		fileName = "dbc-update.mender"
+	}
+
+	// Download the DBC update file
+	filePath := filepath.Join(tempDir, fileName)
+	u.logger.Printf("Downloading DBC update to: %s", filePath)
+	
+	go func() {
+		if err := u.downloadFile(remoteURL, filePath); err != nil {
+			u.logger.Printf("Failed to download DBC update: %v", err)
+			return
+		}
+		u.dbcUpdateFile = filePath
+		
+		// Signal that the download is ready
+		close(u.dbcDownloadReady)
+	}()
+
+	// Wait for download to complete or timeout
+	select {
+	case <-u.dbcDownloadReady:
+		u.logger.Printf("DBC update file downloaded successfully")
+	case <-time.After(5 * time.Minute):
+		u.logger.Printf("Timed out waiting for DBC update download")
+		return "", fmt.Errorf("download timeout exceeded")
+	}
+
+	// Set up the HTTP server to serve the downloaded file
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ota/", func(w http.ResponseWriter, r *http.Request) {
+		u.logger.Printf("Serving DBC update file: %s", filePath)
+		
+		// Set appropriate headers
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		
+		// Serve the file
+		http.ServeFile(w, r, filePath)
+	})
+
+	// Start the HTTP server
+	u.httpServerMutex.Lock()
+	defer u.httpServerMutex.Unlock()
+
+	u.httpServer = &http.Server{
+		Addr:    ":8000",
+		Handler: mux,
+	}
+
+	go func() {
+		u.logger.Printf("Starting HTTP server on port 8000")
+		if err := u.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			u.logger.Printf("HTTP server error: %v", err)
+		}
+	}()
+
+	// Return the local URL
+	return fmt.Sprintf("http://192.168.7.1:8000/ota/%s", fileName), nil
+}
+
+// downloadFile downloads a file from the given URL to the specified path
+func (u *Updater) downloadFile(url, filePath string) error {
+	// Create the file
+	out, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer out.Close()
+
+	// Get the data
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to GET from URL: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check server response
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad status: %s", resp.Status)
+	}
+
+	// Writer the body to file
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to copy content: %w", err)
+	}
+
+	return nil
+}
+
+// removeUpdateInhibits removes all inhibits for a component
+func (u *Updater) removeUpdateInhibits(component string) {
+	// Remove download inhibit if it exists
+	if err := u.inhibitor.RemoveDownloadInhibit(component); err != nil {
+		// Log but don't fail if the inhibit doesn't exist
+		if !strings.Contains(err.Error(), "does not exist") {
+			u.logger.Printf("Failed to remove download inhibit for %s: %v", component, err)
+		}
+	}
+
+	// Remove install inhibit if it exists
+	if err := u.inhibitor.RemoveInstallInhibit(component); err != nil {
+		// Log but don't fail if the inhibit doesn't exist
+		if !strings.Contains(err.Error(), "does not exist") {
+			u.logger.Printf("Failed to remove install inhibit for %s: %v", component, err)
 		}
 	}
 }
