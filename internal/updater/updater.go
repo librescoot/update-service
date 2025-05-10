@@ -18,6 +18,13 @@ import (
 	"github.com/librescoot/update-service/internal/vehicle"
 )
 
+// updateInfo represents information about an available update
+type updateInfo struct {
+	component string
+	release   Release
+	assetURL  string
+}
+
 // Updater represents the update orchestrator
 type Updater struct {
 	config           *config.Config
@@ -165,9 +172,6 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 	u.stateMutex.Unlock()
 	
 	u.logger.Printf("Component %s state changed: %s -> %s", component, prevState, currentStatus)
-
-	// Variable to track if waiting for reboot
-	isWaitingReboot := currentStatus == "installation-complete-waiting-reboot"
 
 	switch currentStatus {
 	case "downloading":
@@ -372,11 +376,6 @@ func (u *Updater) checkForUpdates() {
 	u.logger.Printf("Found %d releases", len(releases))
 
 	// Find available updates for each component
-	type updateInfo struct {
-		component string
-		release   Release
-		assetURL  string
-	}
 	var updates []updateInfo
 
 	for _, component := range u.config.Components {
@@ -675,7 +674,7 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 		}
 
 		// Use local URL if available, otherwise use original URL
-		dbcUpdate.release.Tag = "local" // Mark the release as local for proper initiation
+		dbcUpdate.release.TagName = "local" // Mark the release as local for proper initiation
 		urlToUse := dbcUpdate.assetURL
 		if dbcLocalURL != "" {
 			urlToUse = dbcLocalURL
@@ -765,10 +764,12 @@ func (u *Updater) setupLocalUpdateServer(remoteURL string) (string, error) {
 	// First stop any existing server
 	u.stopHttpServer()
 
-	// Create a temporary directory for downloaded files
-	tempDir, err := os.MkdirTemp("", "update-service")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp directory: %w", err)
+	// Use /data/ota directory for downloaded files
+	downloadDir := "/data/ota"
+
+	// Ensure the directory exists
+	if err := os.MkdirAll(downloadDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create download directory: %w", err)
 	}
 
 	// Extract filename from the remote URL
@@ -779,7 +780,7 @@ func (u *Updater) setupLocalUpdateServer(remoteURL string) (string, error) {
 	}
 
 	// Download the DBC update file
-	filePath := filepath.Join(tempDir, fileName)
+	filePath := filepath.Join(downloadDir, fileName)
 	u.logger.Printf("Downloading DBC update to: %s", filePath)
 	
 	go func() {
@@ -797,6 +798,8 @@ func (u *Updater) setupLocalUpdateServer(remoteURL string) (string, error) {
 	select {
 	case <-u.dbcDownloadReady:
 		u.logger.Printf("DBC update file downloaded successfully")
+		// Create a new channel for future use
+		u.dbcDownloadReady = make(chan struct{})
 	case <-time.After(5 * time.Minute):
 		u.logger.Printf("Timed out waiting for DBC update download")
 		return "", fmt.Errorf("download timeout exceeded")
@@ -856,7 +859,7 @@ func (u *Updater) downloadFile(url, filePath string) error {
 		return fmt.Errorf("bad status: %s", resp.Status)
 	}
 
-	// Writer the body to file
+	// Write the body to file
 	_, err = io.Copy(out, resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to copy content: %w", err)
