@@ -94,6 +94,19 @@ func (s *Service) IsSafeForMdbReboot() (bool, error) {
 	return currentState == "stand-by", nil
 }
 
+// IsSafeForDbcReboot checks if it's safe to reboot the DBC
+// DBC should not be rebooted when the scooter is being actively used
+func (s *Service) IsSafeForDbcReboot() (bool, error) {
+	// Get current state
+	currentState, err := s.redis.GetVehicleState(s.vehicleHashKey)
+	if err != nil {
+		return false, fmt.Errorf("failed to get current vehicle state: %w", err)
+	}
+
+	// DBC should not be rebooted in ready-to-drive or parked modes
+	return currentState != "ready-to-drive" && currentState != "parked", nil
+}
+
 // ScheduleMdbRebootCheck schedules a check for MDB reboot safety
 // It will periodically check if it's safe to reboot the MDB
 // and signal on the rebootCheckChan when it's safe
@@ -160,6 +173,17 @@ func (s *Service) TriggerReboot(component string) error {
 		return s.redis.TriggerReboot()
 		
 	case "dbc":
+		// Check if it's safe to reboot DBC
+		safe, err := s.IsSafeForDbcReboot()
+		if err != nil {
+			return fmt.Errorf("failed to check if safe for DBC reboot: %w", err)
+		}
+
+		if !safe {
+			currentState, _ := s.GetCurrentState() // Best effort to get state for the error message
+			return fmt.Errorf("not safe to reboot DBC while in %s state", currentState)
+		}
+		
 		// For DBC, we need to cycle the DASHBOARD_POWER rail via vehicle-service
 		// This will cause the DBC to reboot
 		if err := s.redis.PushUpdateCommand("cycle-dashboard-power"); err != nil {

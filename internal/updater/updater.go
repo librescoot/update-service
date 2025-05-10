@@ -43,6 +43,8 @@ type Updater struct {
 	httpServerMutex  sync.Mutex
 	dbcUpdateFile    string
 	dbcDownloadReady chan struct{}
+	dbcRebootNeeded  bool                // Flag to indicate if DBC reboot is needed but deferred
+	dbcRebootMutex   sync.Mutex          // Mutex to protect dbcRebootNeeded flag
 }
 
 // New creates a new updater
@@ -60,7 +62,9 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, veh
 		updateState:      make(map[string]string),
 		stateMutex:       sync.Mutex{},
 		httpServerMutex:  sync.Mutex{},
+		dbcRebootMutex:   sync.Mutex{},
 		dbcDownloadReady: make(chan struct{}),
+		dbcRebootNeeded:  false,
 	}
 }
 
@@ -218,10 +222,22 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 				u.logger.Printf("Failed to send complete-dbc command: %v", err)
 			}
 
-			// Trigger DBC reboot to apply update
-			u.logger.Printf("Reboot needed for DBC")
-			if err := u.vehicle.TriggerReboot("dbc"); err != nil {
-				u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+			// Check if it's safe to reboot DBC
+			safe, err := u.vehicle.IsSafeForDbcReboot()
+			if err != nil {
+				u.logger.Printf("Failed to check if safe for DBC reboot: %v", err)
+				return
+			}
+
+			if safe {
+				// Trigger DBC reboot to apply update
+				u.logger.Printf("Reboot needed for DBC and it's safe to do so")
+				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
+					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+				}
+			} else {
+				u.logger.Printf("Not safe to reboot DBC now, scheduling reboot check")
+				u.scheduleDbcRebootCheck()
 			}
 		} else if component == "mdb" {
 			// For MDB, we can remove the inhibits now
@@ -596,6 +612,69 @@ func (u *Updater) waitForMdbReboot() {
 	}
 }
 
+// scheduleDbcRebootCheck sets the dbcRebootNeeded flag and starts a goroutine
+// to periodically check if it's safe to reboot the DBC
+func (u *Updater) scheduleDbcRebootCheck() {
+	u.dbcRebootMutex.Lock()
+	wasNeeded := u.dbcRebootNeeded
+	u.dbcRebootNeeded = true
+	u.dbcRebootMutex.Unlock()
+
+	// If we're already checking, don't start another goroutine
+	if wasNeeded {
+		return
+	}
+
+	// Start a goroutine to check periodically
+	go u.waitForDbcReboot()
+}
+
+// waitForDbcReboot periodically checks if it's safe to reboot the DBC
+// and performs the reboot when it's safe
+func (u *Updater) waitForDbcReboot() {
+	ticker := time.NewTicker(5 * time.Minute) // Check every 5 minutes
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-u.ctx.Done():
+			return
+		case <-ticker.C:
+			// Check if we still need to reboot
+			u.dbcRebootMutex.Lock()
+			needsReboot := u.dbcRebootNeeded
+			u.dbcRebootMutex.Unlock()
+
+			if !needsReboot {
+				return
+			}
+
+			// Check if it's safe to reboot now
+			safe, err := u.vehicle.IsSafeForDbcReboot()
+			if err != nil {
+				u.logger.Printf("Failed to check if safe for DBC reboot: %v", err)
+				continue
+			}
+
+			if safe {
+				u.logger.Printf("Safe to reboot DBC now")
+				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
+					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+					continue
+				}
+
+				// Successfully triggered reboot, clear the flag
+				u.dbcRebootMutex.Lock()
+				u.dbcRebootNeeded = false
+				u.dbcRebootMutex.Unlock()
+
+				u.logger.Printf("DBC reboot triggered successfully")
+				return
+			}
+		}
+	}
+}
+
 // removeUpdateInhibits removes all inhibits for a component
 func (u *Updater) removeUpdateInhibits(component string) {
 	// Remove download inhibit if it exists
@@ -697,11 +776,20 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 		} else {
 			u.logger.Printf("DBC update completed successfully")
 			
-			// Reboot DBC to apply the update
-			if err := u.vehicle.TriggerReboot("dbc"); err != nil {
-				u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+			// Check if it's safe to reboot DBC
+			safe, err := u.vehicle.IsSafeForDbcReboot()
+			if err != nil {
+				u.logger.Printf("Failed to check if safe for DBC reboot: %v", err)
+			} else if safe {
+				// Reboot DBC to apply the update
+				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
+					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+				} else {
+					u.logger.Printf("DBC reboot triggered successfully")
+				}
 			} else {
-				u.logger.Printf("DBC reboot triggered successfully")
+				u.logger.Printf("Not safe to reboot DBC now, scheduling reboot check")
+				u.scheduleDbcRebootCheck()
 			}
 		}
 	}
