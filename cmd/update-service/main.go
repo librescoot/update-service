@@ -19,7 +19,7 @@ import (
 var (
 	redisAddr         = flag.String("redis-addr", "localhost:6379", "Redis server address")
 	githubReleasesURL = flag.String("github-releases-url", "https://api.github.com/repos/librescoot/librescoot/releases", "GitHub Releases API URL")
-	checkInterval     = flag.Duration("check-interval", 4*time.Hour, "Interval between update checks")
+	checkInterval     = flag.Duration("check-interval", 1*time.Hour, "Interval between update checks")
 	defaultChannel    = flag.String("default-channel", "stable", "Default update channel (stable, testing, nightly)")
 	components        = flag.String("components", "dbc,mdb", "Comma-separated list of components to check for updates")
 	dbcUpdateKey      = flag.String("dbc-update-key", "mender/update/dbc/url", "Redis key for DBC update URLs")
