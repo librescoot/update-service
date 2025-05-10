@@ -864,22 +864,3 @@ func (u *Updater) downloadFile(url, filePath string) error {
 
 	return nil
 }
-
-// removeUpdateInhibits removes all inhibits for a component
-func (u *Updater) removeUpdateInhibits(component string) {
-	// Remove download inhibit if it exists
-	if err := u.inhibitor.RemoveDownloadInhibit(component); err != nil {
-		// Log but don't fail if the inhibit doesn't exist
-		if !strings.Contains(err.Error(), "does not exist") {
-			u.logger.Printf("Failed to remove download inhibit for %s: %v", component, err)
-		}
-	}
-
-	// Remove install inhibit if it exists
-	if err := u.inhibitor.RemoveInstallInhibit(component); err != nil {
-		// Log but don't fail if the inhibit doesn't exist
-		if !strings.Contains(err.Error(), "does not exist") {
-			u.logger.Printf("Failed to remove install inhibit for %s: %v", component, err)
-		}
-	}
-}
