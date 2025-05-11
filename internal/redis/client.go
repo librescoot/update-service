@@ -67,6 +67,16 @@ func (c *Client) GetOTAStatus(otaHashKey string) (map[string]string, error) {
 	return c.client.HGetAll(c.ctx, otaHashKey).Result()
 }
 
+// SetOTAStatus sets a field in the OTA status hash
+func (c *Client) SetOTAStatus(otaHashKey, field, value string) error {
+	return c.client.HSet(c.ctx, otaHashKey, field, value).Err()
+}
+
+// GetOTAField gets a specific field from the OTA status hash
+func (c *Client) GetOTAField(otaHashKey, field string) (string, error) {
+	return c.client.HGet(c.ctx, otaHashKey, field).Result()
+}
+
 // SubscribeToOTAStatus subscribes to the OTA status channel
 // It returns a channel that will receive messages when the OTA status changes
 func (c *Client) SubscribeToOTAStatus(channel string) (<-chan string, func(), error) {
