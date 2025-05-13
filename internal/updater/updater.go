@@ -267,6 +267,9 @@ func (u *Updater) processUpdateTypeChange(updateType string, status map[string]s
 				}
 				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
 					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+				} else {
+					// Start monitoring for dashboard ready to shut it down after reboot
+					go u.monitorDbcReboot()
 				}
 			} else {
 				u.logger.Printf("Not safe to reboot DBC now, scheduling reboot check")
@@ -536,6 +539,9 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 				u.logger.Printf("Reboot needed for DBC and it's safe to do so")
 				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
 					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+				} else {
+					// Start monitoring for dashboard ready to shut it down after reboot
+					go u.monitorDbcReboot()
 				}
 			} else {
 				u.logger.Printf("Not safe to reboot DBC now, scheduling reboot check")
@@ -781,7 +787,6 @@ func (u *Updater) checkForUpdates() {
 
 		// Queue both updates to be processed sequentially
 		if mdbUpdate != nil || dbcUpdate != nil {
-			u.logger.Printf("Processing updates sequentially: %v, %v", mdbUpdate, dbcUpdate)
 			go u.processUpdatesSequentially(mdbUpdate, dbcUpdate)
 		}
 	}
@@ -1075,6 +1080,9 @@ func (u *Updater) waitForDbcReboot() {
 					}
 
 					continue
+				} else {
+					// Start monitoring for dashboard ready to shut it down after reboot
+					go u.monitorDbcReboot()
 				}
 
 				// Successfully triggered reboot, clear the flag
@@ -1189,7 +1197,8 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 	// 2. If DBC is powered off: MDB turns on DBC and waits for readiness
 	// 3. Start local HTTP server for DBC update (done above)
 	// 4. MDB pushes update URL to DBC smut key
-	// 5. Wait for DBC update to complete, then handle MDB update
+	// 5. MDB updates itself
+	// 6. Wait for all running updates to complete
 
 	if dbcUpdate != nil {
 		u.logger.Printf("Processing DBC update")
@@ -1309,6 +1318,8 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
 				} else {
 					u.logger.Printf("DBC reboot triggered successfully")
+					// Start monitoring for dashboard ready to shut it down after reboot
+					go u.monitorDbcReboot()
 				}
 			} else {
 				u.logger.Printf("Not safe to reboot DBC now, scheduling reboot check")
@@ -1327,7 +1338,9 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 		}
 	}
 
-	// Apply MDB update if available (after DBC update has been processed)
+	// Start MDB update if available (in parallel with DBC update)
+	var mdbUpdateComplete bool
+	
 	if mdbUpdate != nil {
 		// Set update in progress for MDB
 		if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-in-progress:mdb", "true"); err != nil {
@@ -1338,7 +1351,7 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 			u.logger.Printf("Failed to set MDB update status: %v", err)
 		}
 
-		u.logger.Printf("Initiating MDB update")
+		u.logger.Printf("Initiating MDB update in parallel with DBC update")
 		if err := u.initiateUpdate(mdbUpdate.component, mdbUpdate.release); err != nil {
 			u.logger.Printf("Failed to initiate MDB update: %v", err)
 
@@ -1353,25 +1366,94 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 				u.logger.Printf("Failed to clear MDB update available flag: %v", err)
 			}
 
-			// Set update-type to failed
+			// Set update-type to failed for this MDB update
 			if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeFailed); err != nil {
 				u.logger.Printf("Failed to set update-type to failed: %v", err)
 			}
+			
+			mdbUpdateComplete = true
+		} else {
+			u.logger.Printf("Successfully initiated MDB update, will wait for completion later")
+		}
+	}
+	
+	// If DBC update was initiated, wait for it to complete before checking MDB status
+	if dbcUpdate != nil && u.updateState["dbc"] == "installing" {
+		// Wait for DBC update to complete before proceeding with MDB reboot
+		complete := u.waitForComponentUpdate("dbc", 30*time.Minute)
+		if !complete {
+			u.logger.Printf("DBC update timed out or failed")
+			if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "status:dbc", "failed"); err != nil {
+				u.logger.Printf("Failed to set DBC update status: %v", err)
+			}
 
-			return
+			if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeFailed); err != nil {
+				u.logger.Printf("Failed to set update-type to failed: %v", err)
+			}
+		} else {
+			u.logger.Printf("DBC update completed successfully")
+			if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "status:dbc", "complete"); err != nil {
+				u.logger.Printf("Failed to set DBC update status: %v", err)
+			}
+
+			// Only set update-type to complete if MDB update is not in progress
+			if mdbUpdate == nil {
+				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeComplete); err != nil {
+					u.logger.Printf("Failed to set update-type to complete: %v", err)
+				}
+			}
+
+			// Check if it's safe to reboot DBC
+			safe, err := u.vehicle.IsSafeForDbcReboot()
+			if err != nil {
+				u.logger.Printf("Failed to check if safe for DBC reboot: %v", err)
+			} else if safe {
+				// Update reboot status
+				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeRebooting); err != nil {
+					u.logger.Printf("Failed to set update-type to rebooting: %v", err)
+				}
+
+				// Reboot DBC to apply the update
+				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
+					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+				} else {
+					u.logger.Printf("DBC reboot triggered successfully")
+					// Start monitoring for dashboard ready to shut it down after reboot
+					go u.monitorDbcReboot()
+				}
+			} else {
+				u.logger.Printf("Not safe to reboot DBC now, scheduling reboot check")
+				u.scheduleDbcRebootCheck()
+			}
 		}
 
+		// Clear the flag indicating update is in progress
+		if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-in-progress:dbc", "false"); err != nil {
+			u.logger.Printf("Failed to clear DBC update in progress flag: %v", err)
+		}
+
+		// Clear the update available flag
+		if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-available:dbc", "false"); err != nil {
+			u.logger.Printf("Failed to clear DBC update available flag: %v", err)
+		}
+	}
+	
+	// Now check MDB update status if it was started
+	if mdbUpdate != nil && !mdbUpdateComplete {
 		// Wait for MDB update to complete
 		complete := u.waitForComponentUpdate("mdb", 30*time.Minute)
+		
 		if !complete {
 			u.logger.Printf("MDB update timed out or failed")
 			if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "status:mdb", "failed"); err != nil {
 				u.logger.Printf("Failed to set MDB update status: %v", err)
 			}
 
-			// Set update-type to failed
-			if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeFailed); err != nil {
-				u.logger.Printf("Failed to set update-type to failed: %v", err)
+			// Set update-type to failed if DBC update also failed or wasn't present
+			if dbcUpdate == nil || u.updateState["dbc"] != "complete" {
+				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeFailed); err != nil {
+					u.logger.Printf("Failed to set update-type to failed: %v", err)
+				}
 			}
 		} else {
 			u.logger.Printf("MDB update completed successfully")
@@ -1572,4 +1654,71 @@ func (u *Updater) downloadFile(url, filePath string) error {
 	}
 
 	return nil
+}
+
+// monitorDbcReboot monitors for dashboard ready signal after DBC reboot
+// and shuts down the DBC if the vehicle is in standby state
+func (u *Updater) monitorDbcReboot() {
+	u.logger.Printf("Starting to monitor for DBC reboot completion")
+	
+	// Wait for dashboard to be ready with a longer timeout (2 minutes)
+	ctx, cancel := context.WithTimeout(u.ctx, 2*time.Minute)
+	defer cancel()
+	
+	dashboardReadyChan := u.redis.SubscribeToDashboardReady(ctx, "dashboard")
+	if dashboardReadyChan == nil {
+		u.logger.Printf("Failed to subscribe to dashboard ready channel for post-reboot monitoring")
+		return
+	}
+	
+	// Wait for dashboard ready signal
+	select {
+	case <-dashboardReadyChan:
+		u.logger.Printf("Dashboard ready signal received after DBC reboot")
+		
+		// Check if the DBC version was updated
+		currentVersion, err := u.redis.GetComponentVersion("dbc")
+		if err != nil {
+			u.logger.Printf("Failed to get DBC version after reboot: %v", err)
+			// Continue with shutdown anyway
+		} else {
+			u.logger.Printf("DBC version after reboot: %s", currentVersion)
+		}
+		
+		// Check vehicle state
+		vehicleState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+		if err != nil {
+			u.logger.Printf("Failed to get vehicle state after DBC reboot: %v", err)
+			// Assume it's safe to shut down
+			vehicleState = "stand-by"
+		}
+		
+		u.logger.Printf("Vehicle state after DBC reboot: %s", vehicleState)
+		
+		// Shut down the DBC regardless of version update status
+		// If the version is not updated, there was some failure and we'll try again later
+		if vehicleState == "stand-by" || vehicleState == "updating" {
+			u.logger.Printf("Vehicle in %s state, shutting down DBC after reboot", vehicleState)
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command to shut down DBC: %v", err)
+			} else {
+				u.logger.Printf("Successfully sent complete-dbc command to shut down DBC after reboot")
+			}
+		} else {
+			u.logger.Printf("Vehicle in %s state, keeping DBC powered on after reboot", vehicleState)
+		}
+		
+		// Update OTA status to indicate reboot is complete
+		if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "status:dbc", "complete"); err != nil {
+			u.logger.Printf("Failed to set DBC status to complete after reboot: %v", err)
+		}
+		
+		// Clear the update-will-shutdown flag
+		if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-will-shutdown", "false"); err != nil {
+			u.logger.Printf("Failed to clear update-will-shutdown flag: %v", err)
+		}
+		
+	case <-ctx.Done():
+		u.logger.Printf("Timed out waiting for dashboard ready after DBC reboot")
+	}
 }
