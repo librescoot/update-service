@@ -82,7 +82,7 @@ func (s *Service) IsSafeForDbcUpdate() (bool, error) {
 }
 
 // IsSafeForMdbReboot checks if it's safe to reboot the MDB
-// MDB should only be rebooted when the scooter is in stand-by mode
+// MDB should only be rebooted when the scooter is in stand-by mode or shutting down
 func (s *Service) IsSafeForMdbReboot() (bool, error) {
 	// Get current state
 	currentState, err := s.redis.GetVehicleState(s.vehicleHashKey)
@@ -90,8 +90,8 @@ func (s *Service) IsSafeForMdbReboot() (bool, error) {
 		return false, fmt.Errorf("failed to get current vehicle state: %w", err)
 	}
 
-	// MDB can only be rebooted in stand-by mode
-	return currentState == "stand-by", nil
+	// MDB can be rebooted in stand-by mode or when shutting down
+	return currentState == "stand-by" || currentState == "shutting-down", nil
 }
 
 // IsSafeForDbcReboot checks if it's safe to reboot the DBC
