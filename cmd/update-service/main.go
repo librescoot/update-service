@@ -11,6 +11,7 @@ import (
 
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/inhibitor"
+	"github.com/librescoot/update-service/internal/power"
 	"github.com/librescoot/update-service/internal/redis"
 	"github.com/librescoot/update-service/internal/updater"
 	"github.com/librescoot/update-service/internal/vehicle"
@@ -79,9 +80,16 @@ func main() {
 		logger.Fatalf("Failed to initialize inhibitor client: %v", err)
 	}
 	defer inhibitorClient.Close()
+	
+	// Initialize power management client
+	powerClient, err := power.New(ctx, *redisAddr, logger)
+	if err != nil {
+		logger.Fatalf("Failed to initialize power client: %v", err)
+	}
+	defer powerClient.Close()
 
 	// Initialize updater
-	updater := updater.New(ctx, cfg, redisClient, vehicleService, inhibitorClient, logger)
+	updater := updater.New(ctx, cfg, redisClient, vehicleService, inhibitorClient, powerClient, logger)
 	if err := updater.Start(); err != nil {
 		logger.Fatalf("Failed to start updater: %v", err)
 	}

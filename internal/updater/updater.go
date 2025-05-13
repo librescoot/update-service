@@ -14,6 +14,7 @@ import (
 
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/inhibitor"
+	"github.com/librescoot/update-service/internal/power"
 	"github.com/librescoot/update-service/internal/redis"
 	"github.com/librescoot/update-service/internal/vehicle"
 )
@@ -43,6 +44,7 @@ type Updater struct {
 	redis            *redis.Client
 	vehicle          *vehicle.Service
 	inhibitor        *inhibitor.Client
+	power            *power.Client
 	logger           *log.Logger
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -60,13 +62,14 @@ type Updater struct {
 }
 
 // New creates a new updater
-func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, vehicleService *vehicle.Service, inhibitorClient *inhibitor.Client, logger *log.Logger) *Updater {
+func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, vehicleService *vehicle.Service, inhibitorClient *inhibitor.Client, powerClient *power.Client, logger *log.Logger) *Updater {
 	updaterCtx, cancel := context.WithCancel(ctx)
 	return &Updater{
 		config:           cfg,
 		redis:            redisClient,
 		vehicle:          vehicleService,
 		inhibitor:        inhibitorClient,
+		power:            powerClient,
 		logger:           logger,
 		ctx:              updaterCtx,
 		cancel:           cancel,
@@ -188,11 +191,25 @@ func (u *Updater) processUpdateTypeChange(updateType string, status map[string]s
 		if err := u.inhibitor.AddDownloadInhibit(component); err != nil {
 			u.logger.Printf("Failed to add download inhibit for %s: %v", component, err)
 		}
+		
+		// Request ondemand governor for better performance during downloads
+		if err := u.power.RequestOndemandGovernor(); err != nil {
+			u.logger.Printf("Failed to request ondemand governor for download: %v", err)
+		} else {
+			u.logger.Printf("Set CPU governor to ondemand for download performance")
+		}
 
 	case UpdateTypeInstalling:
 		// Remove download inhibit, add install inhibit
 		if err := u.inhibitor.RemoveDownloadInhibit(component); err != nil {
 			u.logger.Printf("Failed to remove download inhibit for %s: %v", component, err)
+		}
+		
+		// Request performance governor for installation to ensure consistent timing
+		if err := u.power.RequestPerformanceGovernor(); err != nil {
+			u.logger.Printf("Failed to request performance governor for installation: %v", err)
+		} else {
+			u.logger.Printf("Set CPU governor to performance for stable installation performance")
 		}
 
 		if err := u.inhibitor.AddInstallInhibit(component); err != nil {
@@ -298,6 +315,10 @@ func (u *Updater) processUpdateTypeChange(updateType string, status map[string]s
 
 		// Remove all inhibits
 		u.removeUpdateInhibits(component)
+		
+		// Let PM service decide best governor based on current system state
+		// We don't need to explicitly request powersave here, as PM service
+		// will set the appropriate governor based on system state
 
 		// For DBC, notify vehicle service that update is complete
 		if component == "dbc" {

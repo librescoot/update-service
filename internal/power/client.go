@@ -13,6 +13,9 @@ const (
 	// Redis keys for power inhibits
 	InhibitHashKey = "power:inhibits"
 	InhibitChannel = "power:inhibits"
+	
+	// Redis keys for governor control
+	PowerGovernorListKey = "scooter:governor"
 )
 
 // InhibitType represents the type of power inhibit
@@ -120,4 +123,43 @@ func (c *Client) AddInstallInhibit(componentID string) error {
 func (c *Client) RemoveInstallInhibit(componentID string) error {
 	id := fmt.Sprintf("install:%s", componentID)
 	return c.RemoveInhibit(id)
+}
+
+// Governor represents a CPU governor type
+type Governor string
+
+const (
+	// GovernorOndemand is the on-demand CPU governor, scales frequency based on load
+	GovernorOndemand Governor = "ondemand"
+	// GovernorPowersave is the powersave CPU governor, keeps CPU at lowest frequency
+	GovernorPowersave Governor = "powersave"
+	// GovernorPerformance is the performance CPU governor, keeps CPU at highest frequency
+	GovernorPerformance Governor = "performance"
+)
+
+// RequestGovernor requests a governor change from pm-service
+func (c *Client) RequestGovernor(governor string) error {
+	c.logger.Printf("Requesting CPU governor change to: %s", governor)
+	
+	// Send the command via Redis list
+	if _, err := c.client.LPush(c.ctx, PowerGovernorListKey, governor).Result(); err != nil {
+		return fmt.Errorf("failed to request governor change: %w", err)
+	}
+	
+	return nil
+}
+
+// RequestOndemandGovernor requests the ondemand governor for performance scaling
+func (c *Client) RequestOndemandGovernor() error {
+	return c.RequestGovernor(string(GovernorOndemand))
+}
+
+// RequestPowersaveGovernor requests the powersave governor for power saving
+func (c *Client) RequestPowersaveGovernor() error {
+	return c.RequestGovernor(string(GovernorPowersave))
+}
+
+// RequestPerformanceGovernor requests the performance governor for maximum performance
+func (c *Client) RequestPerformanceGovernor() error {
+	return c.RequestGovernor(string(GovernorPerformance))
 }
