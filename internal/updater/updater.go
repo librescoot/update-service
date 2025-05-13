@@ -642,11 +642,14 @@ func (u *Updater) hasUpdatesInProgress() bool {
 	u.stateMutex.Lock()
 	defer u.stateMutex.Unlock()
 
-	for _, state := range u.updateState {
+	u.logger.Printf("Checking if updates are in progress: %v", u.updateState)
+	for component, state := range u.updateState {
 		if state == "updating" {
+			u.logger.Printf("Component %s is currently updating", component)
 			return true
 		}
 	}
+	u.logger.Printf("No updates in progress")
 	return false
 }
 
@@ -676,53 +679,65 @@ func (u *Updater) updateCheckLoop() {
 
 // checkForUpdates checks for updates and initiates the update process if updates are available
 func (u *Updater) checkForUpdates() {
-	u.logger.Printf("Checking for updates")
+	u.logger.Printf("Starting update check process")
 
-	// Get releases from GitHub
+	// Get releases from GitHub with retries
+	u.logger.Printf("Fetching releases from GitHub")
 	releases, err := u.githubAPI.GetReleases()
 	if err != nil {
-		u.logger.Printf("Failed to get releases: %v", err)
+		u.logger.Printf("ERROR: Failed to get releases: %v", err)
 		return
 	}
 
-	u.logger.Printf("Found %d releases", len(releases))
+	u.logger.Printf("Successfully fetched %d releases", len(releases))
 
 	// Find available updates for each component
 	var updates []updateInfo
+	u.logger.Printf("Checking for updates across %d components", len(u.config.Components))
 
 	for _, component := range u.config.Components {
+		u.logger.Printf("Checking component: %s", component)
+
 		// Get the latest release for the component and channel
+		u.logger.Printf("Finding latest release for component %s on channel %s",
+			component, u.config.DefaultChannel)
 		release, found := u.findLatestRelease(releases, component, u.config.DefaultChannel)
 		if !found {
-			u.logger.Printf("No release found for component %s and channel %s", component, u.config.DefaultChannel)
+			u.logger.Printf("No release found for component %s and channel %s",
+				component, u.config.DefaultChannel)
 			continue
 		}
 
 		// Find the .mender asset for the component
 		var menderAsset string
 		var assetURL string
+		u.logger.Printf("Looking for .mender asset for component %s", component)
 		for _, asset := range release.Assets {
 			if strings.Contains(asset.Name, component) && strings.HasSuffix(asset.Name, ".mender") {
 				menderAsset = asset.Name
 				assetURL = asset.BrowserDownloadURL
+				u.logger.Printf("Found .mender asset: %s with URL: %s", menderAsset, assetURL)
 				break
 			}
 		}
 
-		u.logger.Printf("Found release for component %s: %s (asset: %s)", component, release.TagName, menderAsset)
+		u.logger.Printf("Found release for component %s: %s (asset: %s)",
+			component, release.TagName, menderAsset)
 
 		// Check if update is needed
-		if u.isUpdateNeeded(component, release) {
+		isNeeded := u.isUpdateNeeded(component, release)
+		if isNeeded {
 			u.logger.Printf("Update needed for component %s", component)
 
 			if assetURL != "" {
+				u.logger.Printf("Adding update for component %s with URL %s", component, assetURL)
 				updates = append(updates, updateInfo{
 					component: component,
 					release:   release,
 					assetURL:  assetURL,
 				})
 			} else {
-				u.logger.Printf("No .mender asset URL found for component %s", component)
+				u.logger.Printf("ERROR: No .mender asset URL found for component %s", component)
 			}
 		} else {
 			u.logger.Printf("No update needed for component %s", component)
@@ -745,6 +760,7 @@ func (u *Updater) checkForUpdates() {
 
 		// Queue both updates to be processed sequentially
 		if mdbUpdate != nil || dbcUpdate != nil {
+			u.logger.Printf("Processing updates sequentially: %v, %v", mdbUpdate, dbcUpdate)
 			go u.processUpdatesSequentially(mdbUpdate, dbcUpdate)
 		}
 	}
@@ -821,29 +837,43 @@ func (u *Updater) isUpdateNeeded(component string, release Release) bool {
 
 // initiateUpdate initiates the update process for the given component
 func (u *Updater) initiateUpdate(component string, release Release) error {
+	u.logger.Printf("Initiating update for component %s with release %s", component, release.TagName)
+
+	// First check if updates are already in progress
+	if u.hasUpdatesInProgress() {
+		u.logger.Printf("CAUTION: Updates already in progress, will attempt to handle this update anyway")
+	}
+
 	// Find the .mender asset for the component
 	var assetURL string
+	u.logger.Printf("Looking for .mender asset in release assets")
 	for _, asset := range release.Assets {
 		if strings.Contains(asset.Name, component) && strings.HasSuffix(asset.Name, ".mender") {
 			assetURL = asset.BrowserDownloadURL
+			u.logger.Printf("Found asset URL: %s", assetURL)
 			break
 		}
 	}
 
 	if assetURL == "" {
+		u.logger.Printf("ERROR: No .mender asset found for component %s", component)
 		return fmt.Errorf("no .mender asset found for component %s", component)
 	}
 
 	// Set update state
+	u.logger.Printf("Setting update state for component %s to 'updating'", component)
 	u.stateMutex.Lock()
 	u.updateState[component] = "updating"
 	u.stateMutex.Unlock()
+	u.logger.Printf("Update state set for component %s", component)
 
 	// Set update-type and update-component in Redis
+	u.logger.Printf("Setting update-type to %s in Redis", UpdateTypeDownloading)
 	if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeDownloading); err != nil {
 		u.logger.Printf("Failed to set update-type: %v", err)
 	}
 
+	u.logger.Printf("Setting update-component to %s in Redis", component)
 	if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-component", component); err != nil {
 		u.logger.Printf("Failed to set update-component: %v", err)
 	}
@@ -861,9 +891,13 @@ func (u *Updater) initiateUpdate(component string, release Release) error {
 
 // updateDBC updates the DBC component
 func (u *Updater) updateDBC(assetURL string) error {
+	u.logger.Printf("Starting DBC update process with URL: %s", assetURL)
+
 	// Check if it's safe to update DBC
+	u.logger.Printf("Checking if safe to update DBC")
 	safe, err := u.vehicle.IsSafeForDbcUpdate()
 	if err != nil {
+		u.logger.Printf("Error checking if safe for DBC update: %v", err)
 		return fmt.Errorf("failed to check if safe for DBC update: %w", err)
 	}
 
@@ -872,37 +906,52 @@ func (u *Updater) updateDBC(assetURL string) error {
 		// This never actually happens, we just don't reboot the DBC
 		return fmt.Errorf("not safe to update DBC")
 	}
+	u.logger.Printf("Safe to update DBC, proceeding")
 
 	// Notify vehicle service that DBC update is starting
+	u.logger.Printf("Sending start-dbc command to vehicle service")
 	if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+		u.logger.Printf("Error sending start-dbc command: %v", err)
 		return fmt.Errorf("failed to send start-dbc command: %w", err)
 	}
+	u.logger.Printf("Successfully sent start-dbc command")
 
 	// Push update URL to SMUT
 	u.logger.Printf("Pushing DBC update URL to Redis key %s: %s", u.config.DbcUpdateKey, assetURL)
 	if err := u.redis.PushUpdateURL(u.config.DbcUpdateKey, assetURL); err != nil {
+		u.logger.Printf("ERROR: Failed to push DBC update URL: %v", err)
 		// Notify vehicle service that DBC update is complete (failed)
+		u.logger.Printf("Sending complete-dbc command to indicate failure")
 		u.redis.PushUpdateCommand("complete-dbc")
 		return fmt.Errorf("failed to push DBC update URL: %w", err)
 	}
+	u.logger.Printf("Successfully pushed DBC update URL to Redis")
 
 	return nil
 }
 
 // updateMDB updates the MDB component
 func (u *Updater) updateMDB(assetURL string) error {
+	u.logger.Printf("Starting MDB update process with URL: %s", assetURL)
+
 	// Notify vehicle service that update is starting
+	u.logger.Printf("Sending start command to vehicle service")
 	if err := u.redis.PushUpdateCommand("start"); err != nil {
+		u.logger.Printf("Error sending start command: %v", err)
 		return fmt.Errorf("failed to send start command: %w", err)
 	}
+	u.logger.Printf("Successfully sent start command")
 
 	// Push update URL to SMUT
 	u.logger.Printf("Pushing MDB update URL to Redis key %s: %s", u.config.MdbUpdateKey, assetURL)
 	if err := u.redis.PushUpdateURL(u.config.MdbUpdateKey, assetURL); err != nil {
+		u.logger.Printf("ERROR: Failed to push MDB update URL: %v", err)
 		// Notify vehicle service that update is complete (failed)
+		u.logger.Printf("Sending complete command to indicate failure")
 		u.redis.PushUpdateCommand("complete")
 		return fmt.Errorf("failed to push MDB update URL: %w", err)
 	}
+	u.logger.Printf("Successfully pushed MDB update URL to Redis")
 
 	return nil
 }
@@ -1045,10 +1094,22 @@ func (u *Updater) removeUpdateInhibits(component string) {
 
 // processUpdatesSequentially handles the sequential processing of MDB and DBC updates
 func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
-	// Track if we have active updates
-	u.stateMutex.Lock()
+	u.logger.Printf("Starting processUpdatesSequentially - mdbUpdate: %v, dbcUpdate: %v",
+		mdbUpdate != nil, dbcUpdate != nil)
+
+	if dbcUpdate != nil {
+		u.logger.Printf("DBC update details - component: %s, assetURL: %s, release tag: %s",
+			dbcUpdate.component, dbcUpdate.assetURL, dbcUpdate.release.TagName)
+	}
+
+	if mdbUpdate != nil {
+		u.logger.Printf("MDB update details - component: %s, assetURL: %s, release tag: %s",
+		mdbUpdate.component, mdbUpdate.assetURL, mdbUpdate.release.TagName)
+	}
+	
 	activeUpdates := u.hasUpdatesInProgress()
-	u.stateMutex.Unlock()
+
+	u.logger.Printf("Active updates check: %v", activeUpdates)
 
 	if activeUpdates {
 		u.logger.Printf("Updates already in progress, skipping this update cycle")
@@ -1057,11 +1118,13 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 
 	// Update OTA status to indicate what components need updates
 	if mdbUpdate != nil {
+		u.logger.Printf("Setting MDB update available flag")
 		if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-available:mdb", "true"); err != nil {
 			u.logger.Printf("Failed to set MDB update available flag: %v", err)
 		}
 	}
 	if dbcUpdate != nil {
+		u.logger.Printf("Setting DBC update available flag")
 		if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-available:dbc", "true"); err != nil {
 			u.logger.Printf("Failed to set DBC update available flag: %v", err)
 		}
@@ -1069,6 +1132,7 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 
 	// Set global update-type status to available
 	if mdbUpdate != nil || dbcUpdate != nil {
+		u.logger.Printf("Setting update-type to available")
 		if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeAvailable); err != nil {
 			u.logger.Printf("Failed to set update-type to available: %v", err)
 		}
@@ -1079,17 +1143,24 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 	if dbcUpdate != nil {
 		var err error
 		u.logger.Printf("Downloading DBC update to local server")
+
+		// Attempt to set up the local update server
 		dbcLocalURL, err = u.setupLocalUpdateServer(dbcUpdate.assetURL)
 		if err != nil {
 			u.logger.Printf("Failed to set up local update server for DBC: %v", err)
 			// Continue with the original URL if local server setup fails
+			u.logger.Printf("Will use original URL instead: %s", dbcUpdate.assetURL)
 			dbcLocalURL = ""
 		} else {
 			u.logger.Printf("DBC update downloaded and ready at local URL: %s", dbcLocalURL)
 			if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-downloaded:dbc", "true"); err != nil {
 				u.logger.Printf("Failed to set DBC update downloaded flag: %v", err)
+			} else {
+				u.logger.Printf("Set DBC update downloaded flag to true")
 			}
 		}
+	} else {
+		u.logger.Printf("No DBC update to process")
 	}
 
 	// Following the specified update flow:
@@ -1100,19 +1171,27 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 	// 5. Wait for DBC update to complete, then handle MDB update
 
 	if dbcUpdate != nil {
+		u.logger.Printf("Processing DBC update")
+
 		// Ensure dashboard power is on before starting DBC update
+		u.logger.Printf("Sending start-dbc command to ensure dashboard power is on")
 		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
 			u.logger.Printf("Failed to send start-dbc command: %v", err)
+			u.logger.Printf("CRITICAL: Cannot proceed with DBC update without dashboard power")
 			return
 		}
+		u.logger.Printf("Successfully sent start-dbc command")
 
 		// Set update in progress for DBC
+		u.logger.Printf("Setting DBC update in progress flag")
 		if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-in-progress:dbc", "true"); err != nil {
 			u.logger.Printf("Failed to set DBC update in progress flag: %v", err)
+		} else {
+			u.logger.Printf("Successfully set DBC update in progress flag")
 		}
 
 		// Wait for dashboard to be ready (subscribe to dashboard ready signal)
-		u.logger.Printf("Waiting for dashboard to be ready")
+		u.logger.Printf("Waiting for dashboard to be ready (30 second timeout)")
 		dashboardReady := u.waitForDashboardReady(30 * time.Second)
 		if !dashboardReady {
 			u.logger.Printf("Dashboard not ready after timeout, proceeding with update anyway")
@@ -1121,21 +1200,26 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 		}
 
 		// Use local URL if available, otherwise use original URL
+		u.logger.Printf("Preparing DBC update URL")
 		dbcUpdate.release.TagName = "local" // Mark the release as local for proper initiation
 		urlToUse := dbcUpdate.assetURL
 		if dbcLocalURL != "" {
 			urlToUse = dbcLocalURL
 			u.logger.Printf("Using local URL for DBC update: %s", dbcLocalURL)
+		} else {
+			u.logger.Printf("Using original URL for DBC update: %s", dbcUpdate.assetURL)
 		}
 
 		// Initiate the DBC update
+		u.logger.Printf("Waiting 3 seconds to ensure dashboard is fully ready")
 		time.Sleep(3 * time.Second)   // Wait a bit to ensure dashboard is fully ready
 		dbcUpdate.assetURL = urlToUse // Update the URL to use
-		u.logger.Printf("Initiating DBC update")
+		u.logger.Printf("Initiating DBC update via initiateUpdate()")
 		if err := u.initiateUpdate(dbcUpdate.component, dbcUpdate.release); err != nil {
-			u.logger.Printf("Failed to initiate DBC update: %v", err)
+			u.logger.Printf("CRITICAL ERROR: Failed to initiate DBC update: %v", err)
 
 			// Clear the update flags
+			u.logger.Printf("Clearing DBC update flags due to failure")
 			if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-in-progress:dbc", "false"); err != nil {
 				u.logger.Printf("Failed to clear DBC update in progress flag: %v", err)
 			}
@@ -1145,6 +1229,7 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 
 			// Reset update-type if there's no MDB update
 			if mdbUpdate == nil {
+				u.logger.Printf("Resetting update-type to none (no MDB update to process)")
 				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeNone); err != nil {
 					u.logger.Printf("Failed to reset update-type: %v", err)
 				}
@@ -1155,8 +1240,11 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 			if mdbUpdate != nil {
 				u.logger.Printf("Proceeding with MDB update despite DBC update failure")
 			} else {
+				u.logger.Printf("No MDB update to process, returning after DBC update failure")
 				return
 			}
+		} else {
+			u.logger.Printf("Successfully initiated DBC update")
 		}
 
 		// If DBC update was initiated successfully, wait for it to complete
