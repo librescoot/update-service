@@ -184,11 +184,20 @@ func (s *Service) TriggerReboot(component string) error {
 			return fmt.Errorf("not safe to reboot DBC while in %s state", currentState)
 		}
 		
-		// For DBC, we need to cycle the DASHBOARD_POWER rail via vehicle-service
-		// This will cause the DBC to reboot
-		if err := s.redis.PushUpdateCommand("cycle-dashboard-power"); err != nil {
-			return fmt.Errorf("failed to send cycle-dashboard-power command: %w", err)
+		// For DBC, we need to send complete-dbc followed by start-dbc
+		// This properly restarts the DBC via vehicle-service
+		if err := s.redis.PushUpdateCommand("complete-dbc"); err != nil {
+			return fmt.Errorf("failed to send complete-dbc command: %w", err)
 		}
+		
+		// Wait a short time for the complete-dbc command to be processed
+		time.Sleep(500 * time.Millisecond)
+		
+		// Send start-dbc to initiate the reboot
+		if err := s.redis.PushUpdateCommand("start-dbc"); err != nil {
+			return fmt.Errorf("failed to send start-dbc command: %w", err)
+		}
+		
 		return nil
 		
 	default:
