@@ -836,7 +836,62 @@ func (u *Updater) isUpdateNeeded(component string, release Release) bool {
 		return true
 	}
 
-	// If no version is installed, an update is needed
+	// Special case for DBC: If no version is installed, turn on DBC and check again
+	if currentVersion == "" && component == "dbc" {
+		u.logger.Printf("No %s version found, turning on DBC to check version", component)
+		
+		// Send command to turn on DBC
+		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+			u.logger.Printf("Failed to send start-dbc command: %v", err)
+			return true
+		}
+		
+		// Wait for dashboard to be ready
+		dashboardReady := u.waitForDashboardReady(30 * time.Second)
+		if !dashboardReady {
+			u.logger.Printf("Dashboard not ready after timeout, assuming update needed")
+			return true
+		}
+		
+		// Check version again
+		currentVersion, err = u.redis.GetComponentVersion(component)
+		if err != nil {
+			u.logger.Printf("Failed to get current %s version after DBC startup: %v", component, err)
+			return true
+		}
+		
+		// If still no version, update is needed
+		if currentVersion == "" {
+			u.logger.Printf("No %s version found after DBC startup, update needed", component)
+			return true
+		}
+		
+		// Extract the timestamp part from the release tag
+		parts := strings.Split(release.TagName, "-")
+		if len(parts) < 2 {
+			u.logger.Printf("Invalid release tag format: %s", release.TagName)
+			return true
+		}
+		
+		// Convert to lowercase for comparison with Redis version_id
+		normalizedReleaseVersion := strings.ToLower(parts[1])
+		
+		// Check if update is needed
+		if currentVersion != normalizedReleaseVersion {
+			u.logger.Printf("Update needed for %s: current=%s, release=%s", component, currentVersion, normalizedReleaseVersion)
+			return true
+		}
+		
+		// No update needed, turn off DBC
+		u.logger.Printf("No update needed for %s: current=%s, release=%s", component, currentVersion, normalizedReleaseVersion)
+		if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+			u.logger.Printf("Failed to send complete-dbc command to turn off DBC: %v", err)
+		}
+		
+		return false
+	}
+
+	// Standard case: If no version is installed, an update is needed
 	if currentVersion == "" {
 		u.logger.Printf("No %s version found, update needed", component)
 		return true
