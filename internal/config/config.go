@@ -27,11 +27,9 @@ type Config struct {
 	// Component configuration
 	Components []string // "dbc", "mdb"
 
-	// SMUT configuration
-	DbcUpdateKey   string // "mender/update/dbc/url"
-	MdbUpdateKey   string // "mender/update/mdb/url"
-	DbcChecksumKey string // "mender/update/dbc/checksum"
-	MdbChecksumKey string // "mender/update/mdb/checksum"
+	// Update configuration
+	DbcUpdateKey string // "update:install:dbc" (contains URL#checksum)
+	MdbUpdateKey string // "update:install:mdb" (contains URL#checksum)
 
 	// Update constraints
 	MdbRebootCheckInterval time.Duration // How often to check if MDB can be rebooted
@@ -50,8 +48,6 @@ func New(
 	componentsStr string,
 	dbcUpdateKey string,
 	mdbUpdateKey string,
-	dbcChecksumKey string,
-	mdbChecksumKey string,
 	dryRun bool,
 ) *Config {
 	// Parse components string into slice
@@ -68,8 +64,6 @@ func New(
 		Components:        components,
 		DbcUpdateKey:      dbcUpdateKey,
 		MdbUpdateKey:      mdbUpdateKey,
-		DbcChecksumKey:    dbcChecksumKey,
-		MdbChecksumKey:    mdbChecksumKey,
 		// Default values for update constraints
 		MdbRebootCheckInterval: 5 * time.Minute,
 		UpdateRetryInterval:    15 * time.Minute,

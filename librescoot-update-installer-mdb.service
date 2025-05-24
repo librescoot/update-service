@@ -1,0 +1,21 @@
+[Unit]
+Description=Librescoot Update Installer (MDB)
+After=network.target redis.service
+Wants=redis.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/update-installer \
+    --redis-addr=192.168.7.1:6379 \
+    --update-key=update:install:mdb \
+    --failure-key=update:failure \
+    --component=mdb \
+    --update-type=non-blocking \
+    --fetch-queue=fetch-requests
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

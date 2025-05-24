@@ -23,10 +23,8 @@ var (
 	checkInterval     = flag.Duration("check-interval", 1*time.Hour, "Interval between update checks")
 	defaultChannel    = flag.String("default-channel", "stable", "Default update channel (stable, testing, nightly)")
 	components        = flag.String("components", "dbc,mdb", "Comma-separated list of components to check for updates")
-	dbcUpdateKey      = flag.String("dbc-update-key", "mender/update/dbc/url", "Redis key for DBC update URLs")
-	mdbUpdateKey      = flag.String("mdb-update-key", "mender/update/mdb/url", "Redis key for MDB update URLs")
-	dbcChecksumKey    = flag.String("dbc-checksum-key", "mender/update/dbc/checksum", "Redis key for DBC update checksums")
-	mdbChecksumKey    = flag.String("mdb-checksum-key", "mender/update/mdb/checksum", "Redis key for MDB update checksums")
+	dbcUpdateKey      = flag.String("dbc-update-key", "update:install:dbc", "Redis key for DBC updates (URL#checksum)")
+	mdbUpdateKey      = flag.String("mdb-update-key", "update:install:mdb", "Redis key for MDB updates (URL#checksum)")
 	dryRun            = flag.Bool("dry-run", false, "If true, don't actually reboot, just notify")
 )
 
@@ -59,8 +57,6 @@ func main() {
 		*components,
 		*dbcUpdateKey,
 		*mdbUpdateKey,
-		*dbcChecksumKey,
-		*mdbChecksumKey,
 		*dryRun,
 	)
 
