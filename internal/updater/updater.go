@@ -49,6 +49,8 @@ type Updater struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	githubAPI        *GitHubAPI
+	updateState      map[string]string
+	stateMutex       sync.Mutex
 	otaMessages      <-chan string
 	cleanupSub       func()
 	httpServer       *http.Server
@@ -70,6 +72,8 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, veh
 		ctx:              updaterCtx,
 		cancel:           cancel,
 		githubAPI:        NewGitHubAPI(updaterCtx, cfg.GitHubReleasesURL, logger),
+		updateState:      make(map[string]string),
+		stateMutex:       sync.Mutex{},
 		httpServerMutex:  sync.Mutex{},
 		dbcDownloadReady: make(chan struct{}),
 	}
@@ -161,6 +165,20 @@ func (u *Updater) processUpdateTypeChange(updateType string, status map[string]s
 	}
 
 	u.logger.Printf("Processing update-type change for component %s: %s", component, updateType)
+
+	// Check if we're tracking this component
+	u.stateMutex.Lock()
+	_, tracking := u.updateState[component]
+	if tracking {
+		// Update our local state to match Redis
+		u.updateState[component] = updateType
+	}
+	u.stateMutex.Unlock()
+
+	if !tracking {
+		u.logger.Printf("Ignoring update-type change for untracked component: %s", component)
+		return
+	}
 
 	// Handle state transitions based on update-type
 	switch updateType {
@@ -354,15 +372,22 @@ func (u *Updater) processUpdateTypeChange(updateType string, status map[string]s
 
 // processOTAStatus processes an OTA status update
 func (u *Updater) processOTAStatus(status map[string]string) {
-	// Process status for all known components
-	components := []string{"dbc", "mdb"}
-	
+	// Check if we're tracking any components
+	u.stateMutex.Lock()
+	components := make([]string, 0, len(u.updateState))
+	for component := range u.updateState {
+		components = append(components, component)
+	}
+	u.stateMutex.Unlock()
+
+	if len(components) == 0 {
+		u.logger.Printf("No components being tracked, ignoring OTA status update")
+		return
+	}
+
+	// Process the status for each tracked component
 	for _, component := range components {
-		// Only process if the component has a status
-		componentStatusKey := "status:" + component
-		if _, exists := status[componentStatusKey]; exists {
-			u.processComponentStatus(component, status)
-		}
+		u.processComponentStatus(component, status)
 	}
 }
 
@@ -370,7 +395,15 @@ func (u *Updater) processOTAStatus(status map[string]string) {
 func (u *Updater) processComponentStatus(component string, status map[string]string) {
 	u.logger.Printf("Processing status update for component: %s", component)
 
-	// Process component status update
+	// Check if we're tracking this component
+	u.stateMutex.Lock()
+	_, tracking := u.updateState[component]
+	u.stateMutex.Unlock()
+
+	if !tracking {
+		u.logger.Printf("Ignoring OTA status update for untracked component: %s", component)
+		return
+	}
 
 	// Check component-specific status
 	componentStatusKey := "status:" + component
@@ -390,12 +423,11 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 		return
 	}
 
-	// Get previous state from Redis for logging
-	status, err := u.redis.GetOTAStatus(config.OtaStatusHashKey)
-	if err != nil {
-		u.logger.Printf("Failed to get previous state for %s: %v", component, err)
-	}
-	prevState := status["status:"+component]
+	// Update our internal state map first
+	u.stateMutex.Lock()
+	prevState := u.updateState[component]
+	u.updateState[component] = currentStatus
+	u.stateMutex.Unlock()
 
 	u.logger.Printf("Component %s state changed: %s -> %s", component, prevState, currentStatus)
 
@@ -651,31 +683,17 @@ func (u *Updater) stopHttpServer() {
 
 // hasUpdatesInProgress checks if any component updates are in progress
 func (u *Updater) hasUpdatesInProgress() bool {
-	// Check Redis for active component updates
-	status, err := u.redis.GetOTAStatus(config.OtaStatusHashKey)
-	if err != nil {
-		u.logger.Printf("Failed to get OTA status: %v", err)
-		return false
-	}
+	u.stateMutex.Lock()
+	defer u.stateMutex.Unlock()
 
-	// Check if any component is actively updating
-	dbcStatus := status["status:dbc"]
-	mdbStatus := status["status:mdb"]
-	
-	activeStates := []string{"downloading", "installing", "waiting-reboot", "rebooting"}
-	
-	for _, activeState := range activeStates {
-		if dbcStatus == activeState {
-			u.logger.Printf("DBC is currently updating (%s)", dbcStatus)
-			return true
-		}
-		if mdbStatus == activeState {
-			u.logger.Printf("MDB is currently updating (%s)", mdbStatus)
+	u.logger.Printf("Checking if updates are in progress: %v", u.updateState)
+	for component, state := range u.updateState {
+		if state == "updating" {
+			u.logger.Printf("Component %s is currently updating", component)
 			return true
 		}
 	}
-	
-	u.logger.Printf("No updates in progress (dbc:%s, mdb:%s)", dbcStatus, mdbStatus)
+	u.logger.Printf("No updates in progress")
 	return false
 }
 
@@ -940,8 +958,12 @@ func (u *Updater) initiateUpdate(component string, release Release) error {
 		return fmt.Errorf("no .mender asset found for component %s", component)
 	}
 
-	// Update state will be set in Redis through the component status update
-	u.logger.Printf("Component %s starting update", component)
+	// Set update state
+	u.logger.Printf("Setting update state for component %s to 'updating'", component)
+	u.stateMutex.Lock()
+	u.updateState[component] = "updating"
+	u.stateMutex.Unlock()
+	u.logger.Printf("Update state set for component %s", component)
 
 	// Set update-type and update-component in Redis
 	u.logger.Printf("Setting update-type to %s in Redis", UpdateTypeDownloading)
