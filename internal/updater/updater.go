@@ -964,20 +964,6 @@ func (u *Updater) initiateUpdate(component string, release Release) error {
 func (u *Updater) updateDBC(assetURL string) error {
 	u.logger.Printf("Starting DBC update process with URL: %s", assetURL)
 
-	// Check DBC version first to determine if update is actually needed
-	currentVersion, err := u.redis.GetComponentVersion("dbc")
-	if err != nil {
-		u.logger.Printf("Failed to get current DBC version: %v", err)
-		currentVersion = ""
-	}
-	
-	// If no version is found, assume it's either not LibreScoot or doesn't need an update
-	if currentVersion == "" {
-		u.logger.Printf("No DBC version found - assuming non-LibreScoot firmware or no update needed")
-		u.logger.Printf("DBC will populate version hash when it turns on, update will trigger then if needed")
-		return nil
-	}
-
 	// Check if it's safe to update DBC
 	u.logger.Printf("Checking if safe to update DBC")
 	safe, err := u.vehicle.IsSafeForDbcUpdate()
@@ -1000,6 +986,14 @@ func (u *Updater) updateDBC(assetURL string) error {
 		return fmt.Errorf("failed to send start-dbc command: %w", err)
 	}
 	u.logger.Printf("Successfully sent start-dbc command")
+
+	// Check DBC version to determine which key format to use
+	currentVersion, err := u.redis.GetComponentVersion("dbc")
+	if err != nil {
+		u.logger.Printf("Failed to get current DBC version: %v", err)
+		// If we can't get the version, assume it's old
+		currentVersion = ""
+	}
 
 	// Use old key format for versions before 20250524t000000
 	// String comparison works correctly for YYYYMMDDtHHMMSS format
