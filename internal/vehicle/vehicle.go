@@ -107,6 +107,19 @@ func (s *Service) IsSafeForDbcReboot() (bool, error) {
 	return currentState != "ready-to-drive" && currentState != "parked", nil
 }
 
+// IsSafeForDbcPowerDown checks if it's safe to power down the DBC
+// Same logic as reboot - DBC should not be powered down when scooter is actively used
+func (s *Service) IsSafeForDbcPowerDown() (bool, error) {
+	// Get current state
+	currentState, err := s.redis.GetVehicleState(s.vehicleHashKey)
+	if err != nil {
+		return false, fmt.Errorf("failed to get current vehicle state: %w", err)
+	}
+
+	// DBC should not be powered down in ready-to-drive or parked modes
+	return currentState != "ready-to-drive" && currentState != "parked", nil
+}
+
 // ScheduleMdbRebootCheck schedules a check for MDB reboot safety
 // It will periodically check if it's safe to reboot the MDB
 // and signal on the rebootCheckChan when it's safe
