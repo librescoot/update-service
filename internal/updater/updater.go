@@ -987,54 +987,16 @@ func (u *Updater) updateDBC(assetURL string) error {
 	}
 	u.logger.Printf("Successfully sent start-dbc command")
 
-	// Check DBC version to determine which key format to use
-	currentVersion, err := u.redis.GetComponentVersion("dbc")
-	if err != nil {
-		u.logger.Printf("Failed to get current DBC version: %v", err)
-		// If we can't get the version, assume it's old
-		currentVersion = ""
+	// Push update URL to SMUT
+	u.logger.Printf("Pushing DBC update URL to Redis key %s: %s", u.config.DbcUpdateKey, assetURL)
+	if err := u.redis.PushUpdateURL(u.config.DbcUpdateKey, assetURL); err != nil {
+		u.logger.Printf("ERROR: Failed to push DBC update URL: %v", err)
+		// Notify vehicle service that DBC update is complete (failed)
+		u.logger.Printf("Sending complete-dbc command to indicate failure")
+		u.redis.PushUpdateCommand("complete-dbc")
+		return fmt.Errorf("failed to push DBC update URL: %w", err)
 	}
-
-	// Use old key format for versions before 20250524t000000
-	// String comparison works correctly for YYYYMMDDtHHMMSS format
-	if currentVersion != "" && currentVersion < "20250524t000000" {
-		u.logger.Printf("DBC version %s is before 20250524t000000, using old key format", currentVersion)
-		
-		// Use old keys: mender/update/dbc/url and mender/update/dbc/checksum
-		oldUrlKey := "mender/update/dbc/url"
-		oldChecksumKey := "mender/update/dbc/checksum"
-		
-		// Push URL to old key
-		u.logger.Printf("Pushing DBC update URL to legacy Redis key %s: %s", oldUrlKey, assetURL)
-		if err := u.redis.PushUpdateURL(oldUrlKey, assetURL); err != nil {
-			u.logger.Printf("ERROR: Failed to push DBC update URL to legacy key: %v", err)
-			// Notify vehicle service that DBC update is complete (failed)
-			u.logger.Printf("Sending complete-dbc command to indicate failure")
-			u.redis.PushUpdateCommand("complete-dbc")
-			return fmt.Errorf("failed to push DBC update URL to legacy key: %w", err)
-		}
-		
-		// For old format, we also need to set the checksum separately
-		// Extract checksum from URL if available (not implemented in this version)
-		// For now, just log that we're using old format without checksum
-		u.logger.Printf("Note: Old DBC version detected, checksum not set (would use key %s)", oldChecksumKey)
-		
-		u.logger.Printf("Successfully pushed DBC update URL to legacy Redis key")
-	} else {
-		// Use new key format for newer versions or unknown versions
-		u.logger.Printf("Using new key format for DBC update (version: %s)", currentVersion)
-		
-		// Push update URL to update-installer
-		u.logger.Printf("Pushing DBC update URL to Redis key %s: %s", u.config.DbcUpdateKey, assetURL)
-		if err := u.redis.PushUpdateURL(u.config.DbcUpdateKey, assetURL); err != nil {
-			u.logger.Printf("ERROR: Failed to push DBC update URL: %v", err)
-			// Notify vehicle service that DBC update is complete (failed)
-			u.logger.Printf("Sending complete-dbc command to indicate failure")
-			u.redis.PushUpdateCommand("complete-dbc")
-			return fmt.Errorf("failed to push DBC update URL: %w", err)
-		}
-		u.logger.Printf("Successfully pushed DBC update URL to Redis")
-	}
+	u.logger.Printf("Successfully pushed DBC update URL to Redis")
 
 	return nil
 }
@@ -1051,7 +1013,7 @@ func (u *Updater) updateMDB(assetURL string) error {
 	}
 	u.logger.Printf("Successfully sent start command")
 
-	// Push update URL to update-installer
+	// Push update URL to SMUT
 	u.logger.Printf("Pushing MDB update URL to Redis key %s: %s", u.config.MdbUpdateKey, assetURL)
 	if err := u.redis.PushUpdateURL(u.config.MdbUpdateKey, assetURL); err != nil {
 		u.logger.Printf("ERROR: Failed to push MDB update URL: %v", err)
