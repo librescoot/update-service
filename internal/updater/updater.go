@@ -57,6 +57,8 @@ type Updater struct {
 	httpServerMutex  sync.Mutex
 	dbcUpdateFile    string
 	dbcDownloadReady chan struct{}
+	dbcRebootNeeded  bool       // Flag to indicate if DBC reboot is needed but deferred
+	dbcRebootMutex   sync.Mutex // Mutex to protect dbcRebootNeeded flag
 }
 
 // New creates a new updater
@@ -75,7 +77,9 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, veh
 		updateState:      make(map[string]string),
 		stateMutex:       sync.Mutex{},
 		httpServerMutex:  sync.Mutex{},
+		dbcRebootMutex:   sync.Mutex{},
 		dbcDownloadReady: make(chan struct{}),
+		dbcRebootNeeded:  false,
 	}
 }
 
@@ -223,13 +227,12 @@ func (u *Updater) processUpdateTypeChange(updateType string, status map[string]s
 		u.logger.Printf("Update installed for %s, waiting for reboot", component)
 
 		if component == "dbc" {
-			u.logger.Printf("DBC update installed, powering down when safe")
+			// Keep install inhibit active until after reboot for DBC
+			u.logger.Printf("Keeping install inhibit active for DBC until rebooted")
 
-			// Remove install inhibit immediately - DBC update is complete
-			if err := u.inhibitor.RemoveInstallInhibit(component); err != nil {
-				if !strings.Contains(err.Error(), "does not exist") {
-					u.logger.Printf("Failed to remove install inhibit for %s: %v", component, err)
-				}
+			// Notify vehicle service that DBC update is complete
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
 			}
 
 			// Check current vehicle state
@@ -239,7 +242,8 @@ func (u *Updater) processUpdateTypeChange(updateType string, status map[string]s
 			} else {
 				u.logger.Printf("Current vehicle state during DBC update completion: %s", vehicleState)
 
-				// If the vehicle is in stand-by state, show shutdown message
+				// If the vehicle is in stand-by state, the user has locked the scooter
+				// Set update-will-shutdown field to indicate the reboot will happen and then power will turn off
 				if vehicleState == "stand-by" || vehicleState == "updating" {
 					if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-will-shutdown", "true"); err != nil {
 						u.logger.Printf("Failed to set update shutdown flag: %v", err)
@@ -247,35 +251,30 @@ func (u *Updater) processUpdateTypeChange(updateType string, status map[string]s
 				}
 			}
 
-			// Power down DBC when safe (no reboot needed)
-			safe, err := u.vehicle.IsSafeForDbcPowerDown()
+			// Check if it's safe to reboot DBC
+			safe, err := u.vehicle.IsSafeForDbcReboot()
 			if err != nil {
-				u.logger.Printf("Failed to check if safe for DBC power down: %v", err)
+				u.logger.Printf("Failed to check if safe for DBC reboot: %v", err)
 				return
 			}
 
 			if safe {
-				u.logger.Printf("Safe to power down DBC after update installation")
-				if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-					u.logger.Printf("Failed to send complete-dbc command: %v", err)
+				// Trigger DBC reboot to apply update
+				u.logger.Printf("Reboot needed for DBC and it's safe to do so")
+				// Update state to rebooting
+				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeRebooting); err != nil {
+					u.logger.Printf("Failed to set update-type to rebooting: %v", err)
 				}
-				
-				// Mark DBC update as complete
-				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "status:dbc", "complete"); err != nil {
-					u.logger.Printf("Failed to set DBC status to complete: %v", err)
+				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
+					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+				} else {
+					// Start monitoring for dashboard ready to shut it down after reboot
+					go u.monitorDbcReboot()
 				}
 			} else {
-				u.logger.Printf("Not safe to power down DBC now, will power down when vehicle enters standby")
-				// DBC will be powered down automatically when vehicle transitions to standby
+				u.logger.Printf("Not safe to reboot DBC now, scheduling reboot check")
+				u.scheduleDbcRebootCheck()
 			}
-
-			// Clear the shutdown flag after a delay (DBC should be powered down by then)
-			go func() {
-				time.Sleep(10 * time.Second)
-				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-will-shutdown", "false"); err != nil {
-					u.logger.Printf("Failed to clear update shutdown flag: %v", err)
-				}
-			}()
 		} else if component == "mdb" {
 			// For MDB, we can remove the inhibits now
 			u.removeUpdateInhibits(component)
@@ -496,14 +495,15 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 	case "installation-complete-waiting-reboot":
 		u.logger.Printf("Update installed for %s, waiting for reboot", component)
 
+		// Keep inhibitors active until after reboot for DBC
 		if component == "dbc" {
-			u.logger.Printf("DBC update installed, powering down when safe")
+			// For DBC, we keep the install inhibit active until after reboot
+			// to ensure the DBC doesn't get powered off prematurely
+			u.logger.Printf("Keeping install inhibit active for DBC until rebooted")
 
-			// Remove install inhibit immediately - DBC update is complete
-			if err := u.inhibitor.RemoveInstallInhibit(component); err != nil {
-				if !strings.Contains(err.Error(), "does not exist") {
-					u.logger.Printf("Failed to remove install inhibit for %s: %v", component, err)
-				}
+			// Notify vehicle service that DBC update is complete
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
 			}
 
 			// Check current vehicle state
@@ -513,7 +513,8 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 			} else {
 				u.logger.Printf("Current vehicle state during DBC update completion: %s", vehicleState)
 
-				// If the vehicle is in stand-by state, show shutdown message
+				// If the vehicle is in stand-by state, the user has locked the scooter
+				// Add a flag to indicate the reboot will happen and then power will turn off
 				if vehicleState == "stand-by" || vehicleState == "updating" {
 					if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-will-shutdown", "true"); err != nil {
 						u.logger.Printf("Failed to set update shutdown flag: %v", err)
@@ -521,35 +522,31 @@ func (u *Updater) processComponentStatus(component string, status map[string]str
 				}
 			}
 
-			// Power down DBC when safe (no reboot needed)
-			safe, err := u.vehicle.IsSafeForDbcPowerDown()
+			// Check if it's safe to reboot DBC
+			safe, err := u.vehicle.IsSafeForDbcReboot()
 			if err != nil {
-				u.logger.Printf("Failed to check if safe for DBC power down: %v", err)
+				u.logger.Printf("Failed to check if safe for DBC reboot: %v", err)
 				return
 			}
 
 			if safe {
-				u.logger.Printf("Safe to power down DBC after update installation")
-				if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-					u.logger.Printf("Failed to send complete-dbc command: %v", err)
+				// Update state to rebooting
+				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeRebooting); err != nil {
+					u.logger.Printf("Failed to set update-type to rebooting: %v", err)
 				}
-				
-				// Mark DBC update as complete
-				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "status:dbc", "complete"); err != nil {
-					u.logger.Printf("Failed to set DBC status to complete: %v", err)
+
+				// Trigger DBC reboot to apply update
+				u.logger.Printf("Reboot needed for DBC and it's safe to do so")
+				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
+					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+				} else {
+					// Start monitoring for dashboard ready to shut it down after reboot
+					go u.monitorDbcReboot()
 				}
 			} else {
-				u.logger.Printf("Not safe to power down DBC now, will power down when vehicle enters standby")
-				// DBC will be powered down automatically when vehicle transitions to standby
+				u.logger.Printf("Not safe to reboot DBC now, scheduling reboot check")
+				u.scheduleDbcRebootCheck()
 			}
-
-			// Clear the shutdown flag after a delay (DBC should be powered down by then)
-			go func() {
-				time.Sleep(10 * time.Second)
-				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-will-shutdown", "false"); err != nil {
-					u.logger.Printf("Failed to clear update shutdown flag: %v", err)
-				}
-			}()
 		} else if component == "mdb" {
 			// For MDB, we can remove the inhibits now
 			u.removeUpdateInhibits(component)
@@ -1066,6 +1063,100 @@ func (u *Updater) waitForMdbReboot() {
 	}
 }
 
+// scheduleDbcRebootCheck sets the dbcRebootNeeded flag and starts a goroutine
+// to periodically check if it's safe to reboot the DBC
+func (u *Updater) scheduleDbcRebootCheck() {
+	u.dbcRebootMutex.Lock()
+	wasNeeded := u.dbcRebootNeeded
+	u.dbcRebootNeeded = true
+	u.dbcRebootMutex.Unlock()
+
+	// If we're already checking, don't start another goroutine
+	if wasNeeded {
+		return
+	}
+
+	// Start a goroutine to check periodically
+	go u.waitForDbcReboot()
+}
+
+// waitForDbcReboot periodically checks if it's safe to reboot the DBC
+// and performs the reboot when it's safe
+func (u *Updater) waitForDbcReboot() {
+	ticker := time.NewTicker(5 * time.Minute) // Check every 5 minutes
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-u.ctx.Done():
+			return
+		case <-ticker.C:
+			// Check if we still need to reboot
+			u.dbcRebootMutex.Lock()
+			needsReboot := u.dbcRebootNeeded
+			u.dbcRebootMutex.Unlock()
+
+			if !needsReboot {
+				return
+			}
+
+			// Check if it's safe to reboot now
+			safe, err := u.vehicle.IsSafeForDbcReboot()
+			if err != nil {
+				u.logger.Printf("Failed to check if safe for DBC reboot: %v", err)
+
+				// Update status with error
+				if errStatus := u.redis.SetOTAStatus(config.OtaStatusHashKey, "status:dbc", "waiting-for-reboot"); errStatus != nil {
+					u.logger.Printf("Failed to set DBC status: %v", errStatus)
+				}
+
+				continue
+			}
+
+			if safe {
+				u.logger.Printf("Safe to reboot DBC now")
+
+				// Update status to indicate reboot attempt
+				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "status:dbc", "rebooting"); err != nil {
+					u.logger.Printf("Failed to set DBC rebooting status: %v", err)
+				}
+
+				// Update the standard update-type field as well
+				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeRebooting); err != nil {
+					u.logger.Printf("Failed to set update-type to rebooting: %v", err)
+				}
+
+				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
+					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+
+					// Update status to indicate reboot failure
+					if errStatus := u.redis.SetOTAStatus(config.OtaStatusHashKey, "status:dbc", "waiting-for-reboot"); errStatus != nil {
+						u.logger.Printf("Failed to set DBC reboot-failed status: %v", errStatus)
+					}
+
+					continue
+				} else {
+					// Start monitoring for dashboard ready to shut it down after reboot
+					go u.monitorDbcReboot()
+				}
+
+				// Successfully triggered reboot, clear the flag
+				u.dbcRebootMutex.Lock()
+				u.dbcRebootNeeded = false
+				u.dbcRebootMutex.Unlock()
+
+				u.logger.Printf("DBC reboot triggered successfully")
+				return
+			} else {
+				// Update status to indicate still waiting
+				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "status:dbc", "waiting-for-reboot"); err != nil {
+					u.logger.Printf("Failed to set DBC waiting status: %v", err)
+				}
+			}
+		}
+	}
+}
+
 // removeUpdateInhibits removes all inhibits for a component
 func (u *Updater) removeUpdateInhibits(component string) {
 	// Remove download inhibit if it exists
@@ -1267,18 +1358,27 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 				u.logger.Printf("Failed to set update-type to complete: %v", err)
 			}
 
-			// Power down DBC when safe (no reboot needed)
-			safe, err := u.vehicle.IsSafeForDbcPowerDown()
+			// Check if it's safe to reboot DBC
+			safe, err := u.vehicle.IsSafeForDbcReboot()
 			if err != nil {
-				u.logger.Printf("Failed to check if safe for DBC power down: %v", err)
+				u.logger.Printf("Failed to check if safe for DBC reboot: %v", err)
 			} else if safe {
-				u.logger.Printf("Safe to power down DBC after update installation")
-				if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-					u.logger.Printf("Failed to send complete-dbc command: %v", err)
+				// Update reboot status
+				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeRebooting); err != nil {
+					u.logger.Printf("Failed to set update-type to rebooting: %v", err)
+				}
+
+				// Reboot DBC to apply the update
+				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
+					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+				} else {
+					u.logger.Printf("DBC reboot triggered successfully")
+					// Start monitoring for dashboard ready to shut it down after reboot
+					go u.monitorDbcReboot()
 				}
 			} else {
-				u.logger.Printf("Not safe to power down DBC now, will power down when vehicle enters standby")
-				// DBC will be powered down automatically when vehicle transitions to standby
+				u.logger.Printf("Not safe to reboot DBC now, scheduling reboot check")
+				u.scheduleDbcRebootCheck()
 			}
 		}
 
@@ -1358,18 +1458,27 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 				}
 			}
 
-			// Power down DBC when safe (no reboot needed)
-			safe, err := u.vehicle.IsSafeForDbcPowerDown()
+			// Check if it's safe to reboot DBC
+			safe, err := u.vehicle.IsSafeForDbcReboot()
 			if err != nil {
-				u.logger.Printf("Failed to check if safe for DBC power down: %v", err)
+				u.logger.Printf("Failed to check if safe for DBC reboot: %v", err)
 			} else if safe {
-				u.logger.Printf("Safe to power down DBC after update installation")
-				if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-					u.logger.Printf("Failed to send complete-dbc command: %v", err)
+				// Update reboot status
+				if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeRebooting); err != nil {
+					u.logger.Printf("Failed to set update-type to rebooting: %v", err)
+				}
+
+				// Reboot DBC to apply the update
+				if err := u.vehicle.TriggerReboot("dbc"); err != nil {
+					u.logger.Printf("Failed to trigger DBC reboot: %v", err)
+				} else {
+					u.logger.Printf("DBC reboot triggered successfully")
+					// Start monitoring for dashboard ready to shut it down after reboot
+					go u.monitorDbcReboot()
 				}
 			} else {
-				u.logger.Printf("Not safe to power down DBC now, will power down when vehicle enters standby")
-				// DBC will be powered down automatically when vehicle transitions to standby
+				u.logger.Printf("Not safe to reboot DBC now, scheduling reboot check")
+				u.scheduleDbcRebootCheck()
 			}
 		}
 
@@ -1602,3 +1711,69 @@ func (u *Updater) downloadFile(url, filePath string) error {
 	return nil
 }
 
+// monitorDbcReboot monitors for dashboard ready signal after DBC reboot
+// and shuts down the DBC if the vehicle is in standby state
+func (u *Updater) monitorDbcReboot() {
+	u.logger.Printf("Starting to monitor for DBC reboot completion")
+	
+	// Wait for dashboard to be ready with a longer timeout (2 minutes)
+	ctx, cancel := context.WithTimeout(u.ctx, 2*time.Minute)
+	defer cancel()
+	
+	dashboardReadyChan := u.redis.SubscribeToDashboardReady(ctx, "dashboard")
+	if dashboardReadyChan == nil {
+		u.logger.Printf("Failed to subscribe to dashboard ready channel for post-reboot monitoring")
+		return
+	}
+	
+	// Wait for dashboard ready signal
+	select {
+	case <-dashboardReadyChan:
+		u.logger.Printf("Dashboard ready signal received after DBC reboot")
+		
+		// Check if the DBC version was updated
+		currentVersion, err := u.redis.GetComponentVersion("dbc")
+		if err != nil {
+			u.logger.Printf("Failed to get DBC version after reboot: %v", err)
+			// Continue with shutdown anyway
+		} else {
+			u.logger.Printf("DBC version after reboot: %s", currentVersion)
+		}
+		
+		// Check vehicle state
+		vehicleState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+		if err != nil {
+			u.logger.Printf("Failed to get vehicle state after DBC reboot: %v", err)
+			// Assume it's safe to shut down
+			vehicleState = "stand-by"
+		}
+		
+		u.logger.Printf("Vehicle state after DBC reboot: %s", vehicleState)
+		
+		// Shut down the DBC regardless of version update status
+		// If the version is not updated, there was some failure and we'll try again later
+		if vehicleState == "stand-by" || vehicleState == "updating" {
+			u.logger.Printf("Vehicle in %s state, shutting down DBC after reboot", vehicleState)
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command to shut down DBC: %v", err)
+			} else {
+				u.logger.Printf("Successfully sent complete-dbc command to shut down DBC after reboot")
+			}
+		} else {
+			u.logger.Printf("Vehicle in %s state, keeping DBC powered on after reboot", vehicleState)
+		}
+		
+		// Update OTA status to indicate reboot is complete
+		if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "status:dbc", "complete"); err != nil {
+			u.logger.Printf("Failed to set DBC status to complete after reboot: %v", err)
+		}
+		
+		// Clear the update-will-shutdown flag
+		if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-will-shutdown", "false"); err != nil {
+			u.logger.Printf("Failed to clear update-will-shutdown flag: %v", err)
+		}
+		
+	case <-ctx.Done():
+		u.logger.Printf("Timed out waiting for dashboard ready after DBC reboot")
+	}
+}
