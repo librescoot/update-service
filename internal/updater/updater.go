@@ -693,11 +693,6 @@ func (u *Updater) updateCheckLoop() {
 			u.logger.Printf("Update check loop stopped")
 			return
 		case <-ticker.C:
-			// Skip check if updates are in progress
-			if u.hasUpdatesInProgress() {
-				u.logger.Printf("Skipping update check because updates are in progress")
-				continue
-			}
 			u.checkForUpdates()
 		}
 	}
@@ -1083,9 +1078,18 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 	u.logger.Printf("Starting processUpdatesSequentially - mdbUpdate: %v, dbcUpdate: %v",
 		mdbUpdate != nil, dbcUpdate != nil)
 
-	if activeUpdates := u.hasUpdatesInProgress(); activeUpdates {
-		u.logger.Printf("Updates already in progress, skipping this update cycle")
-		return
+	// Check current update state to determine what step to take next
+	currentStatus, err := u.redis.GetOTAStatus(config.OtaStatusHashKey)
+	if err != nil {
+		u.logger.Printf("Failed to get OTA status: %v", err)
+	} else {
+		u.logger.Printf("Current update status - DBC: %s, MDB: %s", 
+			currentStatus["status:dbc"], currentStatus["status:mdb"])
+		
+		// If updates are in progress, verify they're still needed and continue from current state
+		if u.hasUpdatesInProgress() {
+			u.logger.Printf("Updates in progress - will verify they're still needed and continue appropriately")
+		}
 	}
 
 	// PHASE 1: Download DBC update to MDB (if needed)
