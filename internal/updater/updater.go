@@ -1196,34 +1196,6 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 	}
 }
 
-// waitForComponentUpdate waits for a component update to complete within the given timeout
-func (u *Updater) waitForComponentUpdate(component string, timeout time.Duration) bool {
-	startTime := time.Now()
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			// Check if the component update has completed
-			u.stateMutex.Lock()
-			status, exists := u.updateState[component]
-			u.stateMutex.Unlock()
-
-			if exists && (status == "complete" || status == "failed") {
-				return status == "complete"
-			}
-
-			// Check if we've timed out
-			if time.Since(startTime) > timeout {
-				u.logger.Printf("%s update timed out after %v", component, timeout)
-				return false
-			}
-		case <-u.ctx.Done():
-			return false
-		}
-	}
-}
 
 // waitForDashboardReady waits for the dashboard to be ready
 func (u *Updater) waitForDashboardReady(timeout time.Duration) bool {

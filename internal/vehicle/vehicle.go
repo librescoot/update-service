@@ -2,6 +2,7 @@ package vehicle
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/librescoot/update-service/internal/redis"
@@ -83,6 +84,7 @@ func (s *Service) IsSafeForDbcUpdate() (bool, error) {
 
 // IsSafeForMdbReboot checks if it's safe to reboot the MDB
 // MDB should only be rebooted when the scooter is in stand-by mode or shutting down
+// AND has been in stand-by for at least 3 minutes
 func (s *Service) IsSafeForMdbReboot() (bool, error) {
 	// Get current state
 	currentState, err := s.redis.GetVehicleState(s.vehicleHashKey)
@@ -90,8 +92,42 @@ func (s *Service) IsSafeForMdbReboot() (bool, error) {
 		return false, fmt.Errorf("failed to get current vehicle state: %w", err)
 	}
 
-	// MDB can be rebooted in stand-by mode or when shutting down
-	return currentState == "stand-by" || currentState == "shutting-down", nil
+	// MDB can only be rebooted in stand-by mode or when shutting down
+	if currentState != "stand-by" && currentState != "shutting-down" {
+		return false, nil
+	}
+
+	// For stand-by state, check the 3-minute timer requirement
+	if currentState == "stand-by" {
+		// Get standby timer start from Redis
+		otaStatus, err := s.redis.GetOTAStatus("ota")
+		if err != nil {
+			return false, fmt.Errorf("failed to get OTA status: %w", err)
+		}
+
+		standbyStartStr, exists := otaStatus["standby-timer-start"]
+		if !exists || standbyStartStr == "" {
+			// No timer set, not safe to reboot yet
+			return false, nil
+		}
+
+		standbyStart, err := strconv.ParseInt(standbyStartStr, 10, 64)
+		if err != nil {
+			return false, fmt.Errorf("failed to parse standby timer start: %w", err)
+		}
+
+		// Check if 3 minutes have elapsed
+		elapsed := time.Now().Unix() - standbyStart
+		if elapsed < 180 { // 3 minutes = 180 seconds
+			// Log how much time remains for debugging
+			remaining := 180 - elapsed
+			fmt.Printf("MDB reboot timer: %d seconds remaining (need 3 minutes in standby)", remaining)
+			return false, nil
+		}
+	}
+
+	// Safe to reboot
+	return true, nil
 }
 
 // IsSafeForDbcReboot checks if it's safe to reboot the DBC
