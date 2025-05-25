@@ -1,16 +1,11 @@
 [Unit]
-Description=Librescoot Update Service (Orchestrator)
+Description=Librescoot Update Service
 After=network-online.target redis.service
 Wants=network-online.target redis.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/update-service \
-    --redis-addr=192.168.7.1:6379 \
-    --default-channel=nightly \
-    --components=dbc,mdb \
-    --dbc-update-key=update:install:dbc \
-    --mdb-update-key=update:install:mdb
+ExecStart=/usr/bin/update-service -default-channel nightly
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

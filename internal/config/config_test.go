@@ -13,8 +13,10 @@ func TestNew(t *testing.T) {
 		1*time.Hour,
 		"stable",
 		"dbc,mdb",
-		"update:install:dbc",
-		"update:install:mdb",
+		"mender/update/dbc/url",
+		"mender/update/mdb/url",
+		"mender/update/dbc/checksum",
+		"mender/update/mdb/checksum",
 		false,
 	)
 
@@ -47,12 +49,20 @@ func TestNew(t *testing.T) {
 		t.Errorf("Expected Components[1] to be 'mdb', got '%s'", cfg.Components[1])
 	}
 
-	if cfg.DbcUpdateKey != "update:install:dbc" {
-		t.Errorf("Expected DbcUpdateKey to be 'update:install:dbc', got '%s'", cfg.DbcUpdateKey)
+	if cfg.DbcUpdateKey != "mender/update/dbc/url" {
+		t.Errorf("Expected DbcUpdateKey to be 'mender/update/dbc/url', got '%s'", cfg.DbcUpdateKey)
 	}
 
-	if cfg.MdbUpdateKey != "update:install:mdb" {
-		t.Errorf("Expected MdbUpdateKey to be 'update:install:mdb', got '%s'", cfg.MdbUpdateKey)
+	if cfg.MdbUpdateKey != "mender/update/mdb/url" {
+		t.Errorf("Expected MdbUpdateKey to be 'mender/update/mdb/url', got '%s'", cfg.MdbUpdateKey)
+	}
+
+	if cfg.DbcChecksumKey != "mender/update/dbc/checksum" {
+		t.Errorf("Expected DbcChecksumKey to be 'mender/update/dbc/checksum', got '%s'", cfg.DbcChecksumKey)
+	}
+
+	if cfg.MdbChecksumKey != "mender/update/mdb/checksum" {
+		t.Errorf("Expected MdbChecksumKey to be 'mender/update/mdb/checksum', got '%s'", cfg.MdbChecksumKey)
 	}
 
 	// Check that the constants are set correctly
@@ -81,8 +91,10 @@ func TestIsValidComponent(t *testing.T) {
 		1*time.Hour,
 		"stable",
 		"dbc,mdb",
-		"update:install:dbc",
-		"update:install:mdb",
+		"mender/update/dbc/url",
+		"mender/update/mdb/url",
+		"mender/update/dbc/checksum",
+		"mender/update/mdb/checksum",
 		false,
 	)
 
@@ -108,8 +120,10 @@ func TestIsValidChannel(t *testing.T) {
 		1*time.Hour,
 		"stable",
 		"dbc,mdb",
-		"update:install:dbc",
-		"update:install:mdb",
+		"mender/update/dbc/url",
+		"mender/update/mdb/url",
+		"mender/update/dbc/checksum",
+		"mender/update/mdb/checksum",
 		false,
 	)
 

@@ -1,8 +1,6 @@
 module github.com/librescoot/update-service
 
-go 1.22.2
-
-toolchain go1.24.1
+go 1.22.1
 
 require github.com/redis/go-redis/v9 v9.8.0
 
