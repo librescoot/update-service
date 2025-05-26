@@ -1,0 +1,35 @@
+[Unit]
+Description=LibreScoot Update Service (DBC)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/update-service --component=dbc --channel=nightly --redis-addr=192.168.7.1:6379
+Restart=always
+RestartSec=10
+User=root
+Group=root
+
+# Environment variables
+Environment=COMPONENT=dbc
+Environment=CHANNEL=nightly
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=update-service-dbc
+
+# Working directory
+WorkingDirectory=/data/ota
+
+# Create data directory if it doesn't exist
+ExecStartPre=/bin/mkdir -p /data/ota/dbc
+
+# Security settings
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/ota
+
+[Install]
+WantedBy=multi-user.target
