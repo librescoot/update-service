@@ -868,128 +868,7 @@ func (u *Updater) isUpdateNeeded(component string, release Release) bool {
 	return false
 }
 
-// initiateUpdate initiates the update process for the given component
-func (u *Updater) initiateUpdate(component string, release Release) error {
-	u.logger.Printf("Initiating update for component %s with release %s", component, release.TagName)
 
-	// First check if updates are already in progress
-	if u.hasUpdatesInProgress() {
-		u.logger.Printf("CAUTION: Updates already in progress, will attempt to handle this update anyway")
-	}
-
-	// Find the .mender asset for the component
-	var assetURL string
-	u.logger.Printf("Looking for .mender asset in release assets")
-	for _, asset := range release.Assets {
-		if strings.Contains(asset.Name, component) && strings.HasSuffix(asset.Name, ".mender") {
-			assetURL = asset.BrowserDownloadURL
-			u.logger.Printf("Found asset URL: %s", assetURL)
-			break
-		}
-	}
-
-	if assetURL == "" {
-		u.logger.Printf("ERROR: No .mender asset found for component %s", component)
-		return fmt.Errorf("no .mender asset found for component %s", component)
-	}
-
-	// Set update state
-	u.logger.Printf("Setting update state for component %s to 'updating'", component)
-	u.stateMutex.Lock()
-	u.updateState[component] = "updating"
-	u.stateMutex.Unlock()
-	u.logger.Printf("Update state set for component %s", component)
-
-	// Set update-type and update-component in Redis
-	u.logger.Printf("Setting update-type to %s in Redis", UpdateTypeDownloading)
-	if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-type", UpdateTypeDownloading); err != nil {
-		u.logger.Printf("Failed to set update-type: %v", err)
-	}
-
-	u.logger.Printf("Setting update-component to %s in Redis", component)
-	if err := u.redis.SetOTAStatus(config.OtaStatusHashKey, "update-component", component); err != nil {
-		u.logger.Printf("Failed to set update-component: %v", err)
-	}
-
-	// Handle component-specific update process
-	switch component {
-	case "dbc":
-		return u.updateDBC(assetURL)
-	case "mdb":
-		return u.updateMDB(assetURL)
-	default:
-		return fmt.Errorf("unknown component: %s", component)
-	}
-}
-
-// updateDBC updates the DBC component
-func (u *Updater) updateDBC(assetURL string) error {
-	u.logger.Printf("Starting DBC update process with URL: %s", assetURL)
-
-	// Check if it's safe to update DBC
-	u.logger.Printf("Checking if safe to update DBC")
-	safe, err := u.vehicle.IsSafeForDbcUpdate()
-	if err != nil {
-		u.logger.Printf("Error checking if safe for DBC update: %v", err)
-		return fmt.Errorf("failed to check if safe for DBC update: %w", err)
-	}
-
-	if !safe {
-		u.logger.Printf("Not safe to update DBC, scheduling retry")
-		// This never actually happens, we just don't reboot the DBC
-		return fmt.Errorf("not safe to update DBC")
-	}
-	u.logger.Printf("Safe to update DBC, proceeding")
-
-	// Notify vehicle service that DBC update is starting
-	u.logger.Printf("Sending start-dbc command to vehicle service")
-	if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
-		u.logger.Printf("Error sending start-dbc command: %v", err)
-		return fmt.Errorf("failed to send start-dbc command: %w", err)
-	}
-	u.logger.Printf("Successfully sent start-dbc command")
-
-	// Push update URL to SMUT
-	// Check for backwards compatibility - use old key for DBC versions < 20250524t000000
-	dbcUpdateKey := u.getDbcUpdateKey()
-	u.logger.Printf("Pushing DBC update URL to Redis key %s: %s", dbcUpdateKey, assetURL)
-	if err := u.redis.PushUpdateURL(dbcUpdateKey, assetURL); err != nil {
-		u.logger.Printf("ERROR: Failed to push DBC update URL: %v", err)
-		// Notify vehicle service that DBC update is complete (failed)
-		u.logger.Printf("Sending complete-dbc command to indicate failure")
-		u.redis.PushUpdateCommand("complete-dbc")
-		return fmt.Errorf("failed to push DBC update URL: %w", err)
-	}
-	u.logger.Printf("Successfully pushed DBC update URL to Redis")
-
-	return nil
-}
-
-// updateMDB updates the MDB component
-func (u *Updater) updateMDB(assetURL string) error {
-	u.logger.Printf("Starting MDB update process with URL: %s", assetURL)
-
-	// Notify vehicle service that update is starting
-	u.logger.Printf("Sending start command to vehicle service")
-	if err := u.redis.PushUpdateCommand("start"); err != nil {
-		u.logger.Printf("Error sending start command: %v", err)
-		return fmt.Errorf("failed to send start command: %w", err)
-	}
-	u.logger.Printf("Successfully sent start command")
-
-	// Push update URL to SMUT
-	u.logger.Printf("Pushing MDB update URL to Redis key %s: %s", u.config.MdbUpdateKey, assetURL)
-	if err := u.redis.PushUpdateURL(u.config.MdbUpdateKey, assetURL); err != nil {
-		u.logger.Printf("ERROR: Failed to push MDB update URL: %v", err)
-		// Notify vehicle service that update is complete (failed)
-		u.logger.Printf("Sending complete command to indicate failure")
-		u.redis.PushUpdateCommand("complete")
-		return fmt.Errorf("failed to push MDB update URL: %w", err)
-	}
-	u.logger.Printf("Successfully pushed MDB update URL to Redis")
-
-	return nil
-}
 
 // getDbcUpdateKey returns the appropriate Redis key for DBC updates
 // Uses old key for backwards compatibility with DBC versions < 20250524t000000
@@ -1005,7 +884,7 @@ func (u *Updater) getDbcUpdateKey() string {
 	
 	// Check if version is less than 20250524t000000
 	// Version format should be like "20250524t123456"
-	if len(currentVersion) >= 15 && currentVersion < "20250524t000000" {
+	if currentVersion < "20250524t000000" {
 		u.logger.Printf("DBC version %s is older than 20250524t000000, using legacy update key", currentVersion)
 		return "mender/update/dbc/url"
 	}
@@ -1216,6 +1095,11 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 		if err := u.redis.PushUpdateURL(u.config.MdbUpdateKey, mdbUpdate.assetURL); err != nil {
 			u.logger.Printf("Failed to push MDB update URL: %v", err)
 		}
+		
+		// Set MDB update state to track progress
+		u.stateMutex.Lock()
+		u.updateState["mdb"] = "updating"
+		u.stateMutex.Unlock()
 	}
 
 	// Step 7: Wait for update completion for all updating components
@@ -1278,34 +1162,6 @@ func (u *Updater) processUpdatesSequentially(mdbUpdate, dbcUpdate *updateInfo) {
 	}
 }
 
-// waitForComponentUpdate waits for a component update to complete within the given timeout
-func (u *Updater) waitForComponentUpdate(component string, timeout time.Duration) bool {
-	startTime := time.Now()
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			// Check if the component update has completed
-			u.stateMutex.Lock()
-			status, exists := u.updateState[component]
-			u.stateMutex.Unlock()
-
-			if exists && (status == "complete" || status == "failed") {
-				return status == "complete"
-			}
-
-			// Check if we've timed out
-			if time.Since(startTime) > timeout {
-				u.logger.Printf("%s update timed out after %v", component, timeout)
-				return false
-			}
-		case <-u.ctx.Done():
-			return false
-		}
-	}
-}
 
 // waitForComponentUpdateCompletion waits for a component update to complete with timeout
 func (u *Updater) waitForComponentUpdateCompletion(component string) {
