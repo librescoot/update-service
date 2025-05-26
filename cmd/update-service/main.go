@@ -78,6 +78,7 @@ func main() {
 
 	// Initialize updater
 	updater := updater.New(ctx, cfg, redisClient.GetClient(), inhibitorClient, logger)
+	defer updater.Close()
 	if err := updater.Start(); err != nil {
 		logger.Fatalf("Failed to start updater: %v", err)
 	}

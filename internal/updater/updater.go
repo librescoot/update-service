@@ -2,6 +2,7 @@ package updater
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"path/filepath"
 	"strings"
@@ -62,6 +63,12 @@ func (u *Updater) Stop() {
 	u.cancel()
 }
 
+// Close performs cleanup when the updater is shutting down
+func (u *Updater) Close() {
+	u.logger.Printf("Shutting down updater for component %s", u.config.Component)
+	u.Stop()
+}
+
 // updateCheckLoop periodically checks for updates
 func (u *Updater) updateCheckLoop() {
 	ticker := time.NewTicker(u.config.CheckInterval)
@@ -85,17 +92,6 @@ func (u *Updater) updateCheckLoop() {
 func (u *Updater) checkForUpdates() {
 	u.logger.Printf("Checking for updates for component %s on channel %s", u.config.Component, u.config.Channel)
 
-	// Check current status to avoid multiple concurrent updates
-	currentStatus, err := u.status.GetStatus(u.ctx)
-	if err != nil {
-		u.logger.Printf("Failed to get current status: %v", err)
-		return
-	}
-
-	if currentStatus != status.StatusIdle {
-		u.logger.Printf("Skipping update check, component is currently in status: %s", currentStatus)
-		return
-	}
 
 	// Get releases from GitHub
 	releases, err := u.githubAPI.GetReleases()
@@ -212,7 +208,7 @@ func (u *Updater) getCurrentVersion() (string, error) {
 	// This could be enhanced to read from actual system or Redis
 	
 	// Try to read from Redis first
-	result, err := u.redis.HGet(u.ctx, "version", u.config.Component).Result()
+	result, err := u.redis.HGet(u.ctx, fmt.Sprintf("version:%s", u.config.Component), "version_id").Result()
 	if err == nil && result != "" {
 		return result, nil
 	}
