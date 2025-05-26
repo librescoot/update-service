@@ -1,0 +1,36 @@
+[Unit]
+Description=LibreScoot Update Service (%i)
+After=redis.service network.target
+Requires=redis.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/update-service --component=%i --channel=nightly
+Restart=always
+RestartSec=10
+User=root
+Group=root
+
+# Environment variables
+Environment=COMPONENT=%i
+Environment=CHANNEL=nightly
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=update-service-%i
+
+# Working directory
+WorkingDirectory=/data/ota
+
+# Create data directory if it doesn't exist
+ExecStartPre=/bin/mkdir -p /data/ota/%i
+
+# Security settings
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/ota
+
+[Install]
+WantedBy=multi-user.target

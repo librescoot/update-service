@@ -11,29 +11,33 @@ import (
 
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/inhibitor"
-	"github.com/librescoot/update-service/internal/power"
 	"github.com/librescoot/update-service/internal/redis"
 	"github.com/librescoot/update-service/internal/updater"
-	"github.com/librescoot/update-service/internal/vehicle"
 )
 
 var (
 	redisAddr         = flag.String("redis-addr", "localhost:6379", "Redis server address")
 	githubReleasesURL = flag.String("github-releases-url", "https://api.github.com/repos/librescoot/librescoot/releases", "GitHub Releases API URL")
 	checkInterval     = flag.Duration("check-interval", 1*time.Hour, "Interval between update checks")
-	defaultChannel    = flag.String("default-channel", "stable", "Default update channel (stable, testing, nightly)")
-	components        = flag.String("components", "dbc,mdb", "Comma-separated list of components to check for updates")
-	dbcUpdateKey      = flag.String("dbc-update-key", "update:dbc:url", "Redis key for DBC update URLs")
-	mdbUpdateKey      = flag.String("mdb-update-key", "update:mdb:url", "Redis key for MDB update URLs")
+	component         = flag.String("component", "", "Component to manage updates for (mdb or dbc)")
+	channel           = flag.String("channel", "nightly", "Update channel (stable, testing, nightly)")
 	dryRun            = flag.Bool("dry-run", false, "If true, don't actually reboot, just notify")
 )
 
 func main() {
 	flag.Parse()
 
+	// Validate required component flag
+	if *component == "" {
+		log.Fatal("--component flag is required (mdb or dbc)")
+	}
+	if *component != "mdb" && *component != "dbc" {
+		log.Fatalf("Invalid component '%s'. Must be 'mdb' or 'dbc'", *component)
+	}
+
 	// Set up logger
 	logger := log.New(os.Stdout, "update-service: ", log.LstdFlags)
-	logger.Printf("Starting update service")
+	logger.Printf("Starting update service for component: %s", *component)
 
 	// Create context that can be cancelled on SIGINT or SIGTERM
 	ctx, cancel := context.WithCancel(context.Background())
@@ -53,22 +57,17 @@ func main() {
 		*redisAddr,
 		*githubReleasesURL,
 		*checkInterval,
-		*defaultChannel,
-		*components,
-		*dbcUpdateKey,
-		*mdbUpdateKey,
+		*component,
+		*channel,
 		*dryRun,
 	)
 
-	// Initialize Redis client
+	// Initialize Redis client  
 	redisClient, err := redis.New(ctx, *redisAddr)
 	if err != nil {
 		logger.Fatalf("Failed to initialize Redis client: %v", err)
 	}
 	defer redisClient.Close()
-
-	// Initialize vehicle service client
-	vehicleService := vehicle.New(redisClient, config.VehicleHashKey, cfg.DryRun)
 
 	// Initialize power inhibitor client
 	inhibitorClient, err := inhibitor.New(ctx, *redisAddr, logger)
@@ -76,16 +75,9 @@ func main() {
 		logger.Fatalf("Failed to initialize inhibitor client: %v", err)
 	}
 	defer inhibitorClient.Close()
-	
-	// Initialize power management client
-	powerClient, err := power.New(ctx, *redisAddr, logger)
-	if err != nil {
-		logger.Fatalf("Failed to initialize power client: %v", err)
-	}
-	defer powerClient.Close()
 
 	// Initialize updater
-	updater := updater.New(ctx, cfg, redisClient, vehicleService, inhibitorClient, powerClient, logger)
+	updater := updater.New(ctx, cfg, redisClient.GetClient(), inhibitorClient, logger)
 	if err := updater.Start(); err != nil {
 		logger.Fatalf("Failed to start updater: %v", err)
 	}
@@ -94,8 +86,8 @@ func main() {
 	logger.Printf("  Redis address: %s", *redisAddr)
 	logger.Printf("  GitHub Releases URL: %s", *githubReleasesURL)
 	logger.Printf("  Check interval: %v", *checkInterval)
-	logger.Printf("  Default channel: %s", *defaultChannel)
-	logger.Printf("  Components: %s", *components)
+	logger.Printf("  Component: %s", *component)
+	logger.Printf("  Channel: %s", *channel)
 	logger.Printf("  Dry-run mode: %v", *dryRun)
 
 	// Wait for context cancellation

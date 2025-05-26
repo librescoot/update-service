@@ -37,6 +37,11 @@ func (c *Client) Close() error {
 	return c.client.Close()
 }
 
+// GetClient returns the underlying Redis client for direct access
+func (c *Client) GetClient() *redis.Client {
+	return c.client
+}
+
 // SetVehicleState sets the vehicle state in Redis
 func (c *Client) SetVehicleState(vehicleHashKey, state string) error {
 	return c.client.HSet(c.ctx, vehicleHashKey, "state", state).Err()
