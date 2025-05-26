@@ -1,7 +1,6 @@
 package config
 
 import (
-	"strings"
 	"time"
 )
 
@@ -21,15 +20,9 @@ type Config struct {
 	GitHubReleasesURL string
 	CheckInterval     time.Duration
 
-	// Channel configuration
-	DefaultChannel string // "stable", "testing", "nightly"
-
-	// Component configuration
-	Components []string // "dbc", "mdb"
-
-	// SMUT configuration
-	DbcUpdateKey   string // "update:dbc:url"
-	MdbUpdateKey   string // "update:mdb:url"
+	// Component and channel configuration
+	Component string // "mdb" or "dbc" - which component this instance manages
+	Channel   string // "stable", "testing", "nightly"
 
 	// Update constraints
 	MdbRebootCheckInterval time.Duration // How often to check if MDB can be rebooted
@@ -44,26 +37,16 @@ func New(
 	redisAddr string,
 	githubReleasesURL string,
 	checkInterval time.Duration,
-	defaultChannel string,
-	componentsStr string,
-	dbcUpdateKey string,
-	mdbUpdateKey string,
+	component string,
+	channel string,
 	dryRun bool,
 ) *Config {
-	// Parse components string into slice
-	components := strings.Split(componentsStr, ",")
-	for i, c := range components {
-		components[i] = strings.TrimSpace(c)
-	}
-
 	return &Config{
 		RedisAddr:         redisAddr,
 		GitHubReleasesURL: githubReleasesURL,
 		CheckInterval:     checkInterval,
-		DefaultChannel:    defaultChannel,
-		Components:        components,
-		DbcUpdateKey:      dbcUpdateKey,
-		MdbUpdateKey:      mdbUpdateKey,
+		Component:         component,
+		Channel:           channel,
 		// Default values for update constraints
 		MdbRebootCheckInterval: 5 * time.Minute,
 		UpdateRetryInterval:    15 * time.Minute,
@@ -73,17 +56,12 @@ func New(
 }
 
 // IsValidComponent checks if the given component is valid
-func (c *Config) IsValidComponent(component string) bool {
-	for _, comp := range c.Components {
-		if comp == component {
-			return true
-		}
-	}
-	return false
+func IsValidComponent(component string) bool {
+	return component == "mdb" || component == "dbc"
 }
 
 // IsValidChannel checks if the given channel is valid
-func (c *Config) IsValidChannel(channel string) bool {
+func IsValidChannel(channel string) bool {
 	// Currently supported channels
 	validChannels := []string{"stable", "testing", "nightly"}
 	for _, ch := range validChannels {
