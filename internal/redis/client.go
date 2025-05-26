@@ -57,10 +57,6 @@ func (c *Client) PushUpdateCommand(command string) error {
 	return c.client.LPush(c.ctx, "scooter:update", command).Err()
 }
 
-// SetUpdateChecksum sets the update checksum in Redis
-func (c *Client) SetUpdateChecksum(checksumKey, checksum string) error {
-	return c.client.Set(c.ctx, checksumKey, checksum, 0).Err()
-}
 
 // GetOTAStatus gets the OTA status from Redis
 func (c *Client) GetOTAStatus(otaHashKey string) (map[string]string, error) {
