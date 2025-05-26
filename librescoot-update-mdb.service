@@ -26,11 +26,5 @@ WorkingDirectory=/data/ota
 # Create data directory if it doesn't exist
 ExecStartPre=/bin/mkdir -p /data/ota/mdb
 
-# Security settings
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/data/ota
-
 [Install]
 WantedBy=multi-user.target
