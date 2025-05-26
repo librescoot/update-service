@@ -79,6 +79,12 @@ func main() {
 	// Initialize updater
 	updater := updater.New(ctx, cfg, redisClient.GetClient(), inhibitorClient, logger)
 	defer updater.Close()
+	
+	// Check if there's a pending update that needs to be committed on startup
+	if err := updater.CheckAndCommitPendingUpdate(); err != nil {
+		logger.Printf("Warning: Failed to check/commit pending update: %v", err)
+	}
+	
 	if err := updater.Start(); err != nil {
 		logger.Fatalf("Failed to start updater: %v", err)
 	}

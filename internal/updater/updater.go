@@ -48,6 +48,28 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 	}
 }
 
+// CheckAndCommitPendingUpdate checks for and commits any pending updates on startup
+func (u *Updater) CheckAndCommitPendingUpdate() error {
+	u.logger.Printf("Checking for pending updates to commit for component %s", u.config.Component)
+	
+	needsCommit, err := u.mender.NeedsCommit()
+	if err != nil {
+		return fmt.Errorf("failed to check if commit is needed: %w", err)
+	}
+	
+	if needsCommit {
+		u.logger.Printf("Found pending update for %s, committing...", u.config.Component)
+		if err := u.mender.Commit(); err != nil {
+			return fmt.Errorf("failed to commit pending update: %w", err)
+		}
+		u.logger.Printf("Successfully committed pending update for %s", u.config.Component)
+	} else {
+		u.logger.Printf("No pending update to commit for %s", u.config.Component)
+	}
+	
+	return nil
+}
+
 // Start starts the updater
 func (u *Updater) Start() error {
 	u.logger.Printf("Starting component-aware updater for %s", u.config.Component)

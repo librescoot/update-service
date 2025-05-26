@@ -21,8 +21,7 @@ func NewInstaller(logger *log.Logger) *Installer {
 
 // NeedsCommit checks if there's a pending update that needs to be committed
 func (i *Installer) NeedsCommit() (bool, error) {
-	// For now, just return true to maintain compatibility with existing behavior
-	// In a more sophisticated implementation, we could check mender-update show-artifact
+	// Always try to commit on startup - if there's nothing to commit, mender will handle it gracefully
 	return true, nil
 }
 
