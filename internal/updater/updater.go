@@ -393,7 +393,7 @@ func (u *Updater) TriggerReboot(component string) error {
 		u.logger.Printf("Preparing to reboot MDB. Waiting for vehicle to be in 'stand-by' state for at least 3 minutes.")
 		var standbyStartTime time.Time
 		const requiredStandbyDuration = 3 * time.Minute
-		ticker := time.NewTicker(15 * time.Second) // Check every 15 seconds
+		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 
 		for {
