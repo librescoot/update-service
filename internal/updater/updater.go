@@ -11,36 +11,36 @@ import (
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/inhibitor"
 	"github.com/librescoot/update-service/internal/mender"
+	"github.com/librescoot/update-service/internal/redis"
 	"github.com/librescoot/update-service/internal/status"
-	"github.com/redis/go-redis/v9"
 )
 
 // Updater represents the component-aware update orchestrator
 type Updater struct {
-	config      *config.Config
-	redis       *redis.Client
-	inhibitor   *inhibitor.Client
-	mender      *mender.Manager
-	status      *status.Reporter
-	githubAPI   *GitHubAPI
-	logger      *log.Logger
-	ctx         context.Context
-	cancel      context.CancelFunc
+	config    *config.Config
+	redis     *redis.Client // Client from internal/redis
+	inhibitor *inhibitor.Client
+	mender    *mender.Manager
+	status    *status.Reporter
+	githubAPI *GitHubAPI
+	logger    *log.Logger
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 // New creates a new component-aware updater
 func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inhibitorClient *inhibitor.Client, logger *log.Logger) *Updater {
 	updaterCtx, cancel := context.WithCancel(ctx)
-	
+
 	// Create download directory in /data/ota/{component}
 	downloadDir := filepath.Join("/data/ota", cfg.Component)
-	
+
 	return &Updater{
 		config:    cfg,
 		redis:     redisClient,
 		inhibitor: inhibitorClient,
 		mender:    mender.NewManager(downloadDir, logger),
-		status:    status.NewReporter(redisClient, cfg.Component, logger),
+		status:    status.NewReporter(redisClient.GetClient(), cfg.Component, logger), // status.NewReporter expects the underlying go-redis/v9 client
 		githubAPI: NewGitHubAPI(updaterCtx, cfg.GitHubReleasesURL, logger),
 		logger:    logger,
 		ctx:       updaterCtx,
@@ -51,12 +51,12 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 // CheckAndCommitPendingUpdate checks for and commits any pending updates on startup
 func (u *Updater) CheckAndCommitPendingUpdate() error {
 	u.logger.Printf("Checking for pending updates to commit for component %s", u.config.Component)
-	
+
 	needsCommit, err := u.mender.NeedsCommit()
 	if err != nil {
 		return fmt.Errorf("failed to check if commit is needed: %w", err)
 	}
-	
+
 	if needsCommit {
 		u.logger.Printf("Found pending update for %s, committing...", u.config.Component)
 		if err := u.mender.Commit(); err != nil {
@@ -66,7 +66,7 @@ func (u *Updater) CheckAndCommitPendingUpdate() error {
 	} else {
 		u.logger.Printf("No pending update to commit for %s", u.config.Component)
 	}
-	
+
 	return nil
 }
 
@@ -113,7 +113,6 @@ func (u *Updater) updateCheckLoop() {
 // checkForUpdates checks for updates and initiates the update process if updates are available
 func (u *Updater) checkForUpdates() {
 	u.logger.Printf("Checking for updates for component %s on channel %s", u.config.Component, u.config.Channel)
-
 
 	// Get releases from GitHub
 	releases, err := u.githubAPI.GetReleases()
@@ -226,11 +225,7 @@ func (u *Updater) isUpdateNeeded(release Release) bool {
 
 // getCurrentVersion gets the current version for this component
 func (u *Updater) getCurrentVersion() (string, error) {
-	// For now, we'll use a simple method to get the version
-	// This could be enhanced to read from actual system or Redis
-	
-	// Try to read from Redis first
-	result, err := u.redis.HGet(u.ctx, fmt.Sprintf("version:%s", u.config.Component), "version_id").Result()
+	result, err := u.redis.GetClient().HGet(u.ctx, fmt.Sprintf("version:%s", u.config.Component), "version_id").Result()
 	if err == nil && result != "" {
 		return result, nil
 	}
@@ -341,24 +336,99 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	// Step 7: Trigger reboot (component will reboot automatically or system will reboot)
 	u.logger.Printf("Update installation complete, system will reboot to apply changes")
 
-	// For MDB, we should reboot the system
-	if u.config.Component == "mdb" {
-		u.logger.Printf("Rebooting system to apply MDB update")
-		if !u.config.DryRun {
-			// In a real implementation, this would trigger a system reboot
-			// For now, we'll just set the status back to idle after a delay
-			time.Sleep(5 * time.Second)
-			if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
-				u.logger.Printf("Failed to set idle status: %v", err)
+	// Trigger reboot
+	if u.config.Component == "mdb" || u.config.Component == "dbc" {
+		u.logger.Printf("%s update installed, triggering reboot", strings.ToUpper(u.config.Component))
+		err := u.TriggerReboot(u.config.Component) // Call the method on *Updater
+		if err != nil {
+			u.logger.Printf("Failed to trigger %s reboot: %v", u.config.Component, err)
+			// If reboot trigger fails (and not due to dry run), set status to error
+			// The TriggerReboot method now logs "DRY-RUN..." itself.
+			// We check if the error message contains "DRY-RUN" to avoid setting error status.
+			if !strings.Contains(err.Error(), "DRY-RUN") {
+				if statusErr := u.status.SetStatus(u.ctx, status.StatusError); statusErr != nil {
+					u.logger.Printf("Additionally failed to set error status after %s reboot trigger failure: %v", u.config.Component, statusErr)
+				}
+			}
+
+			// If it was a dry run (error contains "DRY-RUN" or DryRun flag is true), simulate post-reboot.
+			if u.config.DryRun || strings.Contains(err.Error(), "DRY-RUN") {
+				u.logger.Printf("Dry run or simulated reboot: Simulating post-reboot state by setting idle status for %s.", u.config.Component)
+				if idleErr := u.status.SetIdleAndClearVersion(u.ctx); idleErr != nil {
+					u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
+				}
 			}
 		}
+		// If TriggerReboot was successful (and not a dry run), the system/component will reboot/restart.
+		// Status remains 'rebooting'.
 	} else {
-		// For DBC, the component will handle its own reboot
-		u.logger.Printf("DBC update installed, waiting for component reboot")
-		// Set status back to idle after a delay to simulate reboot completion
-		time.Sleep(10 * time.Second)
+		u.logger.Printf("Unknown component %s, cannot determine reboot strategy. Setting to idle.", u.config.Component)
 		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
-			u.logger.Printf("Failed to set idle status: %v", err)
+			u.logger.Printf("Failed to set idle status for unknown component: %v", err)
 		}
+	}
+}
+
+// IsSafeForMdbReboot checks if it's safe to reboot the MDB
+// MDB should only be rebooted when the scooter is in stand-by mode or shutting down.
+func (u *Updater) IsSafeForMdbReboot() (bool, error) {
+	currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+	if err != nil {
+		return false, fmt.Errorf("failed to get current vehicle state: %w", err)
+	}
+	return currentState == "stand-by" || currentState == "shutting-down", nil
+}
+
+// IsSafeForDbcReboot checks if it's safe to reboot the DBC.
+// DBC should not be rebooted when the scooter is being actively used.
+func (u *Updater) IsSafeForDbcReboot() (bool, error) {
+	currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+	if err != nil {
+		return false, fmt.Errorf("failed to get current vehicle state: %w", err)
+	}
+	return currentState != "ready-to-drive" && currentState != "parked", nil
+}
+
+// TriggerReboot triggers a reboot or restart of the specified component.
+func (u *Updater) TriggerReboot(component string) error {
+	if u.config.DryRun {
+		u.logger.Printf("DRY-RUN: Would reboot/restart %s, but dry-run mode is enabled", component)
+		return fmt.Errorf("DRY-RUN: Would reboot/restart %s", component) // Return an error to signal dry run
+	}
+
+	switch component {
+	case "mdb":
+		safe, err := u.IsSafeForMdbReboot()
+		if err != nil {
+			return fmt.Errorf("failed to check MDB reboot safety: %w", err)
+		}
+		if !safe {
+			currentState, _ := u.redis.GetVehicleState(config.VehicleHashKey)
+			return fmt.Errorf("not safe to reboot MDB in current state: %s", currentState)
+		}
+		u.logger.Printf("Triggering MDB reboot via Redis command")
+		return u.redis.TriggerReboot()
+
+	case "dbc":
+		safe, err := u.IsSafeForDbcReboot()
+		if err != nil {
+			return fmt.Errorf("failed to check DBC reboot safety: %w", err)
+		}
+		if !safe {
+			currentState, _ := u.redis.GetVehicleState(config.VehicleHashKey)
+			return fmt.Errorf("not safe to reboot DBC in current state: %s", currentState)
+		}
+		u.logger.Printf("Triggering DBC restart via Redis commands (complete-dbc, start-dbc)")
+		if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+			return fmt.Errorf("failed to send complete-dbc command: %w", err)
+		}
+		time.Sleep(500 * time.Millisecond) // Allow time for complete-dbc to be processed
+		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+			return fmt.Errorf("failed to send start-dbc command: %w", err)
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unknown component for reboot: %s", component)
 	}
 }

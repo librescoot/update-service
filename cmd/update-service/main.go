@@ -62,7 +62,7 @@ func main() {
 		*dryRun,
 	)
 
-	// Initialize Redis client  
+	// Initialize Redis client
 	redisClient, err := redis.New(ctx, *redisAddr)
 	if err != nil {
 		logger.Fatalf("Failed to initialize Redis client: %v", err)
@@ -77,14 +77,14 @@ func main() {
 	defer inhibitorClient.Close()
 
 	// Initialize updater
-	updater := updater.New(ctx, cfg, redisClient.GetClient(), inhibitorClient, logger)
+	updater := updater.New(ctx, cfg, redisClient, inhibitorClient, logger)
 	defer updater.Close()
-	
+
 	// Check if there's a pending update that needs to be committed on startup
 	if err := updater.CheckAndCommitPendingUpdate(); err != nil {
 		logger.Printf("Warning: Failed to check/commit pending update: %v", err)
 	}
-	
+
 	if err := updater.Start(); err != nil {
 		logger.Fatalf("Failed to start updater: %v", err)
 	}
