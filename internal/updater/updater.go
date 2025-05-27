@@ -58,11 +58,14 @@ func (u *Updater) CheckAndCommitPendingUpdate() error {
 	}
 
 	if needsCommit {
-		u.logger.Printf("Found pending update for %s, committing...", u.config.Component)
-		if err := u.mender.Commit(); err != nil {
-			return fmt.Errorf("failed to commit pending update: %w", err)
+		u.logger.Printf("Found pending update for %s, attempting to commit...", u.config.Component)
+		// Attempt to commit, log outcome (mender.Commit logs details), but don't let failure here stop startup.
+		if errCommit := u.mender.Commit(); errCommit != nil {
+			u.logger.Printf("Attempt to commit pending Mender update for %s during startup resulted in an error (continuing startup): %v", u.config.Component, errCommit)
+		} else {
+			u.logger.Printf("Attempt to commit pending Mender update for %s during startup completed.", u.config.Component)
 		}
-		u.logger.Printf("Successfully committed pending update for %s", u.config.Component)
+		// Regardless of commit outcome, we consider this check handled for startup purposes.
 	} else {
 		u.logger.Printf("No pending update to commit for %s", u.config.Component)
 	}
@@ -251,14 +254,13 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 
 	// Step 0: Check and commit any pending Mender update
 	u.logger.Printf("Checking and attempting to commit any pending Mender update for %s before starting new update to %s", u.config.Component, release.TagName)
-	if err := u.mender.Commit(); err != nil {
-		u.logger.Printf("Failed to commit pending Mender update for %s: %v. Aborting update to %s.", u.config.Component, err, release.TagName)
-		if statusErr := u.status.SetStatus(u.ctx, status.StatusError); statusErr != nil {
-			u.logger.Printf("Additionally failed to set error status for %s: %v", u.config.Component, statusErr)
-		}
-		return
+	// Attempt to commit. Log outcome (mender.Commit logs details), but don't let failure here stop the new update.
+	if errCommit := u.mender.Commit(); errCommit != nil {
+		u.logger.Printf("Attempt to commit pending Mender update for %s before new update to %s resulted in an error (proceeding with new update): %v", u.config.Component, release.TagName, errCommit)
+	} else {
+		u.logger.Printf("Attempt to commit pending Mender update for %s before new update to %s completed.", u.config.Component, release.TagName)
 	}
-	u.logger.Printf("Pending Mender commit (if any) handled successfully for %s. Proceeding with update to %s.", u.config.Component, release.TagName)
+	u.logger.Printf("Proceeding with update to %s for component %s.", release.TagName, u.config.Component)
 
 	// Step 1: Set downloading status and add download inhibitor
 	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, version); err != nil {
