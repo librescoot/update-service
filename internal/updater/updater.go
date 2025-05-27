@@ -369,16 +369,6 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	}
 }
 
-// IsSafeForMdbReboot checks if it's safe to reboot the MDB
-// MDB should only be rebooted when the scooter is in stand-by mode or shutting down.
-func (u *Updater) IsSafeForMdbReboot() (bool, error) {
-	currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
-	if err != nil {
-		return false, fmt.Errorf("failed to get current vehicle state: %w", err)
-	}
-	return currentState == "stand-by" || currentState == "shutting-down", nil
-}
-
 // IsSafeForDbcReboot checks if it's safe to reboot the DBC.
 // DBC should not be rebooted when the scooter is being actively used.
 func (u *Updater) IsSafeForDbcReboot() (bool, error) {
@@ -398,16 +388,47 @@ func (u *Updater) TriggerReboot(component string) error {
 
 	switch component {
 	case "mdb":
-		safe, err := u.IsSafeForMdbReboot()
-		if err != nil {
-			return fmt.Errorf("failed to check MDB reboot safety: %w", err)
+		u.logger.Printf("Preparing to reboot MDB. Waiting for vehicle to be in 'stand-by' state for at least 3 minutes.")
+		var standbyStartTime time.Time
+		const requiredStandbyDuration = 3 * time.Minute
+		ticker := time.NewTicker(15 * time.Second) // Check every 15 seconds
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-u.ctx.Done():
+				u.logger.Printf("MDB reboot cancelled due to context done.")
+				return u.ctx.Err()
+			case <-ticker.C:
+				currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+				if err != nil {
+					u.logger.Printf("Failed to get vehicle state for MDB reboot check: %v. Retrying.", err)
+					standbyStartTime = time.Time{} // Reset timer on error
+					continue
+				}
+
+				if currentState == "stand-by" {
+					if standbyStartTime.IsZero() {
+						standbyStartTime = time.Now()
+						u.logger.Printf("Vehicle entered 'stand-by' state at %s. Monitoring for %v.", standbyStartTime.Format(time.RFC3339), requiredStandbyDuration)
+					}
+					durationInStandby := time.Since(standbyStartTime)
+					if durationInStandby >= requiredStandbyDuration {
+						u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", durationInStandby, standbyStartTime.Format(time.RFC3339))
+						u.logger.Printf("Triggering MDB reboot via Redis command")
+						return u.redis.TriggerReboot()
+					}
+					u.logger.Printf("Vehicle in 'stand-by' for %v. Waiting for %v.", durationInStandby, requiredStandbyDuration)
+				} else {
+					if !standbyStartTime.IsZero() {
+						u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Resetting standby timer.", currentState)
+						standbyStartTime = time.Time{}
+					} else {
+						u.logger.Printf("Vehicle not in 'stand-by' (current: %s). Waiting.", currentState)
+					}
+				}
+			}
 		}
-		if !safe {
-			currentState, _ := u.redis.GetVehicleState(config.VehicleHashKey)
-			return fmt.Errorf("not safe to reboot MDB in current state: %s", currentState)
-		}
-		u.logger.Printf("Triggering MDB reboot via Redis command")
-		return u.redis.TriggerReboot()
 
 	case "dbc":
 		safe, err := u.IsSafeForDbcReboot()
