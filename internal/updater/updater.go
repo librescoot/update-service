@@ -254,6 +254,17 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	}
 	version := strings.ToLower(parts[1])
 
+	// Step 0: Check and commit any pending Mender update
+	u.logger.Printf("Checking and attempting to commit any pending Mender update for %s before starting new update to %s", u.config.Component, release.TagName)
+	if err := u.mender.Commit(); err != nil {
+		u.logger.Printf("Failed to commit pending Mender update for %s: %v. Aborting update to %s.", u.config.Component, err, release.TagName)
+		if statusErr := u.status.SetStatus(u.ctx, status.StatusError); statusErr != nil {
+			u.logger.Printf("Additionally failed to set error status for %s: %v", u.config.Component, statusErr)
+		}
+		return
+	}
+	u.logger.Printf("Pending Mender commit (if any) handled successfully for %s. Proceeding with update to %s.", u.config.Component, release.TagName)
+
 	// Step 1: Set downloading status and add download inhibitor
 	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, version); err != nil {
 		u.logger.Printf("Failed to set downloading status: %v", err)
