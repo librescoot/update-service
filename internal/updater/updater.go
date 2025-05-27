@@ -292,12 +292,13 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 		return
 	}
 
-	if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to remove download inhibit: %v", err)
-	}
-
+	// Add install inhibit before removing download inhibit to prevent a window where no inhibit is active
 	if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
 		u.logger.Printf("Failed to add install inhibit: %v", err)
+	}
+
+	if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
+		u.logger.Printf("Failed to remove download inhibit: %v", err)
 	}
 
 	// Step 4: Install the update
