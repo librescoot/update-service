@@ -117,6 +117,23 @@ func (u *Updater) updateCheckLoop() {
 func (u *Updater) checkForUpdates() {
 	u.logger.Printf("Checking for updates for component %s on channel %s", u.config.Component, u.config.Channel)
 
+	// Check if we're waiting for a reboot - if so, defer updates
+	currentStatus, err := u.status.GetStatus(u.ctx)
+	if err != nil {
+		u.logger.Printf("Failed to get current status: %v", err)
+		return
+	}
+
+	if currentStatus == status.StatusRebooting {
+		u.logger.Printf("Component %s is in rebooting state, deferring update check until reboot completes", u.config.Component)
+		return
+	}
+
+	if currentStatus == status.StatusDownloading || currentStatus == status.StatusInstalling {
+		u.logger.Printf("Component %s is currently %s, deferring update check", u.config.Component, currentStatus)
+		return
+	}
+
 	// Get releases from GitHub
 	releases, err := u.githubAPI.GetReleases()
 	if err != nil {
