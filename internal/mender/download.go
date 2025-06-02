@@ -38,11 +38,38 @@ func NewDownloader(downloadDir string, logger *log.Logger) *Downloader {
 	}
 }
 
+// CleanupStaleTmpFiles removes .tmp files that don't match the current download filename
+func (d *Downloader) CleanupStaleTmpFiles(currentFilename string) error {
+	currentTmpFile := currentFilename + ".tmp"
+	
+	files, err := filepath.Glob(filepath.Join(d.downloadDir, "*.tmp"))
+	if err != nil {
+		return fmt.Errorf("error finding tmp files: %w", err)
+	}
+	
+	for _, file := range files {
+		baseName := filepath.Base(file)
+		if baseName != currentTmpFile {
+			d.logger.Printf("Removing stale tmp file: %s", file)
+			if err := os.Remove(file); err != nil {
+				d.logger.Printf("Warning: failed to remove stale tmp file %s: %v", file, err)
+			}
+		}
+	}
+	
+	return nil
+}
+
 // Download downloads a file from the given URL with resumable downloads and retry logic
 func (d *Downloader) Download(ctx context.Context, url string) (string, error) {
 	filename := filepath.Base(url)
 	if filename == "" || filename == "." {
 		filename = "update.mender"
+	}
+
+	// Clean up any stale .tmp files before starting download
+	if err := d.CleanupStaleTmpFiles(filename); err != nil {
+		d.logger.Printf("Warning: failed to cleanup stale tmp files: %v", err)
 	}
 
 	finalPath := filepath.Join(d.downloadDir, filename)

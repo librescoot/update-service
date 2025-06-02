@@ -63,6 +63,11 @@ func (m *Manager) GetDownloadDir() string {
 	return m.downloader.downloadDir
 }
 
+// CleanupStaleTmpFiles removes stale .tmp files that don't match the current filename
+func (m *Manager) CleanupStaleTmpFiles(currentFilename string) error {
+	return m.downloader.CleanupStaleTmpFiles(currentFilename)
+}
+
 // CleanupFile removes a downloaded file
 func (m *Manager) CleanupFile(filePath string) error {
 	// Only clean up files within our download directory
