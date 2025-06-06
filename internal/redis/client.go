@@ -62,7 +62,6 @@ func (c *Client) PushUpdateCommand(command string) error {
 	return c.client.LPush(c.ctx, "scooter:update", command).Err()
 }
 
-
 // GetOTAStatus gets the OTA status from Redis
 func (c *Client) GetOTAStatus(otaHashKey string) (map[string]string, error) {
 	return c.client.HGetAll(c.ctx, otaHashKey).Result()

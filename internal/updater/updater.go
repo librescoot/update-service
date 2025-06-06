@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -303,6 +304,14 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 		return
 	}
 
+	// For DBC updates, notify vehicle-service to keep dashboard power on
+	if u.config.Component == "dbc" {
+		u.logger.Printf("Starting DBC update - sending start-dbc command")
+		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+			u.logger.Printf("Failed to send start-dbc command: %v", err)
+		}
+	}
+
 	if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
 		u.logger.Printf("Failed to add download inhibit: %v", err)
 	}
@@ -314,6 +323,14 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 		}
 		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
 			u.logger.Printf("Failed to remove install inhibit: %v", err)
+		}
+
+		// For DBC updates, notify vehicle-service that update is complete
+		if u.config.Component == "dbc" {
+			u.logger.Printf("DBC update cleanup - sending complete-dbc command")
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
+			}
 		}
 	}()
 
@@ -471,13 +488,9 @@ func (u *Updater) TriggerReboot(component string) error {
 			currentState, _ := u.redis.GetVehicleState(config.VehicleHashKey)
 			return fmt.Errorf("not safe to reboot DBC in current state: %s", currentState)
 		}
-		u.logger.Printf("Triggering DBC restart via Redis commands (complete-dbc, start-dbc)")
-		if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-			return fmt.Errorf("failed to send complete-dbc command: %w", err)
-		}
-		time.Sleep(500 * time.Millisecond) // Allow time for complete-dbc to be processed
-		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
-			return fmt.Errorf("failed to send start-dbc command: %w", err)
+		u.logger.Printf("Triggering DBC reboot via systemctl")
+		if err := exec.Command("systemctl", "reboot").Run(); err != nil {
+			return fmt.Errorf("failed to trigger reboot: %w", err)
 		}
 		return nil
 

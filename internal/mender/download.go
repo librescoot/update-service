@@ -31,7 +31,7 @@ func NewDownloader(downloadDir string, logger *log.Logger) *Downloader {
 			logger.Printf("Error creating download directory: %v", err)
 		}
 	}
-	
+
 	return &Downloader{
 		downloadDir: downloadDir,
 		logger:      logger,
@@ -41,12 +41,12 @@ func NewDownloader(downloadDir string, logger *log.Logger) *Downloader {
 // CleanupStaleTmpFiles removes .tmp files that don't match the current download filename
 func (d *Downloader) CleanupStaleTmpFiles(currentFilename string) error {
 	currentTmpFile := currentFilename + ".tmp"
-	
+
 	files, err := filepath.Glob(filepath.Join(d.downloadDir, "*.tmp"))
 	if err != nil {
 		return fmt.Errorf("error finding tmp files: %w", err)
 	}
-	
+
 	for _, file := range files {
 		baseName := filepath.Base(file)
 		if baseName != currentTmpFile {
@@ -56,7 +56,7 @@ func (d *Downloader) CleanupStaleTmpFiles(currentFilename string) error {
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -109,8 +109,8 @@ func (d *Downloader) Download(ctx context.Context, url string) (string, error) {
 		// Timeout for TLS handshake
 		TLSHandshakeTimeout: 30 * time.Second,
 		// Increase idle connections
-		MaxIdleConns:        100,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:    100,
+		IdleConnTimeout: 90 * time.Second,
 	}
 
 	client := &http.Client{
@@ -162,7 +162,7 @@ func (d *Downloader) Download(ctx context.Context, url string) (string, error) {
 	totalRead := fileSize
 	lastProgressReport := time.Now()
 	start := time.Now()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -188,13 +188,13 @@ func (d *Downloader) Download(ctx context.Context, url string) (string, error) {
 					elapsed := time.Since(start)
 					speed := float64(totalRead) / elapsed.Seconds() / 1024 / 1024 // MB/s
 					d.logger.Printf("Download complete, total size: %d bytes, average speed: %.2f MB/s", totalRead, speed)
-					
+
 					file.Close()
 					if err := os.Rename(downloadTempPath, finalPath); err != nil {
 						return "", fmt.Errorf("error renaming temporary file: %w", err)
 					}
 					d.logger.Printf("Renamed temporary file %s to %s", downloadTempPath, finalPath)
-					
+
 					return finalPath, nil
 				}
 				return "", fmt.Errorf("error reading response: %w", err)

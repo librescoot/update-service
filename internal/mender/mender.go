@@ -26,25 +26,25 @@ func NewManager(downloadDir string, logger *log.Logger) *Manager {
 // DownloadAndVerify downloads an update file and verifies its checksum
 func (m *Manager) DownloadAndVerify(ctx context.Context, url, checksum string) (string, error) {
 	m.logger.Printf("Starting download and verification for %s", url)
-	
+
 	// Download the file
 	filePath, err := m.downloader.Download(ctx, url)
 	if err != nil {
 		return "", err
 	}
-	
+
 	// Verify checksum if provided
 	if checksum != "" {
 		if err := m.downloader.VerifyChecksum(filePath, checksum); err != nil {
 			return "", err
 		}
 	}
-	
+
 	// Clean up old downloaded files after successful verification
 	if err := m.cleanupOldFiles(url); err != nil {
 		m.logger.Printf("Warning: failed to cleanup old files: %v", err)
 	}
-	
+
 	return filePath, nil
 }
 
@@ -105,7 +105,7 @@ func (m *Manager) CleanupFile(filePath string) error {
 		m.logger.Printf("Warning: not cleaning up file outside download directory: %s", filePath)
 		return nil
 	}
-	
+
 	m.logger.Printf("Cleaning up downloaded file: %s", filePath)
 	return filepath.Walk(filePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {

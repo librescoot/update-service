@@ -13,7 +13,7 @@ const (
 	// Redis keys for power inhibits
 	InhibitHashKey = "power:inhibits"
 	InhibitChannel = "power:inhibits"
-	
+
 	// Redis keys for governor control
 	PowerGovernorListKey = "scooter:governor"
 )
@@ -140,12 +140,12 @@ const (
 // RequestGovernor requests a governor change from pm-service
 func (c *Client) RequestGovernor(governor string) error {
 	c.logger.Printf("Requesting CPU governor change to: %s", governor)
-	
+
 	// Send the command via Redis list
 	if _, err := c.client.LPush(c.ctx, PowerGovernorListKey, governor).Result(); err != nil {
 		return fmt.Errorf("failed to request governor change: %w", err)
 	}
-	
+
 	return nil
 }
 

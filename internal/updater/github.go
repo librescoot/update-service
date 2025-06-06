@@ -11,11 +11,11 @@ import (
 
 // Retry constants
 const (
-	maxRetries       = 5
-	initialBackoff   = 5 * time.Second
-	maxBackoff       = 300 * time.Second
-	backoffFactor    = 2.0
-	backoffJitter    = 0.2 // 20% jitter
+	maxRetries     = 5
+	initialBackoff = 5 * time.Second
+	maxBackoff     = 300 * time.Second
+	backoffFactor  = 2.0
+	backoffJitter  = 0.2 // 20% jitter
 )
 
 // Asset represents a GitHub release asset
@@ -84,21 +84,21 @@ func (g *GitHubAPI) GetReleases() ([]Release, error) {
 
 		// Make the request
 		resp, err = g.client.Do(req)
-		
+
 		// If request succeeded
 		if err == nil && resp.StatusCode == http.StatusOK {
 			defer resp.Body.Close()
-			
+
 			// Decode the response
 			if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
 				return nil, fmt.Errorf("failed to decode response: %w", err)
 			}
-			
+
 			// If we retried, log success after retries
 			if retries > 0 {
 				g.logger.Printf("Successfully fetched releases after %d retries", retries)
 			}
-			
+
 			return releases, nil
 		}
 
@@ -121,12 +121,12 @@ func (g *GitHubAPI) GetReleases() ([]Release, error) {
 
 		// Calculate jitter (between -jitter% and +jitter%)
 		jitter := 1.0 + (rand.Float64()*2-1.0)*backoffJitter
-		
+
 		// Apply jitter to backoff
 		actualBackoff := time.Duration(float64(backoff) * jitter)
-		
+
 		// Log retry attempt
-		g.logger.Printf("Failed to fetch releases (attempt %d/%d), retrying in %v: %v", 
+		g.logger.Printf("Failed to fetch releases (attempt %d/%d), retrying in %v: %v",
 			retries+1, maxRetries, actualBackoff, lastError)
 
 		// Wait before retrying
