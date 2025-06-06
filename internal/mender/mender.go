@@ -40,6 +40,11 @@ func (m *Manager) DownloadAndVerify(ctx context.Context, url, checksum string) (
 		}
 	}
 	
+	// Clean up old downloaded files after successful verification
+	if err := m.cleanupOldFiles(url); err != nil {
+		m.logger.Printf("Warning: failed to cleanup old files: %v", err)
+	}
+	
 	return filePath, nil
 }
 
@@ -66,6 +71,31 @@ func (m *Manager) GetDownloadDir() string {
 // CleanupStaleTmpFiles removes stale .tmp files that don't match the current filename
 func (m *Manager) CleanupStaleTmpFiles(currentFilename string) error {
 	return m.downloader.CleanupStaleTmpFiles(currentFilename)
+}
+
+// cleanupOldFiles removes old downloaded .mender files except the one we're about to download
+func (m *Manager) cleanupOldFiles(currentURL string) error {
+	currentFilename := filepath.Base(currentURL)
+	if currentFilename == "" || currentFilename == "." {
+		currentFilename = "update.mender"
+	}
+
+	pattern := filepath.Join(m.downloader.downloadDir, "*.mender")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		if filepath.Base(file) != currentFilename {
+			m.logger.Printf("Removing old download file: %s", file)
+			if err := os.Remove(file); err != nil {
+				m.logger.Printf("Warning: failed to remove old file %s: %v", file, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 // CleanupFile removes a downloaded file

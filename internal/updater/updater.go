@@ -77,6 +77,11 @@ func (u *Updater) CheckAndCommitPendingUpdate() error {
 func (u *Updater) Start() error {
 	u.logger.Printf("Starting component-aware updater for %s", u.config.Component)
 
+	// Clear rebooting status if present (reboot completed or failed)
+	if err := u.clearRebootingStatus(); err != nil {
+		u.logger.Printf("Warning: Failed to clear rebooting status: %v", err)
+	}
+
 	// Start the update check loop
 	go u.updateCheckLoop()
 
@@ -92,6 +97,24 @@ func (u *Updater) Stop() {
 func (u *Updater) Close() {
 	u.logger.Printf("Shutting down updater for component %s", u.config.Component)
 	u.Stop()
+}
+
+// clearRebootingStatus clears the rebooting status if present on startup
+func (u *Updater) clearRebootingStatus() error {
+	currentStatus, err := u.status.GetStatus(u.ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get current status: %w", err)
+	}
+
+	if currentStatus == status.StatusRebooting {
+		u.logger.Printf("Found rebooting status for %s on startup, clearing (reboot completed or failed)", u.config.Component)
+		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+			return fmt.Errorf("failed to clear rebooting status: %w", err)
+		}
+		u.logger.Printf("Cleared rebooting status for %s", u.config.Component)
+	}
+
+	return nil
 }
 
 // updateCheckLoop periodically checks for updates
@@ -126,11 +149,6 @@ func (u *Updater) checkForUpdates() {
 
 	if currentStatus == status.StatusRebooting {
 		u.logger.Printf("Component %s is in rebooting state, deferring update check until reboot completes", u.config.Component)
-		return
-	}
-
-	if currentStatus == status.StatusDownloading || currentStatus == status.StatusInstalling {
-		u.logger.Printf("Component %s is currently %s, deferring update check", u.config.Component, currentStatus)
 		return
 	}
 
@@ -337,12 +355,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 
 	u.logger.Printf("Successfully installed update")
 
-	// Step 5: Clean up the downloaded file
-	if err := u.mender.CleanupFile(filePath); err != nil {
-		u.logger.Printf("Failed to cleanup downloaded file: %v", err)
-	}
-
-	// Step 6: Set rebooting status and prepare for reboot
+	// Step 5: Set rebooting status and prepare for reboot
 	if err := u.status.SetStatus(u.ctx, status.StatusRebooting); err != nil {
 		u.logger.Printf("Failed to set rebooting status: %v", err)
 	}
@@ -352,7 +365,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 		u.logger.Printf("Failed to remove install inhibit: %v", err)
 	}
 
-	// Step 7: Trigger reboot (component will reboot automatically or system will reboot)
+	// Step 6: Trigger reboot (component will reboot automatically or system will reboot)
 	u.logger.Printf("Update installation complete, system will reboot to apply changes")
 
 	// Trigger reboot
