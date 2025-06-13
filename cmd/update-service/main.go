@@ -36,7 +36,12 @@ func main() {
 	}
 
 	// Set up logger
-	logger := log.New(os.Stdout, "update-service: ", log.LstdFlags)
+	var logger *log.Logger
+	if os.Getenv("INVOCATION_ID") != "" {
+		logger = log.New(os.Stdout, "", 0)
+	} else {
+		logger = log.New(os.Stdout, "librescoot-update: ", log.LstdFlags|log.Lmsgprefix)
+	}
 	logger.Printf("Starting update service for component: %s", *component)
 
 	// Create context that can be cancelled on SIGINT or SIGTERM
