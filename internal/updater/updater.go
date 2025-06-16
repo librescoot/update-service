@@ -12,6 +12,7 @@ import (
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/inhibitor"
 	"github.com/librescoot/update-service/internal/mender"
+	"github.com/librescoot/update-service/internal/power"
 	"github.com/librescoot/update-service/internal/redis"
 	"github.com/librescoot/update-service/internal/status"
 )
@@ -21,6 +22,7 @@ type Updater struct {
 	config    *config.Config
 	redis     *redis.Client // Client from internal/redis
 	inhibitor *inhibitor.Client
+	power     *power.Client
 	mender    *mender.Manager
 	status    *status.Reporter
 	githubAPI *GitHubAPI
@@ -30,7 +32,7 @@ type Updater struct {
 }
 
 // New creates a new component-aware updater
-func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inhibitorClient *inhibitor.Client, logger *log.Logger) *Updater {
+func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inhibitorClient *inhibitor.Client, powerClient *power.Client, logger *log.Logger) *Updater {
 	updaterCtx, cancel := context.WithCancel(ctx)
 
 	// Create download directory in /data/ota/{component}
@@ -40,6 +42,7 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		config:    cfg,
 		redis:     redisClient,
 		inhibitor: inhibitorClient,
+		power:     powerClient,
 		mender:    mender.NewManager(downloadDir, logger),
 		status:    status.NewReporter(redisClient.GetClient(), cfg.Component, logger), // status.NewReporter expects the underlying go-redis/v9 client
 		githubAPI: NewGitHubAPI(updaterCtx, cfg.GitHubReleasesURL, logger),
@@ -314,6 +317,11 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 
 	if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
 		u.logger.Printf("Failed to add download inhibit: %v", err)
+	}
+
+	// Request ondemand CPU governor for optimal download performance
+	if err := u.power.RequestOndemandGovernor(); err != nil {
+		u.logger.Printf("Failed to request ondemand governor: %v", err)
 	}
 
 	defer func() {

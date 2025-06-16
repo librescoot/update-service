@@ -11,6 +11,7 @@ import (
 
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/inhibitor"
+	"github.com/librescoot/update-service/internal/power"
 	"github.com/librescoot/update-service/internal/redis"
 	"github.com/librescoot/update-service/internal/updater"
 )
@@ -81,8 +82,15 @@ func main() {
 	}
 	defer inhibitorClient.Close()
 
+	// Initialize power client
+	powerClient, err := power.New(ctx, *redisAddr, logger)
+	if err != nil {
+		logger.Fatalf("Failed to initialize power client: %v", err)
+	}
+	defer powerClient.Close()
+
 	// Initialize updater
-	updater := updater.New(ctx, cfg, redisClient, inhibitorClient, logger)
+	updater := updater.New(ctx, cfg, redisClient, inhibitorClient, powerClient, logger)
 	defer updater.Close()
 
 	// Check if there's a pending update that needs to be committed on startup
