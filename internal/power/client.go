@@ -59,7 +59,11 @@ func (c *Client) Close() error {
 
 // AddInhibit adds a power inhibit
 func (c *Client) AddInhibit(id string, inhibitType InhibitType, duration time.Duration) error {
-	c.logger.Printf("Adding power inhibit: id=%s, type=%s, duration=%v", id, inhibitType, duration)
+	durationStr := duration.String()
+	if duration == 0 {
+		durationStr = "indefinite"
+	}
+	c.logger.Printf("Adding power inhibit: id=%s, type=%s, duration=%s", id, inhibitType, durationStr)
 
 	// Create inhibit data
 	inhibitData := map[string]interface{}{
