@@ -75,13 +75,22 @@ func (d *Downloader) Download(ctx context.Context, url string) (string, error) {
 	finalPath := filepath.Join(d.downloadDir, filename)
 	downloadTempPath := filepath.Join(d.downloadDir, filename+".tmp")
 
+	// Check if final file already exists first
+	if finalInfo, err := os.Stat(finalPath); err == nil {
+		d.logger.Printf("File already exists: %s (%d bytes), skipping download", finalPath, finalInfo.Size())
+		return finalPath, nil
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("error checking final file: %w", err)
+	}
+
+	// Check for resumable temporary file
 	fileInfo, err := os.Stat(downloadTempPath)
 	var fileSize int64
 	if err == nil {
 		fileSize = fileInfo.Size()
-		d.logger.Printf("File already exists with size %d bytes, resuming download", fileSize)
+		d.logger.Printf("Temporary file exists with size %d bytes, resuming download", fileSize)
 	} else if !os.IsNotExist(err) {
-		return "", fmt.Errorf("error checking file: %w", err)
+		return "", fmt.Errorf("error checking temporary file: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
