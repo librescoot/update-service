@@ -150,6 +150,59 @@ func (c *Client) GetComponentVersion(component string) (string, error) {
 	return versionID, nil
 }
 
+// GetVehicleStateWithTimestamp gets vehicle state and last state change timestamp
+func (c *Client) GetVehicleStateWithTimestamp(vehicleHashKey string) (string, time.Time, error) {
+	result, err := c.client.HMGet(c.ctx, vehicleHashKey, "state", "state_timestamp").Result()
+	if err != nil {
+		return "", time.Time{}, err
+	}
+
+	state := ""
+	if result[0] != nil {
+		state = result[0].(string)
+	}
+
+	var timestamp time.Time
+	if result[1] != nil {
+		if ts, ok := result[1].(string); ok && ts != "" {
+			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+				timestamp = parsed
+			}
+		}
+	}
+
+	return state, timestamp, nil
+}
+
+// SubscribeToVehicleStateChanges subscribes to vehicle state changes
+func (c *Client) SubscribeToVehicleStateChanges(channel string) (<-chan string, func(), error) {
+	pubsub := c.client.Subscribe(c.ctx, channel)
+
+	// Check if subscription was successful
+	_, err := pubsub.Receive(c.ctx)
+	if err != nil {
+		pubsub.Close()
+		return nil, nil, fmt.Errorf("failed to subscribe to vehicle state changes: %w", err)
+	}
+
+	// Create a string channel
+	msgChan := make(chan string)
+
+	// Start a goroutine to handle messages
+	go func() {
+		defer close(msgChan)
+		for msg := range pubsub.Channel() {
+			select {
+			case <-c.ctx.Done():
+				return
+			case msgChan <- msg.Payload:
+			}
+		}
+	}()
+
+	return msgChan, func() { pubsub.Close() }, nil
+}
+
 // TriggerReboot triggers a system reboot via Redis
 func (c *Client) TriggerReboot() error {
 	return c.client.LPush(c.ctx, "scooter:power", "reboot").Err()

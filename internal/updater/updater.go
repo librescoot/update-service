@@ -446,46 +446,39 @@ func (u *Updater) TriggerReboot(component string) error {
 	switch component {
 	case "mdb":
 		u.logger.Printf("Preparing to reboot MDB. Waiting for vehicle to be in 'stand-by' state for at least 3 minutes.")
-		var standbyStartTime time.Time
 		const requiredStandbyDuration = 3 * time.Minute
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
 
-		for {
-			select {
-			case <-u.ctx.Done():
-				u.logger.Printf("MDB reboot cancelled due to context done.")
-				return u.ctx.Err()
-			case <-ticker.C:
-				currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
-				if err != nil {
-					u.logger.Printf("Failed to get vehicle state for MDB reboot check: %v. Retrying.", err)
-					standbyStartTime = time.Time{} // Reset timer on error
-					continue
-				}
-
-				if currentState == "stand-by" {
-					if standbyStartTime.IsZero() {
-						standbyStartTime = time.Now()
-						u.logger.Printf("Vehicle entered 'stand-by' state at %s. Monitoring for %v.", standbyStartTime.Format(time.RFC3339), requiredStandbyDuration)
-					}
-					durationInStandby := time.Since(standbyStartTime)
-					if durationInStandby >= requiredStandbyDuration {
-						u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", durationInStandby, standbyStartTime.Format(time.RFC3339))
-						u.logger.Printf("Triggering MDB reboot via Redis command")
-						return u.redis.TriggerReboot()
-					}
-					u.logger.Printf("Vehicle in 'stand-by' for %v. Waiting for %v.", durationInStandby, requiredStandbyDuration)
-				} else {
-					if !standbyStartTime.IsZero() {
-						u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Resetting standby timer.", currentState)
-						standbyStartTime = time.Time{}
-					} else {
-						u.logger.Printf("Vehicle not in 'stand-by' (current: %s). Waiting.", currentState)
-					}
-				}
-			}
+		// Get current vehicle state and timestamp
+		currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+		if err != nil {
+			u.logger.Printf("Failed to get vehicle state for MDB reboot check: %v. Falling back to polling.", err)
+			// Fall back to old polling behavior
+			return u.waitForStandbyWithPolling(requiredStandbyDuration)
 		}
+
+		// Check if already in standby and for how long
+		if currentState == "stand-by" && !stateTimestamp.IsZero() {
+			durationInStandby := time.Since(stateTimestamp)
+			if durationInStandby >= requiredStandbyDuration {
+				u.logger.Printf("Vehicle already in 'stand-by' for %v (since %s). Proceeding with MDB reboot immediately.", durationInStandby, stateTimestamp.Format(time.RFC3339))
+				u.logger.Printf("Triggering MDB reboot via Redis command")
+				return u.redis.TriggerReboot()
+			}
+			remainingTime := requiredStandbyDuration - durationInStandby
+			u.logger.Printf("Vehicle already in 'stand-by' for %v (since %s). Waiting %v more.", durationInStandby, stateTimestamp.Format(time.RFC3339), remainingTime)
+			// Wait for the remaining time with more precise timing
+			return u.waitForStandbyRemaining(stateTimestamp, requiredStandbyDuration)
+		}
+
+		// Vehicle not in standby or no timestamp, wait for standby state
+		if currentState != "stand-by" {
+			u.logger.Printf("Vehicle not in 'stand-by' (current: %s). Waiting for state change.", currentState)
+		} else {
+			u.logger.Printf("Vehicle in 'stand-by' but no timestamp available. Monitoring for state changes.")
+		}
+
+		// Subscribe to state changes for real-time updates
+		return u.waitForStandbyWithSubscription(requiredStandbyDuration)
 
 	case "dbc":
 		safe, err := u.IsSafeForDbcReboot()
@@ -504,5 +497,198 @@ func (u *Updater) TriggerReboot(component string) error {
 
 	default:
 		return fmt.Errorf("unknown component for reboot: %s", component)
+	}
+}
+
+// waitForStandbyRemaining waits for the remaining time after vehicle is already in standby
+func (u *Updater) waitForStandbyRemaining(standbyStartTime time.Time, requiredDuration time.Duration) error {
+	remainingTime := requiredDuration - time.Since(standbyStartTime)
+	if remainingTime <= 0 {
+		u.logger.Printf("Triggering MDB reboot via Redis command")
+		return u.redis.TriggerReboot()
+	}
+
+	// Use a more precise timer for the remaining time
+	timer := time.NewTimer(remainingTime)
+	defer timer.Stop()
+
+	// Also poll every 30 seconds to verify state hasn't changed
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-u.ctx.Done():
+			u.logger.Printf("MDB reboot cancelled due to context done.")
+			return u.ctx.Err()
+		case <-timer.C:
+			// Final check before reboot
+			currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+			if err != nil {
+				u.logger.Printf("Failed to get vehicle state before reboot: %v. Proceeding anyway.", err)
+			} else if currentState != "stand-by" {
+				u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Restarting wait.", currentState)
+				return u.waitForStandbyWithSubscription(requiredDuration)
+			}
+			totalDuration := time.Since(standbyStartTime)
+			u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", totalDuration, standbyStartTime.Format(time.RFC3339))
+			u.logger.Printf("Triggering MDB reboot via Redis command")
+			return u.redis.TriggerReboot()
+		case <-ticker.C:
+			// Periodic check to ensure we're still in standby
+			currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+			if err != nil {
+				u.logger.Printf("Failed to get vehicle state during wait: %v. Continuing.", err)
+				continue
+			}
+			if currentState != "stand-by" {
+				u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Restarting wait.", currentState)
+				return u.waitForStandbyWithSubscription(requiredDuration)
+			}
+			durationInStandby := time.Since(standbyStartTime)
+			remainingTime = requiredDuration - durationInStandby
+			u.logger.Printf("Vehicle in 'stand-by' for %v. Waiting %v more.", durationInStandby, remainingTime)
+		}
+	}
+}
+
+// waitForStandbyWithSubscription waits for standby state using real-time subscription
+func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration) error {
+	// Try to subscribe to vehicle state changes
+	stateChanges, cleanup, err := u.redis.SubscribeToVehicleStateChanges("vehicle:state:change")
+	if err != nil {
+		u.logger.Printf("Failed to subscribe to vehicle state changes: %v. Falling back to polling.", err)
+		return u.waitForStandbyWithPolling(requiredDuration)
+	}
+	defer cleanup()
+
+	// Also use a ticker as backup in case subscription misses events
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	var standbyStartTime time.Time
+
+	for {
+		select {
+		case <-u.ctx.Done():
+			u.logger.Printf("MDB reboot cancelled due to context done.")
+			return u.ctx.Err()
+		case <-stateChanges:
+			// State changed, check current state
+			currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+			if err != nil {
+				u.logger.Printf("Failed to get vehicle state after change: %v. Continuing.", err)
+				continue
+			}
+
+			if currentState == "stand-by" {
+				if !stateTimestamp.IsZero() {
+					standbyStartTime = stateTimestamp
+				} else {
+					standbyStartTime = time.Now()
+				}
+				u.logger.Printf("Vehicle entered 'stand-by' state at %s. Monitoring for %v.", standbyStartTime.Format(time.RFC3339), requiredDuration)
+
+				// Check if already waited long enough
+				durationInStandby := time.Since(standbyStartTime)
+				if durationInStandby >= requiredDuration {
+					u.logger.Printf("Vehicle has been in 'stand-by' for %v. Proceeding with MDB reboot.", durationInStandby)
+					u.logger.Printf("Triggering MDB reboot via Redis command")
+					return u.redis.TriggerReboot()
+				}
+				u.logger.Printf("Vehicle in 'stand-by' for %v. Waiting for %v.", durationInStandby, requiredDuration)
+			} else {
+				if !standbyStartTime.IsZero() {
+					u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Resetting standby timer.", currentState)
+					standbyStartTime = time.Time{}
+				} else {
+					u.logger.Printf("Vehicle not in 'stand-by' (current: %s). Waiting.", currentState)
+				}
+			}
+		case <-ticker.C:
+			// Periodic check as backup
+			currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+			if err != nil {
+				u.logger.Printf("Failed to get vehicle state during periodic check: %v. Continuing.", err)
+				continue
+			}
+
+			if currentState == "stand-by" {
+				if standbyStartTime.IsZero() {
+					if !stateTimestamp.IsZero() {
+						standbyStartTime = stateTimestamp
+					} else {
+						standbyStartTime = time.Now()
+					}
+					u.logger.Printf("Vehicle entered 'stand-by' state at %s. Monitoring for %v.", standbyStartTime.Format(time.RFC3339), requiredDuration)
+				}
+
+				durationInStandby := time.Since(standbyStartTime)
+				if durationInStandby >= requiredDuration {
+					u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", durationInStandby, standbyStartTime.Format(time.RFC3339))
+					u.logger.Printf("Triggering MDB reboot via Redis command")
+					return u.redis.TriggerReboot()
+				}
+				u.logger.Printf("Vehicle in 'stand-by' for %v. Waiting for %v.", durationInStandby, requiredDuration)
+			} else {
+				if !standbyStartTime.IsZero() {
+					u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Resetting standby timer.", currentState)
+					standbyStartTime = time.Time{}
+				}
+			}
+		}
+	}
+}
+
+// waitForStandbyWithPolling is the fallback polling implementation
+func (u *Updater) waitForStandbyWithPolling(requiredDuration time.Duration) error {
+	var standbyStartTime time.Time
+	// Use 30-second intervals instead of 1 minute for more responsive timing
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// Check immediately first
+	currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+	if err != nil {
+		u.logger.Printf("Failed to get initial vehicle state: %v. Continuing with polling.", err)
+	} else if currentState == "stand-by" {
+		standbyStartTime = time.Now()
+		u.logger.Printf("Vehicle entered 'stand-by' state at %s. Monitoring for %v.", standbyStartTime.Format(time.RFC3339), requiredDuration)
+	}
+
+	for {
+		select {
+		case <-u.ctx.Done():
+			u.logger.Printf("MDB reboot cancelled due to context done.")
+			return u.ctx.Err()
+		case <-ticker.C:
+			currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+			if err != nil {
+				u.logger.Printf("Failed to get vehicle state for MDB reboot check: %v. Retrying.", err)
+				standbyStartTime = time.Time{} // Reset timer on error
+				continue
+			}
+
+			if currentState == "stand-by" {
+				if standbyStartTime.IsZero() {
+					standbyStartTime = time.Now()
+					u.logger.Printf("Vehicle entered 'stand-by' state at %s. Monitoring for %v.", standbyStartTime.Format(time.RFC3339), requiredDuration)
+				}
+				durationInStandby := time.Since(standbyStartTime)
+				if durationInStandby >= requiredDuration {
+					u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", durationInStandby, standbyStartTime.Format(time.RFC3339))
+					u.logger.Printf("Triggering MDB reboot via Redis command")
+					return u.redis.TriggerReboot()
+				}
+				u.logger.Printf("Vehicle in 'stand-by' for %v. Waiting for %v.", durationInStandby, requiredDuration)
+			} else {
+				if !standbyStartTime.IsZero() {
+					u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Resetting standby timer.", currentState)
+					standbyStartTime = time.Time{}
+				} else {
+					u.logger.Printf("Vehicle not in 'stand-by' (current: %s). Waiting.", currentState)
+				}
+			}
+		}
 	}
 }
