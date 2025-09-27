@@ -312,7 +312,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	parts := strings.Split(release.TagName, "-")
 	if len(parts) < 2 {
 		u.logger.Printf("Invalid release tag format: %s", release.TagName)
-		if err := u.status.SetStatus(u.ctx, status.StatusError); err != nil {
+		if err := u.status.SetError(u.ctx, "invalid-release-tag", fmt.Sprintf("Invalid release tag format: %s", release.TagName)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
@@ -374,7 +374,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	filePath, err := u.mender.DownloadAndVerify(u.ctx, assetURL, "")
 	if err != nil {
 		u.logger.Printf("Failed to download update: %v", err)
-		if err := u.status.SetStatus(u.ctx, status.StatusError); err != nil {
+		if err := u.status.SetError(u.ctx, "download-failed", fmt.Sprintf("Failed to download update: %v", err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
@@ -400,7 +400,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	// Step 4: Install the update
 	if err := u.mender.Install(filePath); err != nil {
 		u.logger.Printf("Failed to install update: %v", err)
-		if err := u.status.SetStatus(u.ctx, status.StatusError); err != nil {
+		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update: %v", err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
@@ -431,7 +431,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 			// The TriggerReboot method now logs "DRY-RUN..." itself.
 			// We check if the error message contains "DRY-RUN" to avoid setting error status.
 			if !strings.Contains(err.Error(), "DRY-RUN") {
-				if statusErr := u.status.SetStatus(u.ctx, status.StatusError); statusErr != nil {
+				if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
 					u.logger.Printf("Additionally failed to set error status after %s reboot trigger failure: %v", u.config.Component, statusErr)
 				}
 			}

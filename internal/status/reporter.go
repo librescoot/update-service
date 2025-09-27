@@ -108,15 +108,19 @@ func (r *Reporter) SetStatusAndVersion(ctx context.Context, status Status, versi
 	return nil
 }
 
-// SetIdleAndClearVersion atomically sets status to idle and clears update version
+// SetIdleAndClearVersion atomically sets status to idle and clears update version and error keys
 func (r *Reporter) SetIdleAndClearVersion(ctx context.Context) error {
 	pipe := r.client.Pipeline()
 
 	statusKey := fmt.Sprintf("status:%s", r.component)
 	versionKey := fmt.Sprintf("update-version:%s", r.component)
+	errorKey := fmt.Sprintf("error:%s", r.component)
+	errorMessageKey := fmt.Sprintf("error-message:%s", r.component)
 
 	pipe.HSet(ctx, "ota", statusKey, string(StatusIdle))
 	pipe.HDel(ctx, "ota", versionKey)
+	pipe.HDel(ctx, "ota", errorKey)
+	pipe.HDel(ctx, "ota", errorMessageKey)
 
 	_, err := pipe.Exec(ctx)
 	if err != nil {
@@ -124,5 +128,45 @@ func (r *Reporter) SetIdleAndClearVersion(ctx context.Context) error {
 	}
 
 	r.logger.Printf("Set status to idle and cleared version for %s", r.component)
+	return nil
+}
+
+// SetError atomically sets status to error and stores error details
+func (r *Reporter) SetError(ctx context.Context, errorType, errorMessage string) error {
+	pipe := r.client.Pipeline()
+
+	statusKey := fmt.Sprintf("status:%s", r.component)
+	errorKey := fmt.Sprintf("error:%s", r.component)
+	errorMessageKey := fmt.Sprintf("error-message:%s", r.component)
+
+	pipe.HSet(ctx, "ota", statusKey, string(StatusError))
+	pipe.HSet(ctx, "ota", errorKey, errorType)
+	pipe.HSet(ctx, "ota", errorMessageKey, errorMessage)
+
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to set error for component %s: %w", r.component, err)
+	}
+
+	r.logger.Printf("Set error for %s: type=%s, message=%s", r.component, errorType, errorMessage)
+	return nil
+}
+
+// ClearError removes error and error-message keys from Redis
+func (r *Reporter) ClearError(ctx context.Context) error {
+	pipe := r.client.Pipeline()
+
+	errorKey := fmt.Sprintf("error:%s", r.component)
+	errorMessageKey := fmt.Sprintf("error-message:%s", r.component)
+
+	pipe.HDel(ctx, "ota", errorKey)
+	pipe.HDel(ctx, "ota", errorMessageKey)
+
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to clear error for component %s: %w", r.component, err)
+	}
+
+	r.logger.Printf("Cleared error keys for %s", r.component)
 	return nil
 }
