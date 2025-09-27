@@ -118,6 +118,29 @@ The Update Service operates as component-specific instances. Each instance inclu
     - Handles post-installation steps, including reboots, respecting inhibitions.
     - Performs a startup check to commit any pending updates.
 
+## Redis Schema
+
+The Update Service uses Redis to track update state and communicate with other services. All keys are stored in the `ota` hash.
+
+### Status Keys (per component)
+
+| Key                            | Type   | Description                                          | Values                                        |
+|--------------------------------|--------|------------------------------------------------------|-----------------------------------------------|
+| `status:{component}`           | String | Current update status                                | `idle`, `downloading`, `installing`, `rebooting`, `error` |
+| `update-version:{component}`   | String | Target version being installed                       | Version string (e.g., `20251009t162327`)      |
+| `error:{component}`            | String | Error type when status is `error`                    | `invalid-release-tag`, `download-failed`, `install-failed`, `reboot-failed` |
+| `error-message:{component}`    | String | Human-readable error message when status is `error`  | Detailed error message                        |
+
+**Examples:**
+- `status:mdb` → `downloading`
+- `update-version:mdb` → `20251009t162327`
+- `error:dbc` → `download-failed`
+- `error-message:dbc` → `Failed to download update: connection timeout`
+
+**Note:** Error keys (`error:{component}` and `error-message:{component}`) are automatically cleared when:
+- The service starts/restarts
+- An update completes successfully and status returns to `idle`
+
 ## Development
 
 ```bash
