@@ -134,6 +134,11 @@ The Update Service uses Redis to track update state and communicate with other s
 | `error:{component}`            | String  | Error type when status is `error`                    | `invalid-release-tag`, `download-failed`, `install-failed`, `reboot-failed` |
 | `error-message:{component}`    | String  | Human-readable error message when status is `error`  | Detailed error message                        |
 
+**Status Meanings:**
+- `rebooting`: Update is installed and will be applied on next reboot/power cycle
+  - **MDB**: Service waits for vehicle to be in standby for 3 minutes, then actively triggers reboot
+  - **DBC**: Update will be applied on next natural power-on (no active reboot triggered)
+
 **Examples:**
 - `status:mdb` → `downloading`
 - `update-version:mdb` → `20251009t162327`

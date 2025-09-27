@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -465,16 +464,6 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	}
 }
 
-// IsSafeForDbcReboot checks if it's safe to reboot the DBC.
-// DBC should not be rebooted when the scooter is being actively used.
-func (u *Updater) IsSafeForDbcReboot() (bool, error) {
-	currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
-	if err != nil {
-		return false, fmt.Errorf("failed to get current vehicle state: %w", err)
-	}
-	return currentState != "ready-to-drive" && currentState != "parked", nil
-}
-
 // TriggerReboot triggers a reboot or restart of the specified component.
 func (u *Updater) TriggerReboot(component string) error {
 	if u.config.DryRun {
@@ -528,18 +517,9 @@ func (u *Updater) TriggerReboot(component string) error {
 		return u.waitForStandbyWithSubscription(requiredStandbyDuration)
 
 	case "dbc":
-		safe, err := u.IsSafeForDbcReboot()
-		if err != nil {
-			return fmt.Errorf("failed to check DBC reboot safety: %w", err)
-		}
-		if !safe {
-			currentState, _ := u.redis.GetVehicleState(config.VehicleHashKey)
-			return fmt.Errorf("not safe to reboot DBC in current state: %s", currentState)
-		}
-		u.logger.Printf("Triggering DBC reboot via systemctl")
-		if err := exec.Command("systemctl", "reboot").Run(); err != nil {
-			return fmt.Errorf("failed to trigger reboot: %w", err)
-		}
+		u.logger.Printf("DBC update installed. Will apply on next power cycle.")
+		// For DBC, we don't actively reboot - it will apply the update on next power-on
+		// Status remains "rebooting" and will be cleared on next service startup
 		return nil
 
 	default:
