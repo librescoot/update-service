@@ -108,7 +108,7 @@ func (r *Reporter) SetStatusAndVersion(ctx context.Context, status Status, versi
 	return nil
 }
 
-// SetIdleAndClearVersion atomically sets status to idle and clears update version and error keys
+// SetIdleAndClearVersion atomically sets status to idle and clears update version, error, and progress keys
 func (r *Reporter) SetIdleAndClearVersion(ctx context.Context) error {
 	pipe := r.client.Pipeline()
 
@@ -116,11 +116,17 @@ func (r *Reporter) SetIdleAndClearVersion(ctx context.Context) error {
 	versionKey := fmt.Sprintf("update-version:%s", r.component)
 	errorKey := fmt.Sprintf("error:%s", r.component)
 	errorMessageKey := fmt.Sprintf("error-message:%s", r.component)
+	progressKey := fmt.Sprintf("download-progress:%s", r.component)
+	downloadedKey := fmt.Sprintf("download-bytes:%s", r.component)
+	totalKey := fmt.Sprintf("download-total:%s", r.component)
 
 	pipe.HSet(ctx, "ota", statusKey, string(StatusIdle))
 	pipe.HDel(ctx, "ota", versionKey)
 	pipe.HDel(ctx, "ota", errorKey)
 	pipe.HDel(ctx, "ota", errorMessageKey)
+	pipe.HDel(ctx, "ota", progressKey)
+	pipe.HDel(ctx, "ota", downloadedKey)
+	pipe.HDel(ctx, "ota", totalKey)
 
 	_, err := pipe.Exec(ctx)
 	if err != nil {
@@ -131,17 +137,23 @@ func (r *Reporter) SetIdleAndClearVersion(ctx context.Context) error {
 	return nil
 }
 
-// SetError atomically sets status to error and stores error details
+// SetError atomically sets status to error, stores error details, and clears download progress
 func (r *Reporter) SetError(ctx context.Context, errorType, errorMessage string) error {
 	pipe := r.client.Pipeline()
 
 	statusKey := fmt.Sprintf("status:%s", r.component)
 	errorKey := fmt.Sprintf("error:%s", r.component)
 	errorMessageKey := fmt.Sprintf("error-message:%s", r.component)
+	progressKey := fmt.Sprintf("download-progress:%s", r.component)
+	downloadedKey := fmt.Sprintf("download-bytes:%s", r.component)
+	totalKey := fmt.Sprintf("download-total:%s", r.component)
 
 	pipe.HSet(ctx, "ota", statusKey, string(StatusError))
 	pipe.HSet(ctx, "ota", errorKey, errorType)
 	pipe.HSet(ctx, "ota", errorMessageKey, errorMessage)
+	pipe.HDel(ctx, "ota", progressKey)
+	pipe.HDel(ctx, "ota", downloadedKey)
+	pipe.HDel(ctx, "ota", totalKey)
 
 	_, err := pipe.Exec(ctx)
 	if err != nil {
@@ -168,5 +180,51 @@ func (r *Reporter) ClearError(ctx context.Context) error {
 	}
 
 	r.logger.Printf("Cleared error keys for %s", r.component)
+	return nil
+}
+
+// SetDownloadProgress sets the download progress with both percentage and byte counts
+func (r *Reporter) SetDownloadProgress(ctx context.Context, downloaded, total int64) error {
+	pipe := r.client.Pipeline()
+
+	progressKey := fmt.Sprintf("download-progress:%s", r.component)
+	downloadedKey := fmt.Sprintf("download-bytes:%s", r.component)
+	totalKey := fmt.Sprintf("download-total:%s", r.component)
+
+	// Calculate percentage (0-100)
+	var percentage int
+	if total > 0 {
+		percentage = int((downloaded * 100) / total)
+	}
+
+	pipe.HSet(ctx, "ota", progressKey, percentage)
+	pipe.HSet(ctx, "ota", downloadedKey, downloaded)
+	pipe.HSet(ctx, "ota", totalKey, total)
+
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to set download progress for component %s: %w", r.component, err)
+	}
+
+	return nil
+}
+
+// ClearDownloadProgress removes the download progress keys from Redis
+func (r *Reporter) ClearDownloadProgress(ctx context.Context) error {
+	pipe := r.client.Pipeline()
+
+	progressKey := fmt.Sprintf("download-progress:%s", r.component)
+	downloadedKey := fmt.Sprintf("download-bytes:%s", r.component)
+	totalKey := fmt.Sprintf("download-total:%s", r.component)
+
+	pipe.HDel(ctx, "ota", progressKey)
+	pipe.HDel(ctx, "ota", downloadedKey)
+	pipe.HDel(ctx, "ota", totalKey)
+
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to clear download progress for component %s: %w", r.component, err)
+	}
+
 	return nil
 }

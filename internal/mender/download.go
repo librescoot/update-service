@@ -16,6 +16,11 @@ import (
 	"time"
 )
 
+// ProgressCallback is called during download to report progress
+// downloaded: bytes downloaded so far
+// total: total bytes to download (0 if unknown)
+type ProgressCallback func(downloaded, total int64)
+
 // Downloader handles downloading update files with resumable downloads and retry logic
 type Downloader struct {
 	downloadDir string
@@ -61,7 +66,7 @@ func (d *Downloader) CleanupStaleTmpFiles(currentFilename string) error {
 }
 
 // Download downloads a file from the given URL with resumable downloads and retry logic
-func (d *Downloader) Download(ctx context.Context, url string) (string, error) {
+func (d *Downloader) Download(ctx context.Context, url string, progressCallback ProgressCallback) (string, error) {
 	filename := filepath.Base(url)
 	if filename == "" || filename == "." {
 		filename = "update.mender"
@@ -152,6 +157,17 @@ func (d *Downloader) Download(ctx context.Context, url string) (string, error) {
 		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
+	// Get total size from Content-Length header
+	var totalSize int64
+	if resp.ContentLength > 0 {
+		if resp.StatusCode == http.StatusPartialContent {
+			// For partial content, add the already downloaded size
+			totalSize = fileSize + resp.ContentLength
+		} else {
+			totalSize = resp.ContentLength
+		}
+	}
+
 	var file *os.File
 	if fileSize > 0 && resp.StatusCode == http.StatusPartialContent {
 		file, err = os.OpenFile(downloadTempPath, os.O_APPEND|os.O_WRONLY, 0644)
@@ -190,6 +206,11 @@ func (d *Downloader) Download(ctx context.Context, url string) (string, error) {
 					speed := float64(totalRead) / elapsed.Seconds() / 1024 / 1024 // MB/s
 					d.logger.Printf("Downloaded %d bytes (%.2f MB/s)", totalRead, speed)
 					lastProgressReport = time.Now()
+
+					// Report progress via callback
+					if progressCallback != nil {
+						progressCallback(totalRead, totalSize)
+					}
 				}
 			}
 			if err != nil {
@@ -197,6 +218,11 @@ func (d *Downloader) Download(ctx context.Context, url string) (string, error) {
 					elapsed := time.Since(start)
 					speed := float64(totalRead) / elapsed.Seconds() / 1024 / 1024 // MB/s
 					d.logger.Printf("Download complete, total size: %d bytes, average speed: %.2f MB/s", totalRead, speed)
+
+					// Report final progress
+					if progressCallback != nil {
+						progressCallback(totalRead, totalSize)
+					}
 
 					file.Close()
 					if err := os.Rename(downloadTempPath, finalPath); err != nil {

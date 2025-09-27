@@ -24,11 +24,11 @@ func NewManager(downloadDir string, logger *log.Logger) *Manager {
 }
 
 // DownloadAndVerify downloads an update file and verifies its checksum
-func (m *Manager) DownloadAndVerify(ctx context.Context, url, checksum string) (string, error) {
+func (m *Manager) DownloadAndVerify(ctx context.Context, url, checksum string, progressCallback ProgressCallback) (string, error) {
 	m.logger.Printf("Starting download and verification for %s", url)
 
 	// Download the file
-	filePath, err := m.downloader.Download(ctx, url)
+	filePath, err := m.downloader.Download(ctx, url, progressCallback)
 	if err != nil {
 		return "", err
 	}

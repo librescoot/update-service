@@ -124,22 +124,29 @@ The Update Service uses Redis to track update state and communicate with other s
 
 ### Status Keys (per component)
 
-| Key                            | Type   | Description                                          | Values                                        |
-|--------------------------------|--------|------------------------------------------------------|-----------------------------------------------|
-| `status:{component}`           | String | Current update status                                | `idle`, `downloading`, `installing`, `rebooting`, `error` |
-| `update-version:{component}`   | String | Target version being installed                       | Version string (e.g., `20251009t162327`)      |
-| `error:{component}`            | String | Error type when status is `error`                    | `invalid-release-tag`, `download-failed`, `install-failed`, `reboot-failed` |
-| `error-message:{component}`    | String | Human-readable error message when status is `error`  | Detailed error message                        |
+| Key                            | Type    | Description                                          | Values                                        |
+|--------------------------------|---------|------------------------------------------------------|-----------------------------------------------|
+| `status:{component}`           | String  | Current update status                                | `idle`, `downloading`, `installing`, `rebooting`, `error` |
+| `update-version:{component}`   | String  | Target version being installed                       | Version string (e.g., `20251009t162327`)      |
+| `download-progress:{component}`| Integer | Download progress percentage (0-100)                 | `0` to `100`                                  |
+| `download-bytes:{component}`   | Integer | Bytes downloaded so far                              | Byte count (e.g., `12582912`)                 |
+| `download-total:{component}`   | Integer | Total download size in bytes                         | Byte count (e.g., `104857600`)                |
+| `error:{component}`            | String  | Error type when status is `error`                    | `invalid-release-tag`, `download-failed`, `install-failed`, `reboot-failed` |
+| `error-message:{component}`    | String  | Human-readable error message when status is `error`  | Detailed error message                        |
 
 **Examples:**
 - `status:mdb` → `downloading`
 - `update-version:mdb` → `20251009t162327`
+- `download-progress:mdb` → `45`
+- `download-bytes:mdb` → `47185920`
+- `download-total:mdb` → `104857600`
 - `error:dbc` → `download-failed`
 - `error-message:dbc` → `Failed to download update: connection timeout`
 
-**Note:** Error keys (`error:{component}` and `error-message:{component}`) are automatically cleared when:
+**Note:** Error and download progress keys are automatically cleared when:
 - The service starts/restarts
 - An update completes successfully and status returns to `idle`
+- An error occurs (clears download progress only)
 
 ## Development
 

@@ -371,13 +371,24 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	}()
 
 	// Step 2: Download and verify the update
-	filePath, err := u.mender.DownloadAndVerify(u.ctx, assetURL, "")
+	progressCallback := func(downloaded, total int64) {
+		if err := u.status.SetDownloadProgress(u.ctx, downloaded, total); err != nil {
+			u.logger.Printf("Failed to update download progress: %v", err)
+		}
+	}
+
+	filePath, err := u.mender.DownloadAndVerify(u.ctx, assetURL, "", progressCallback)
 	if err != nil {
 		u.logger.Printf("Failed to download update: %v", err)
 		if err := u.status.SetError(u.ctx, "download-failed", fmt.Sprintf("Failed to download update: %v", err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
+	}
+
+	// Clear download progress after successful download
+	if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
+		u.logger.Printf("Failed to clear download progress: %v", err)
 	}
 
 	u.logger.Printf("Successfully downloaded update to: %s", filePath)
