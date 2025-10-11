@@ -190,24 +190,36 @@ func (u *Updater) checkForUpdates() {
 		return
 	}
 
-	// Find the latest release for our component and channel
-	release, found := u.findLatestRelease(releases, u.config.Component, u.config.Channel)
+	// Get the variant_id to find releases for the correct variant
+	variantID, err := u.redis.GetVariantID(u.config.Component)
+	if err != nil {
+		u.logger.Printf("Failed to get variant_id for component %s: %v (falling back to component name)", u.config.Component, err)
+		variantID = u.config.Component
+	}
+
+	// Find the latest release for our variant and channel
+	release, found := u.findLatestRelease(releases, variantID, u.config.Channel)
 	if !found {
-		u.logger.Printf("No release found for component %s and channel %s", u.config.Component, u.config.Channel)
+		u.logger.Printf("No release found for variant_id %s and channel %s", variantID, u.config.Channel)
 		return
 	}
 
-	// Find the .mender asset for the component
+	u.logger.Printf("Found release %s, looking for asset matching variant_id: %s", release.TagName, variantID)
+
+	// Find the .mender asset for the variant
 	var assetURL string
 	for _, asset := range release.Assets {
-		if strings.Contains(asset.Name, u.config.Component) && strings.HasSuffix(asset.Name, ".mender") {
+		// Match assets by variant_id (e.g., "unu-mdb", "unu-dbc", "rpi5")
+		// Asset names should be like: librescoot-{variant_id}-{timestamp}.mender
+		if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".mender") {
 			assetURL = asset.BrowserDownloadURL
+			u.logger.Printf("Found matching asset: %s", asset.Name)
 			break
 		}
 	}
 
 	if assetURL == "" {
-		u.logger.Printf("No .mender asset found for component %s in release %s", u.config.Component, release.TagName)
+		u.logger.Printf("No .mender asset found for variant_id %s in release %s", variantID, release.TagName)
 		return
 	}
 
@@ -223,8 +235,8 @@ func (u *Updater) checkForUpdates() {
 	go u.performUpdate(release, assetURL)
 }
 
-// findLatestRelease finds the latest release for the given component and channel
-func (u *Updater) findLatestRelease(releases []Release, component, channel string) (Release, bool) {
+// findLatestRelease finds the latest release for the given variant and channel
+func (u *Updater) findLatestRelease(releases []Release, variantID, channel string) (Release, bool) {
 	var latestRelease Release
 	found := false
 
@@ -234,16 +246,16 @@ func (u *Updater) findLatestRelease(releases []Release, component, channel strin
 			continue
 		}
 
-		// Check if the release has assets for the specified component
-		hasComponentAsset := false
+		// Check if the release has assets for the specified variant
+		hasVariantAsset := false
 		for _, asset := range release.Assets {
-			if strings.Contains(asset.Name, component) && strings.HasSuffix(asset.Name, ".mender") {
-				hasComponentAsset = true
+			if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".mender") {
+				hasVariantAsset = true
 				break
 			}
 		}
 
-		if !hasComponentAsset {
+		if !hasVariantAsset {
 			continue
 		}
 

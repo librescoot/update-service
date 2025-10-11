@@ -6,9 +6,10 @@ import (
 
 // Fixed keys for Redis
 const (
-	OtaStatusHashKey = "ota"
-	OtaChannel       = "ota"
-	VehicleHashKey   = "vehicle"
+	OtaStatusHashKey   = "ota"
+	OtaChannel         = "ota"
+	VehicleHashKey     = "vehicle"
+	OsReleaseHashKey   = "os-release"
 )
 
 // Config holds the configuration for the update service

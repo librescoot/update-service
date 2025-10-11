@@ -150,6 +150,20 @@ func (c *Client) GetComponentVersion(component string) (string, error) {
 	return versionID, nil
 }
 
+// GetVariantID gets the variant_id from the component's version hash
+func (c *Client) GetVariantID(component string) (string, error) {
+	versionHash := fmt.Sprintf("version:%s", component)
+	variantID, err := c.client.HGet(c.ctx, versionHash, "variant_id").Result()
+	if err != nil {
+		if err == redis.Nil {
+			// Variant ID not found - for backward compatibility, return component name
+			return component, nil
+		}
+		return "", fmt.Errorf("failed to get variant_id for %s: %w", component, err)
+	}
+	return variantID, nil
+}
+
 // GetVehicleStateWithTimestamp gets vehicle state and last state change timestamp
 func (c *Client) GetVehicleStateWithTimestamp(vehicleHashKey string) (string, time.Time, error) {
 	result, err := c.client.HMGet(c.ctx, vehicleHashKey, "state", "state_timestamp").Result()
