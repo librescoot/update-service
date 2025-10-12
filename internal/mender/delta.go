@@ -47,8 +47,8 @@ func (a *DeltaApplier) ApplyDelta(oldMenderPath, deltaPath, newMenderPath string
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
-	// Execute the delta application script
-	cmd := exec.Command("/usr/bin/mender-apply-delta.py", oldMenderPath, deltaPath, newMenderPath)
+	// Execute the delta application script with nice priority (lower CPU priority)
+	cmd := exec.Command("nice", "-n", "10", "/usr/bin/mender-apply-delta.py", oldMenderPath, deltaPath, newMenderPath)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
