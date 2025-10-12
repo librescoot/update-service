@@ -1,7 +1,13 @@
 [Unit]
 Description=LibreScoot Update Service (MDB)
-After=redis.service network.target
+After=redis.service
+After=network-online.target
+After=librescoot-modem.service
+After=librescoot-vehicle.service
+After=librescoot-version.service
+After=librescoot-pm.service
 Requires=redis.service
+Wants=network-online.target
 
 [Service]
 Type=simple
