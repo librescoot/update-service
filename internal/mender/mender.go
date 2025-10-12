@@ -2,6 +2,7 @@ package mender
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -9,17 +10,19 @@ import (
 
 // Manager combines download and installation functionality for Mender updates
 type Manager struct {
-	downloader *Downloader
-	installer  *Installer
-	logger     *log.Logger
+	downloader    *Downloader
+	installer     *Installer
+	deltaApplier  *DeltaApplier
+	logger        *log.Logger
 }
 
 // NewManager creates a new Mender manager with the specified download directory
 func NewManager(downloadDir string, logger *log.Logger) *Manager {
 	return &Manager{
-		downloader: NewDownloader(downloadDir, logger),
-		installer:  NewInstaller(logger),
-		logger:     logger,
+		downloader:   NewDownloader(downloadDir, logger),
+		installer:    NewInstaller(logger),
+		deltaApplier: NewDeltaApplier(logger),
+		logger:       logger,
 	}
 }
 
@@ -113,4 +116,76 @@ func (m *Manager) CleanupFile(filePath string) error {
 		}
 		return os.Remove(path)
 	})
+}
+
+// FindMenderFileForVersion checks if a .mender file exists for the specified version
+// Returns the full path to the file and whether it exists
+func (m *Manager) FindMenderFileForVersion(version string) (string, bool) {
+	// Look for any .mender file containing the version timestamp
+	pattern := filepath.Join(m.downloader.downloadDir, "*"+version+"*.mender")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		m.logger.Printf("Error searching for mender file with version %s: %v", version, err)
+		return "", false
+	}
+
+	if len(files) == 0 {
+		m.logger.Printf("No mender file found for version %s", version)
+		return "", false
+	}
+
+	// Use the first match (there should typically only be one)
+	menderPath := files[0]
+
+	// Verify the file actually exists and is readable
+	if _, err := os.Stat(menderPath); err != nil {
+		m.logger.Printf("Mender file %s exists in glob but cannot be accessed: %v", menderPath, err)
+		return "", false
+	}
+
+	m.logger.Printf("Found mender file for version %s: %s", version, menderPath)
+	return menderPath, true
+}
+
+// ApplyDeltaUpdate applies a delta update to generate a new mender file
+// Returns the path to the new mender file or an error
+func (m *Manager) ApplyDeltaUpdate(ctx context.Context, deltaURL, currentVersion string, progressCallback ProgressCallback) (string, error) {
+	// Find the existing mender file for the current version
+	oldMenderPath, exists := m.FindMenderFileForVersion(currentVersion)
+	if !exists {
+		return "", fmt.Errorf("no mender file found for current version %s, cannot apply delta", currentVersion)
+	}
+
+	// Download the delta file
+	m.logger.Printf("Downloading delta update from %s", deltaURL)
+	deltaPath, err := m.downloader.Download(ctx, deltaURL, progressCallback)
+	if err != nil {
+		return "", fmt.Errorf("failed to download delta file: %w", err)
+	}
+
+	// Generate the new mender filename based on the delta filename
+	deltaBaseName := filepath.Base(deltaPath)
+	newMenderName := deltaBaseName[:len(deltaBaseName)-6] + ".mender" // Replace .delta with .mender
+	newMenderPath := filepath.Join(m.downloader.downloadDir, newMenderName)
+
+	// Apply the delta
+	err = m.deltaApplier.ApplyDelta(oldMenderPath, deltaPath, newMenderPath)
+	if err != nil {
+		// Clean up the delta file on failure
+		m.deltaApplier.CleanupDeltaFile(deltaPath)
+		return "", fmt.Errorf("failed to apply delta update: %w", err)
+	}
+
+	// Clean up the delta file after successful application
+	if err := m.deltaApplier.CleanupDeltaFile(deltaPath); err != nil {
+		m.logger.Printf("Warning: failed to cleanup delta file: %v", err)
+	}
+
+	// Clean up the old mender file after successful delta application
+	m.logger.Printf("Removing old mender file after successful delta application: %s", oldMenderPath)
+	if err := os.Remove(oldMenderPath); err != nil {
+		m.logger.Printf("Warning: failed to remove old mender file %s: %v", oldMenderPath, err)
+	}
+
+	return newMenderPath, nil
 }
