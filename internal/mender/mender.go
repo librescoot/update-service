@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Manager combines download and installation functionality for Mender updates
@@ -121,30 +122,31 @@ func (m *Manager) CleanupFile(filePath string) error {
 // FindMenderFileForVersion checks if a .mender file exists for the specified version
 // Returns the full path to the file and whether it exists
 func (m *Manager) FindMenderFileForVersion(version string) (string, bool) {
-	// Look for any .mender file containing the version timestamp
-	pattern := filepath.Join(m.downloader.downloadDir, "*"+version+"*.mender")
+	// Get all .mender files in the download directory
+	pattern := filepath.Join(m.downloader.downloadDir, "*.mender")
 	files, err := filepath.Glob(pattern)
 	if err != nil {
-		m.logger.Printf("Error searching for mender file with version %s: %v", version, err)
+		m.logger.Printf("Error searching for mender files: %v", err)
 		return "", false
 	}
 
-	if len(files) == 0 {
-		m.logger.Printf("No mender file found for version %s", version)
-		return "", false
+	// Look for a file containing the version string (case-insensitive)
+	versionLower := strings.ToLower(version)
+	for _, file := range files {
+		filenameLower := strings.ToLower(filepath.Base(file))
+		if strings.Contains(filenameLower, versionLower) {
+			// Verify the file actually exists and is readable
+			if _, err := os.Stat(file); err != nil {
+				m.logger.Printf("Mender file %s exists in glob but cannot be accessed: %v", file, err)
+				continue
+			}
+			m.logger.Printf("Found mender file for version %s: %s", version, file)
+			return file, true
+		}
 	}
 
-	// Use the first match (there should typically only be one)
-	menderPath := files[0]
-
-	// Verify the file actually exists and is readable
-	if _, err := os.Stat(menderPath); err != nil {
-		m.logger.Printf("Mender file %s exists in glob but cannot be accessed: %v", menderPath, err)
-		return "", false
-	}
-
-	m.logger.Printf("Found mender file for version %s: %s", version, menderPath)
-	return menderPath, true
+	m.logger.Printf("No mender file found for version %s", version)
+	return "", false
 }
 
 // ApplyDeltaUpdate applies a delta update to generate a new mender file
