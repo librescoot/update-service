@@ -108,7 +108,7 @@ func (r *Reporter) SetStatusAndVersion(ctx context.Context, status Status, versi
 	return nil
 }
 
-// SetIdleAndClearVersion atomically sets status to idle and clears update version, error, and progress keys
+// SetIdleAndClearVersion atomically sets status to idle and clears update version, error, progress, and method keys
 func (r *Reporter) SetIdleAndClearVersion(ctx context.Context) error {
 	pipe := r.client.Pipeline()
 
@@ -119,6 +119,7 @@ func (r *Reporter) SetIdleAndClearVersion(ctx context.Context) error {
 	progressKey := fmt.Sprintf("download-progress:%s", r.component)
 	downloadedKey := fmt.Sprintf("download-bytes:%s", r.component)
 	totalKey := fmt.Sprintf("download-total:%s", r.component)
+	methodKey := fmt.Sprintf("update-method:%s", r.component)
 
 	pipe.HSet(ctx, "ota", statusKey, string(StatusIdle))
 	pipe.HDel(ctx, "ota", versionKey)
@@ -127,6 +128,7 @@ func (r *Reporter) SetIdleAndClearVersion(ctx context.Context) error {
 	pipe.HDel(ctx, "ota", progressKey)
 	pipe.HDel(ctx, "ota", downloadedKey)
 	pipe.HDel(ctx, "ota", totalKey)
+	pipe.HDel(ctx, "ota", methodKey)
 
 	_, err := pipe.Exec(ctx)
 	if err != nil {
@@ -226,5 +228,31 @@ func (r *Reporter) ClearDownloadProgress(ctx context.Context) error {
 		return fmt.Errorf("failed to clear download progress for component %s: %w", r.component, err)
 	}
 
+	return nil
+}
+
+// SetUpdateMethod sets the update method being used (delta or full) in Redis
+func (r *Reporter) SetUpdateMethod(ctx context.Context, method string) error {
+	key := fmt.Sprintf("update-method:%s", r.component)
+
+	err := r.client.HSet(ctx, "ota", key, method).Err()
+	if err != nil {
+		return fmt.Errorf("failed to set update method for component %s: %w", r.component, err)
+	}
+
+	r.logger.Printf("Set update method for %s: %s", r.component, method)
+	return nil
+}
+
+// ClearUpdateMethod removes the update method key from Redis
+func (r *Reporter) ClearUpdateMethod(ctx context.Context) error {
+	key := fmt.Sprintf("update-method:%s", r.component)
+
+	err := r.client.HDel(ctx, "ota", key).Err()
+	if err != nil {
+		return fmt.Errorf("failed to clear update method for component %s: %w", r.component, err)
+	}
+
+	r.logger.Printf("Cleared update method for %s", r.component)
 	return nil
 }

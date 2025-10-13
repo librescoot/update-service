@@ -222,6 +222,27 @@ func (c *Client) TriggerReboot() error {
 	return c.client.LPush(c.ctx, "scooter:power", "reboot").Err()
 }
 
+// GetUpdateMethod gets the configured update method for a component from Redis settings
+// Returns "full" by default if not configured
+func (c *Client) GetUpdateMethod(component string) (string, error) {
+	key := fmt.Sprintf("updates.%s.method", component)
+	method, err := c.client.HGet(c.ctx, "settings", key).Result()
+	if err != nil {
+		if err == redis.Nil {
+			// Default to full if not configured
+			return "full", nil
+		}
+		return "", fmt.Errorf("failed to get update method for %s: %w", component, err)
+	}
+
+	// Validate the method
+	if method != "delta" && method != "full" {
+		return "full", nil // Default to full for invalid values
+	}
+
+	return method, nil
+}
+
 // SubscribeToDashboardReady subscribes to the dashboard ready channel
 // and returns a channel that will receive a signal when the dashboard is ready
 // The context can be used to cancel the subscription
@@ -258,4 +279,34 @@ func (c *Client) SubscribeToDashboardReady(ctx context.Context, channel string) 
 	}()
 
 	return readyChan
+}
+
+// SubscribeToSettingsChanges subscribes to settings change notifications
+// Returns a channel that receives the setting key that changed and a cleanup function
+func (c *Client) SubscribeToSettingsChanges(channel string) (<-chan string, func(), error) {
+	pubsub := c.client.Subscribe(c.ctx, channel)
+
+	// Check if subscription was successful
+	_, err := pubsub.Receive(c.ctx)
+	if err != nil {
+		pubsub.Close()
+		return nil, nil, fmt.Errorf("failed to subscribe to settings changes on channel %s: %w", channel, err)
+	}
+
+	// Create a string channel for setting changes
+	msgChan := make(chan string)
+
+	// Start a goroutine to handle messages
+	go func() {
+		defer close(msgChan)
+		for msg := range pubsub.Channel() {
+			select {
+			case <-c.ctx.Done():
+				return
+			case msgChan <- msg.Payload:
+			}
+		}
+	}()
+
+	return msgChan, func() { pubsub.Close() }, nil
 }
