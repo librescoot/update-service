@@ -1102,7 +1102,7 @@ func (u *Updater) findNextRelease(releases []Release, currentVersion, channel, v
 	// Tags are in format: channel-YYYYMMDDTHHMMSS
 	for i := 0; i < len(candidateReleases)-1; i++ {
 		for j := i + 1; j < len(candidateReleases); j++ {
-			if candidateReleases[i].TagName > candidateReleases[j].TagName {
+			if strings.ToLower(candidateReleases[i].TagName) > strings.ToLower(candidateReleases[j].TagName) {
 				candidateReleases[i], candidateReleases[j] = candidateReleases[j], candidateReleases[i]
 			}
 		}
@@ -1111,7 +1111,7 @@ func (u *Updater) findNextRelease(releases []Release, currentVersion, channel, v
 	// Find the first release that's newer than the current version
 	currentTag := channel + "-" + currentVersion
 	for _, release := range candidateReleases {
-		if release.TagName > currentTag {
+		if strings.ToLower(release.TagName) > strings.ToLower(currentTag) {
 			u.logger.Printf("Found next release after %s: %s", currentTag, release.TagName)
 			return release, true
 		}
