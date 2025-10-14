@@ -1100,6 +1100,7 @@ func (u *Updater) findNextRelease(releases []Release, currentVersion, channel, v
 
 	// Sort releases by tag name (which includes the timestamp)
 	// Tags are in format: channel-YYYYMMDDTHHMMSS
+	// Use case-insensitive comparison to handle both 't' and 'T' separators
 	for i := 0; i < len(candidateReleases)-1; i++ {
 		for j := i + 1; j < len(candidateReleases); j++ {
 			if strings.ToLower(candidateReleases[i].TagName) > strings.ToLower(candidateReleases[j].TagName) {
@@ -1109,15 +1110,16 @@ func (u *Updater) findNextRelease(releases []Release, currentVersion, channel, v
 	}
 
 	// Find the first release that's newer than the current version
-	currentTag := channel + "-" + currentVersion
+	// Normalize currentTag to lowercase for consistent comparison
+	currentTag := strings.ToLower(channel + "-" + currentVersion)
 	for _, release := range candidateReleases {
-		if strings.ToLower(release.TagName) > strings.ToLower(currentTag) {
-			u.logger.Printf("Found next release after %s: %s", currentTag, release.TagName)
+		if strings.ToLower(release.TagName) > currentTag {
+			u.logger.Printf("Found next release after %s: %s", channel+"-"+currentVersion, release.TagName)
 			return release, true
 		}
 	}
 
-	u.logger.Printf("No release found after current version %s", currentTag)
+	u.logger.Printf("No release found after current version %s", channel+"-"+currentVersion)
 	return Release{}, false
 }
 
