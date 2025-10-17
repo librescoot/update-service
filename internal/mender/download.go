@@ -204,7 +204,16 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 				if time.Since(lastProgressReport) > 5*time.Second {
 					elapsed := time.Since(start)
 					speed := float64(totalRead) / elapsed.Seconds() / 1024 / 1024 // MB/s
-					d.logger.Printf("Downloaded %d bytes (%.2f MB/s)", totalRead, speed)
+
+					// Calculate progress percentage
+					var percentage float64
+					if totalSize > 0 {
+						percentage = float64(totalRead) / float64(totalSize) * 100
+						d.logger.Printf("Downloaded %d / %d bytes (%.1f%%, %.2f MB/s)", totalRead, totalSize, percentage, speed)
+					} else {
+						d.logger.Printf("Downloaded %d bytes (size unknown, %.2f MB/s)", totalRead, speed)
+					}
+
 					lastProgressReport = time.Now()
 
 					// Report progress via callback
@@ -217,7 +226,13 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 				if err == io.EOF {
 					elapsed := time.Since(start)
 					speed := float64(totalRead) / elapsed.Seconds() / 1024 / 1024 // MB/s
-					d.logger.Printf("Download complete, total size: %d bytes, average speed: %.2f MB/s", totalRead, speed)
+
+					// Log completion with percentage if total size was known
+					if totalSize > 0 && totalRead == totalSize {
+						d.logger.Printf("Download complete, %d / %d bytes (100%%, average speed: %.2f MB/s)", totalRead, totalSize, speed)
+					} else {
+						d.logger.Printf("Download complete, total size: %d bytes, average speed: %.2f MB/s", totalRead, speed)
+					}
 
 					// Report final progress
 					if progressCallback != nil {
