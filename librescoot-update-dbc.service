@@ -16,9 +16,6 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=update-service-dbc
 
-# Working directory
-WorkingDirectory=/data/ota
-
 # Create data directory if it doesn't exist
 ExecStartPre=/bin/mkdir -p /data/ota/dbc
 
