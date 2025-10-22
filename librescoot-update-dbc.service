@@ -1,6 +1,7 @@
 [Unit]
 Description=LibreScoot Update Service (DBC)
 After=network.target
+After=librescoot-version.service
 Wants=network-online.target
 
 [Service]
