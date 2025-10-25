@@ -310,3 +310,15 @@ func (c *Client) SubscribeToSettingsChanges(channel string) (<-chan string, func
 
 	return msgChan, func() { pubsub.Close() }, nil
 }
+
+// HGet gets a field value from a Redis hash
+func (c *Client) HGet(key, field string) (string, error) {
+	val, err := c.client.HGet(c.ctx, key, field).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return "", fmt.Errorf("field not found")
+		}
+		return "", err
+	}
+	return val, nil
+}

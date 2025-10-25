@@ -6,12 +6,14 @@ After=librescoot-modem.service
 After=librescoot-vehicle.service
 After=librescoot-version.service
 After=librescoot-pm.service
+After=librescoot-settings.service
 Requires=redis.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/update-service --component=mdb --channel=nightly
+Environment="GOMEMLIMIT=100MiB"
+ExecStart=/usr/bin/update-service --component=mdb
 Restart=always
 RestartSec=10
 User=root

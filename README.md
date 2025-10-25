@@ -79,16 +79,52 @@ make run-dbc
 
 ## Configuration
 
-The service is configured using command-line flags:
+The service can be configured via command-line flags or Redis settings. CLI flags take precedence over Redis settings.
 
-| Flag                    | Description                                                       | Default                                                        | Required |
-|-------------------------|-------------------------------------------------------------------|----------------------------------------------------------------|----------|
-| `--component`           | Component to manage updates for.                                  | `""`                                                           | **Yes** (must be `mdb` or `dbc`) |
-| `--channel`             | Update channel to track.                                          | `nightly`                                                      | No       |
-| `--redis-addr`          | Redis server address.                                             | `localhost:6379`                                               | No       |
-| `--github-releases-url` | GitHub Releases API URL for update discovery.                     | `https://api.github.com/repos/librescoot/librescoot/releases`  | No       |
-| `--check-interval`      | Interval between update checks.                                   | `1h`                                                           | No       |
-| `--dry-run`             | If true, log reboot actions instead of performing them.           | `false`                                                        | No       |
+### Command-Line Flags
+
+| Flag                    | Description                                                       | Default                                                        | Required | Redis Configurable |
+|-------------------------|-------------------------------------------------------------------|----------------------------------------------------------------|----------|--------------------|
+| `--component`           | Component to manage updates for.                                  | `""`                                                           | **Yes** (must be `mdb` or `dbc`) | No (CLI only) |
+| `--redis-addr`          | Redis server address.                                             | `localhost:6379`                                               | No       | No (CLI only) |
+| `--channel`             | Update channel to track.                                          | `nightly`                                                      | No       | Yes |
+| `--github-releases-url` | GitHub Releases API URL for update discovery.                     | `https://api.github.com/repos/librescoot/librescoot/releases`  | No       | Yes |
+| `--check-interval`      | Interval between update checks.                                   | `6h`                                                           | No       | Yes |
+| `--dry-run`             | If true, log reboot actions instead of performing them.           | `false`                                                        | No       | Yes |
+
+**Note:** `--component` and `--redis-addr` are CLI-only and cannot be configured via Redis.
+
+### Redis Settings
+
+Settings can be configured per-component in the Redis `settings` hash. The update service monitors the `settings` channel for changes and applies them at runtime.
+
+**Setting Keys:**
+- `updates.{component}.channel` - Update channel (`stable`, `testing`, or `nightly`)
+- `updates.{component}.check-interval` - Check interval (e.g., `6h`, `1h`, `30m`)
+- `updates.{component}.github-releases-url` - GitHub Releases API URL
+- `updates.{component}.dry-run` - Dry-run mode (`true` or `false`)
+- `updates.{component}.method` - Update method (`full` or `delta`)
+
+**Examples:**
+```bash
+# Set MDB to stable channel
+redis-cli HSET settings updates.mdb.channel stable
+redis-cli PUBLISH settings updates.mdb.channel
+
+# Set DBC check interval to 12 hours
+redis-cli HSET settings updates.dbc.check-interval 12h
+redis-cli PUBLISH settings updates.dbc.check-interval
+
+# Enable delta updates for MDB
+redis-cli HSET settings updates.mdb.method delta
+redis-cli PUBLISH settings updates.mdb.method
+
+# Enable dry-run for testing
+redis-cli HSET settings updates.dbc.dry-run true
+redis-cli PUBLISH settings updates.dbc.dry-run
+```
+
+**Priority:** CLI flags (if specified) > Redis settings > hardcoded defaults
 
 Many previous Redis key configurations are now handled internally based on the specified `--component`.
 

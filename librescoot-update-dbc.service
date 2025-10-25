@@ -2,11 +2,13 @@
 Description=LibreScoot Update Service (DBC)
 After=network.target
 After=librescoot-version.service
+After=librescoot-settings.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/update-service --component=dbc --channel=nightly --redis-addr=192.168.7.1:6379
+Environment="GOMEMLIMIT=100MiB"
+ExecStart=/usr/bin/update-service --component=dbc --redis-addr=192.168.7.1:6379
 Restart=always
 RestartSec=10
 User=root
