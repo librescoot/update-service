@@ -264,6 +264,15 @@ func (u *Updater) monitorSettingsChanges() {
 
 // updateCheckLoop periodically checks for updates
 func (u *Updater) updateCheckLoop() {
+	// If check interval is 0, automated updates are disabled
+	if u.config.CheckInterval == 0 {
+		u.logger.Printf("Automated update checks disabled (check-interval is 0 or 'never')")
+		// Wait for context cancellation
+		<-u.ctx.Done()
+		u.logger.Printf("Update check loop stopped")
+		return
+	}
+
 	ticker := time.NewTicker(u.config.CheckInterval)
 	defer ticker.Stop()
 

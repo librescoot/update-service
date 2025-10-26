@@ -97,7 +97,9 @@ func (c *Config) LoadFromRedis(redis RedisSettings) error {
 
 	// Load check-interval from Redis if available
 	if intervalStr, err := redis.HGet(SettingsHashKey, prefix+"check-interval"); err == nil && intervalStr != "" {
-		if duration, err := time.ParseDuration(intervalStr); err == nil {
+		if intervalStr == "never" {
+			c.CheckInterval = 0 // 0 means disabled
+		} else if duration, err := time.ParseDuration(intervalStr); err == nil {
 			c.CheckInterval = duration
 		}
 	}
@@ -136,7 +138,10 @@ func (c *Config) ApplyRedisUpdate(key, value string) bool {
 			return true
 		}
 	case "check-interval":
-		if duration, err := time.ParseDuration(value); err == nil {
+		if value == "never" {
+			c.CheckInterval = 0 // 0 means disabled
+			return true
+		} else if duration, err := time.ParseDuration(value); err == nil {
 			c.CheckInterval = duration
 			return true
 		}

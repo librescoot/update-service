@@ -19,7 +19,7 @@ import (
 var (
 	redisAddr         = flag.String("redis-addr", "localhost:6379", "Redis server address")
 	githubReleasesURL = flag.String("github-releases-url", "https://api.github.com/repos/librescoot/librescoot/releases", "GitHub Releases API URL")
-	checkInterval     = flag.Duration("check-interval", 6*time.Hour, "Interval between update checks")
+	checkInterval     = flag.Duration("check-interval", 6*time.Hour, "Interval between update checks (use 0 or 'never' to disable)")
 	component         = flag.String("component", "", "Component to manage updates for (mdb or dbc)")
 	channel           = flag.String("channel", "nightly", "Update channel (stable, testing, nightly)")
 	dryRun            = flag.Bool("dry-run", false, "If true, don't actually reboot, just notify")
