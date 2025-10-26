@@ -95,11 +95,17 @@ func (c *Client) SubscribeToOTAStatus(channel string) (<-chan string, func(), er
 	// Start a goroutine to convert redis.Message to string
 	go func() {
 		defer close(msgChan)
-		for msg := range pubsub.Channel() {
+		redisChan := pubsub.Channel()
+		for {
 			select {
 			case <-c.ctx.Done():
 				return
-			case msgChan <- msg.Payload:
+			case msg, ok := <-redisChan:
+				if !ok {
+					// Channel closed - Redis connection lost
+					panic(fmt.Sprintf("Redis channel %s closed unexpectedly, exiting to allow systemd restart", channel))
+				}
+				msgChan <- msg.Payload
 			}
 		}
 	}()
@@ -205,11 +211,17 @@ func (c *Client) SubscribeToVehicleStateChanges(channel string) (<-chan string, 
 	// Start a goroutine to handle messages
 	go func() {
 		defer close(msgChan)
-		for msg := range pubsub.Channel() {
+		redisChan := pubsub.Channel()
+		for {
 			select {
 			case <-c.ctx.Done():
 				return
-			case msgChan <- msg.Payload:
+			case msg, ok := <-redisChan:
+				if !ok {
+					// Channel closed - Redis connection lost
+					panic(fmt.Sprintf("Redis channel %s closed unexpectedly, exiting to allow systemd restart", channel))
+				}
+				msgChan <- msg.Payload
 			}
 		}
 	}()
@@ -265,11 +277,16 @@ func (c *Client) SubscribeToDashboardReady(ctx context.Context, channel string) 
 		defer pubsub.Close()
 		defer close(readyChan)
 
+		redisChan := pubsub.Channel()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case msg := <-pubsub.Channel():
+			case msg, ok := <-redisChan:
+				if !ok {
+					// Channel closed - Redis connection lost
+					panic(fmt.Sprintf("Redis channel %s closed unexpectedly, exiting to allow systemd restart", channel))
+				}
 				if msg.Payload == "ready" {
 					readyChan <- struct{}{}
 					return
@@ -299,11 +316,17 @@ func (c *Client) SubscribeToSettingsChanges(channel string) (<-chan string, func
 	// Start a goroutine to handle messages
 	go func() {
 		defer close(msgChan)
-		for msg := range pubsub.Channel() {
+		redisChan := pubsub.Channel()
+		for {
 			select {
 			case <-c.ctx.Done():
 				return
-			case msgChan <- msg.Payload:
+			case msg, ok := <-redisChan:
+				if !ok {
+					// Channel closed - Redis connection lost
+					panic(fmt.Sprintf("Redis channel %s closed unexpectedly, exiting to allow systemd restart", channel))
+				}
+				msgChan <- msg.Payload
 			}
 		}
 	}()
