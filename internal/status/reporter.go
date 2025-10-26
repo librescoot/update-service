@@ -256,3 +256,24 @@ func (r *Reporter) ClearUpdateMethod(ctx context.Context) error {
 	r.logger.Printf("Cleared update method for %s", r.component)
 	return nil
 }
+
+// Initialize sets initial values for OTA keys on service startup
+func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
+	pipe := r.client.Pipeline()
+
+	statusKey := fmt.Sprintf("status:%s", r.component)
+	progressKey := fmt.Sprintf("download-progress:%s", r.component)
+	methodKey := fmt.Sprintf("update-method:%s", r.component)
+
+	pipe.HSet(ctx, "ota", statusKey, string(StatusIdle))
+	pipe.HSet(ctx, "ota", progressKey, 0)
+	pipe.HSet(ctx, "ota", methodKey, updateMethod)
+
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to initialize OTA keys for component %s: %w", r.component, err)
+	}
+
+	r.logger.Printf("Initialized OTA keys for %s (status: idle, progress: 0, method: %s)", r.component, updateMethod)
+	return nil
+}

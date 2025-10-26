@@ -102,6 +102,11 @@ func (u *Updater) Start() error {
 		u.logger.Printf("Warning: Failed to clear rebooting status: %v", err)
 	}
 
+	// Initialize Redis keys if they don't exist
+	if err := u.initializeRedisKeys(); err != nil {
+		u.logger.Printf("Warning: Failed to initialize Redis keys: %v", err)
+	}
+
 	// Check initial vehicle state and set standby timestamp if needed
 	u.checkInitialStandbyState()
 
@@ -155,6 +160,30 @@ func (u *Updater) clearRebootingStatus() error {
 			return fmt.Errorf("failed to clear rebooting status: %w", err)
 		}
 		u.logger.Printf("Cleared rebooting status for %s", u.config.Component)
+	}
+
+	return nil
+}
+
+// initializeRedisKeys ensures Redis keys for this component are initialized
+func (u *Updater) initializeRedisKeys() error {
+	// Check if status key exists and get its value
+	statusKey := fmt.Sprintf("status:%s", u.config.Component)
+	statusValue, err := u.redis.GetClient().HGet(u.ctx, "ota", statusKey).Result()
+
+	// Initialize if key doesn't exist (redis.Nil) or if it's empty
+	needsInit := err != nil || statusValue == ""
+
+	if needsInit {
+		u.logger.Printf("Initializing Redis OTA keys for component %s", u.config.Component)
+
+		// Get the configured update method
+		updateMethod := u.getUpdateMethod()
+
+		// Initialize keys: status=idle, download-progress=0, update-method=<configured>
+		if err := u.status.Initialize(u.ctx, updateMethod); err != nil {
+			return fmt.Errorf("failed to initialize OTA keys: %w", err)
+		}
 	}
 
 	return nil
