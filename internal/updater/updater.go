@@ -213,6 +213,34 @@ func (u *Updater) checkInitialStandbyState() {
 	}
 }
 
+// revalidateStandbyState re-validates the vehicle state after long-running operations
+// This ensures the standby timestamp reflects the current vehicle state, not a stale
+// timestamp from before the operation started. This is critical after operations like
+// delta patch application which can take 20+ minutes during which the vehicle state
+// may have changed multiple times.
+func (u *Updater) revalidateStandbyState() {
+	currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+	if err != nil {
+		u.logger.Printf("Failed to get vehicle state after long-running operation: %v (clearing standby timestamp)", err)
+		u.standbyStartTime = time.Time{} // Clear on error to be safe
+		return
+	}
+
+	if currentState == "stand-by" {
+		if !stateTimestamp.IsZero() {
+			u.standbyStartTime = stateTimestamp
+			elapsed := time.Since(stateTimestamp)
+			u.logger.Printf("Vehicle in 'stand-by' after operation completion (timestamp: %s, elapsed: %v) - standby timer reset", stateTimestamp.Format(time.RFC3339), elapsed)
+		} else {
+			u.standbyStartTime = time.Now()
+			u.logger.Printf("Vehicle in 'stand-by' after operation completion (no timestamp) - using current time for standby tracking")
+		}
+	} else {
+		u.logger.Printf("Vehicle not in 'stand-by' after operation completion (current: %s) - clearing standby timestamp", currentState)
+		u.standbyStartTime = time.Time{}
+	}
+}
+
 // monitorSettingsChanges monitors Redis pub/sub for update method configuration changes
 func (u *Updater) monitorSettingsChanges() {
 	// Subscribe to the general settings channel
@@ -556,6 +584,10 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 
 	u.logger.Printf("Successfully downloaded update to: %s", filePath)
 
+	// Re-validate vehicle state after long-running download operation
+	// This ensures the 3-minute standby requirement starts fresh from the current state
+	u.revalidateStandbyState()
+
 	// Step 3: Set installing status and add install inhibitor
 	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
 		u.logger.Printf("Failed to set installing status: %v", err)
@@ -780,6 +812,10 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 
 	u.logger.Printf("Delta update successful, new mender file created: %s", newMenderPath)
+
+	// Re-validate vehicle state after long-running delta patch operation
+	// This ensures the 3-minute standby requirement starts fresh from the current state
+	u.revalidateStandbyState()
 
 	// Step 3: Set installing status and add install inhibitor
 	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
