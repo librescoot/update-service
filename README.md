@@ -128,6 +128,26 @@ redis-cli PUBLISH settings updates.dbc.dry-run
 
 Many previous Redis key configurations are now handled internally based on the specified `--component`.
 
+### Redis Commands
+
+The update service listens for commands on the `scooter:update` list. Commands can be sent using Redis LPUSH:
+
+**Available Commands:**
+- `check-now` - Immediately trigger an update check, bypassing the configured check interval
+
+**Examples:**
+```bash
+# Force an immediate update check
+redis-cli LPUSH scooter:update check-now
+
+# This triggers update checks for all running update-service instances (both MDB and DBC)
+```
+
+**Note:** The `check-now` command is useful for:
+- Testing update functionality without waiting for the next scheduled check
+- Manually checking for updates after deploying new releases
+- Forcing an update check after changing update settings
+
 ## Component-Specific Update Constraints
 
 ### DBC Updates

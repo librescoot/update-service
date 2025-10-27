@@ -113,6 +113,9 @@ func (u *Updater) Start() error {
 	// Start monitoring for settings changes
 	go u.monitorSettingsChanges()
 
+	// Start listening for Redis commands
+	go u.listenForCommands()
+
 	// Start the update check loop
 	go u.updateCheckLoop()
 
@@ -238,6 +241,49 @@ func (u *Updater) revalidateStandbyState() {
 	} else {
 		u.logger.Printf("Vehicle not in 'stand-by' after operation completion (current: %s) - clearing standby timestamp", currentState)
 		u.standbyStartTime = time.Time{}
+	}
+}
+
+// listenForCommands listens for Redis commands on scooter:update
+func (u *Updater) listenForCommands() {
+	u.logger.Printf("Starting update command listener on scooter:update")
+
+	for {
+		select {
+		case <-u.ctx.Done():
+			u.logger.Printf("Update command listener stopped")
+			return
+
+		default:
+			// Use BRPOP with 5 second timeout to allow periodic context checks
+			result, err := u.redis.GetClient().BRPop(u.ctx, 5*time.Second, "scooter:update").Result()
+			if err != nil {
+				// Ignore timeout and context cancellation errors
+				if err.Error() == "redis: nil" || err == context.Canceled {
+					continue
+				}
+				u.logger.Printf("Error reading from scooter:update: %v", err)
+				continue
+			}
+
+			// BRPOP returns [key, value]
+			if len(result) >= 2 {
+				command := result[1]
+				u.logger.Printf("Received update command: %s", command)
+				u.handleCommand(command)
+			}
+		}
+	}
+}
+
+// handleCommand handles incoming Redis commands
+func (u *Updater) handleCommand(command string) {
+	switch command {
+	case "check-now":
+		u.logger.Printf("Received check-now command, triggering immediate update check")
+		go u.checkForUpdates()
+	default:
+		u.logger.Printf("Unknown update command: %s", command)
 	}
 }
 
