@@ -163,6 +163,15 @@ func (u *Updater) clearRebootingStatus() error {
 			return fmt.Errorf("failed to clear rebooting status: %w", err)
 		}
 		u.logger.Printf("Cleared rebooting status for %s", u.config.Component)
+
+		// For DBC component, notify vehicle-service that update is complete
+		// (the defer that normally sends this didn't execute due to reboot)
+		if u.config.Component == "dbc" {
+			u.logger.Printf("Sending complete-dbc command after reboot")
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
+			}
+		}
 	}
 
 	return nil
