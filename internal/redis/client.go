@@ -345,3 +345,30 @@ func (c *Client) HGet(key, field string) (string, error) {
 	}
 	return val, nil
 }
+
+// SetLastUpdateCheckTime stores the timestamp of the last update check for a component
+func (c *Client) SetLastUpdateCheckTime(component string, timestamp time.Time) error {
+	key := fmt.Sprintf("updates.%s.last-check-time", component)
+	return c.client.HSet(c.ctx, "settings", key, timestamp.Format(time.RFC3339)).Err()
+}
+
+// GetLastUpdateCheckTime retrieves the timestamp of the last update check for a component
+// Returns zero time if not found
+func (c *Client) GetLastUpdateCheckTime(component string) (time.Time, error) {
+	key := fmt.Sprintf("updates.%s.last-check-time", component)
+	timeStr, err := c.client.HGet(c.ctx, "settings", key).Result()
+	if err != nil {
+		if err == redis.Nil {
+			// Not found, return zero time
+			return time.Time{}, nil
+		}
+		return time.Time{}, fmt.Errorf("failed to get last check time for %s: %w", component, err)
+	}
+
+	timestamp, err := time.Parse(time.RFC3339, timeStr)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to parse last check time for %s: %w", component, err)
+	}
+
+	return timestamp, nil
+}

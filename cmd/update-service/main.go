@@ -210,7 +210,53 @@ func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *c
 			// Apply the setting update
 			if cfg.ApplyRedisUpdate(settingKey, value) {
 				logger.Printf("Applied setting update: %s = %s", settingKey, value)
+
+				// If check-interval was updated, evaluate if we should check now
+				if len(settingKey) > len(prefix) && settingKey[:len(prefix)] == prefix {
+					settingName := settingKey[len(prefix):]
+					if settingName == "check-interval" {
+						evaluateCheckIntervalChange(ctx, redisClient, cfg, logger)
+					}
+				}
 			}
 		}
+	}
+}
+
+// evaluateCheckIntervalChange evaluates if an update check should be triggered based on the new check interval
+func evaluateCheckIntervalChange(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger) {
+	// If automated checks are disabled (interval is 0), don't trigger a check
+	if cfg.CheckInterval == 0 {
+		logger.Printf("Check interval set to 0 (disabled), not triggering check")
+		return
+	}
+
+	// Get the last check time from Redis
+	lastCheckTime, err := redisClient.GetLastUpdateCheckTime(cfg.Component)
+	if err != nil {
+		logger.Printf("Warning: Failed to get last check time: %v. Will not trigger immediate check.", err)
+		return
+	}
+
+	// If there's no recorded last check time, don't trigger a check
+	// The normal update loop will handle it
+	if lastCheckTime.IsZero() {
+		logger.Printf("No previous check time recorded, will wait for normal check interval")
+		return
+	}
+
+	// Calculate time since last check
+	timeSinceLastCheck := time.Since(lastCheckTime)
+	logger.Printf("Time since last check: %v, new check interval: %v", timeSinceLastCheck, cfg.CheckInterval)
+
+	// If enough time has passed based on the new interval, trigger a check
+	if timeSinceLastCheck >= cfg.CheckInterval {
+		logger.Printf("Time since last check (%v) >= new interval (%v), triggering immediate check", timeSinceLastCheck, cfg.CheckInterval)
+		if err := redisClient.PushUpdateCommand("check-now"); err != nil {
+			logger.Printf("Warning: Failed to trigger update check: %v", err)
+		}
+	} else {
+		remainingTime := cfg.CheckInterval - timeSinceLastCheck
+		logger.Printf("Time since last check (%v) < new interval (%v), next check in %v", timeSinceLastCheck, cfg.CheckInterval, remainingTime)
 	}
 }

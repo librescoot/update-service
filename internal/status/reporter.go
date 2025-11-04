@@ -211,6 +211,22 @@ func (r *Reporter) SetDownloadProgress(ctx context.Context, downloaded, total in
 	return nil
 }
 
+// SetInstallProgress sets the install/delta application progress (0-100)
+func (r *Reporter) SetInstallProgress(ctx context.Context, percent int) error {
+	progressKey := fmt.Sprintf("install-progress:%s", r.component)
+	err := r.client.HSet(ctx, "ota", progressKey, percent).Err()
+	if err != nil {
+		return fmt.Errorf("failed to set install progress for component %s: %w", r.component, err)
+	}
+	return nil
+}
+
+// ClearInstallProgress removes the install progress key from Redis
+func (r *Reporter) ClearInstallProgress(ctx context.Context) error {
+	progressKey := fmt.Sprintf("install-progress:%s", r.component)
+	return r.client.HDel(ctx, "ota", progressKey).Err()
+}
+
 // ClearDownloadProgress removes the download progress keys from Redis
 func (r *Reporter) ClearDownloadProgress(ctx context.Context) error {
 	pipe := r.client.Pipeline()

@@ -368,6 +368,11 @@ func (u *Updater) updateCheckLoop() {
 func (u *Updater) checkForUpdates() {
 	u.logger.Printf("Checking for updates for component %s on channel %s", u.config.Component, u.config.Channel)
 
+	// Store the timestamp of this check
+	if err := u.redis.SetLastUpdateCheckTime(u.config.Component, time.Now()); err != nil {
+		u.logger.Printf("Warning: Failed to store last check time: %v", err)
+	}
+
 	// Check if we're waiting for a reboot - if so, defer updates
 	currentStatus, err := u.status.GetStatus(u.ctx)
 	if err != nil {
@@ -821,13 +826,19 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}()
 
 	// Step 2: Apply delta update
-	progressCallback := func(downloaded, total int64) {
+	downloadProgressCallback := func(downloaded, total int64) {
 		if err := u.status.SetDownloadProgress(u.ctx, downloaded, total); err != nil {
 			u.logger.Printf("Failed to update download progress: %v", err)
 		}
 	}
 
-	newMenderPath, err := u.mender.ApplyDeltaUpdate(u.ctx, deltaURL, currentVersion, progressCallback)
+	installProgressCallback := func(percent int) {
+		if err := u.status.SetInstallProgress(u.ctx, percent); err != nil {
+			u.logger.Printf("Failed to update install progress: %v", err)
+		}
+	}
+
+	newMenderPath, err := u.mender.ApplyDeltaUpdate(u.ctx, deltaURL, currentVersion, downloadProgressCallback, installProgressCallback)
 	if err != nil {
 		u.logger.Printf("Delta update failed: %v, falling back to full update", err)
 		if err := u.status.SetError(u.ctx, "delta-failed", fmt.Sprintf("Delta update failed: %v", err)); err != nil {
@@ -852,9 +863,12 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		return
 	}
 
-	// Clear download progress after successful delta application
+	// Clear download and install progress after successful delta application
 	if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
 		u.logger.Printf("Failed to clear download progress: %v", err)
+	}
+	if err := u.status.ClearInstallProgress(u.ctx); err != nil {
+		u.logger.Printf("Failed to clear install progress: %v", err)
 	}
 
 	u.logger.Printf("Delta update successful, new mender file created: %s", newMenderPath)

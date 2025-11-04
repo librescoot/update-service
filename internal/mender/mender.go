@@ -151,7 +151,7 @@ func (m *Manager) FindMenderFileForVersion(version string) (string, bool) {
 
 // ApplyDeltaUpdate applies a delta update to generate a new mender file
 // Returns the path to the new mender file or an error
-func (m *Manager) ApplyDeltaUpdate(ctx context.Context, deltaURL, currentVersion string, progressCallback ProgressCallback) (string, error) {
+func (m *Manager) ApplyDeltaUpdate(ctx context.Context, deltaURL, currentVersion string, downloadProgressCallback ProgressCallback, deltaProgressCallback DeltaProgressCallback) (string, error) {
 	// Find the existing mender file for the current version
 	oldMenderPath, exists := m.FindMenderFileForVersion(currentVersion)
 	if !exists {
@@ -160,7 +160,7 @@ func (m *Manager) ApplyDeltaUpdate(ctx context.Context, deltaURL, currentVersion
 
 	// Download the delta file
 	m.logger.Printf("Downloading delta update from %s", deltaURL)
-	deltaPath, err := m.downloader.Download(ctx, deltaURL, progressCallback)
+	deltaPath, err := m.downloader.Download(ctx, deltaURL, downloadProgressCallback)
 	if err != nil {
 		return "", fmt.Errorf("failed to download delta file: %w", err)
 	}
@@ -171,7 +171,7 @@ func (m *Manager) ApplyDeltaUpdate(ctx context.Context, deltaURL, currentVersion
 	newMenderPath := filepath.Join(m.downloader.downloadDir, newMenderName)
 
 	// Apply the delta
-	err = m.deltaApplier.ApplyDelta(oldMenderPath, deltaPath, newMenderPath)
+	err = m.deltaApplier.ApplyDelta(oldMenderPath, deltaPath, newMenderPath, deltaProgressCallback)
 	if err != nil {
 		// Clean up the delta file on failure
 		m.deltaApplier.CleanupDeltaFile(deltaPath)
