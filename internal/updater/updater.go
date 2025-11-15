@@ -253,9 +253,10 @@ func (u *Updater) revalidateStandbyState() {
 	}
 }
 
-// listenForCommands listens for Redis commands on scooter:update
+// listenForCommands listens for Redis commands on scooter:update:{component}
 func (u *Updater) listenForCommands() {
-	u.logger.Printf("Starting update command listener on scooter:update")
+	channel := fmt.Sprintf("scooter:update:%s", u.config.Component)
+	u.logger.Printf("Starting update command listener on %s", channel)
 
 	for {
 		select {
@@ -265,13 +266,13 @@ func (u *Updater) listenForCommands() {
 
 		default:
 			// Use BRPOP with 5 second timeout to allow periodic context checks
-			result, err := u.redis.GetClient().BRPop(u.ctx, 5*time.Second, "scooter:update").Result()
+			result, err := u.redis.GetClient().BRPop(u.ctx, 5*time.Second, channel).Result()
 			if err != nil {
 				// Ignore timeout and context cancellation errors
 				if err.Error() == "redis: nil" || err == context.Canceled {
 					continue
 				}
-				u.logger.Printf("Error reading from scooter:update: %v", err)
+				u.logger.Printf("Error reading from %s: %v", channel, err)
 				continue
 			}
 

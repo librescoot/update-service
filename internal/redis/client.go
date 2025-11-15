@@ -58,8 +58,16 @@ func (c *Client) PushUpdateURL(updateKey, url string) error {
 }
 
 // PushUpdateCommand pushes an update command to the scooter:update list
+// Used for lifecycle commands (start-dbc, complete-dbc) that vehicle-service needs
 func (c *Client) PushUpdateCommand(command string) error {
 	return c.client.LPush(c.ctx, "scooter:update", command).Err()
+}
+
+// PushUpdateCommandToComponent pushes an update command to a component-specific channel
+// Used for check commands (check-now) that only the specific update-service should handle
+func (c *Client) PushUpdateCommandToComponent(component, command string) error {
+	channel := fmt.Sprintf("scooter:update:%s", component)
+	return c.client.LPush(c.ctx, channel, command).Err()
 }
 
 // GetOTAStatus gets the OTA status from Redis

@@ -252,7 +252,7 @@ func evaluateCheckIntervalChange(ctx context.Context, redisClient *redis.Client,
 	// If enough time has passed based on the new interval, trigger a check
 	if timeSinceLastCheck >= cfg.CheckInterval {
 		logger.Printf("Time since last check (%v) >= new interval (%v), triggering immediate check", timeSinceLastCheck, cfg.CheckInterval)
-		if err := redisClient.PushUpdateCommand("check-now"); err != nil {
+		if err := redisClient.PushUpdateCommandToComponent(cfg.Component, "check-now"); err != nil {
 			logger.Printf("Warning: Failed to trigger update check: %v", err)
 		}
 	} else {
