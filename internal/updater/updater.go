@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -477,8 +478,32 @@ func (u *Updater) findLatestRelease(releases []Release, variantID, channel strin
 	found := false
 
 	for _, release := range releases {
-		// Check if the release is for the specified channel
-		if !strings.HasPrefix(release.TagName, channel+"-") {
+		// Channel-specific filtering logic
+		match := false
+		switch channel {
+		case "nightly":
+			// Nightly: look for prereleases with "nightly-" prefix
+			if release.Prerelease && strings.HasPrefix(release.TagName, "nightly-") {
+				match = true
+			}
+		case "testing":
+			// Testing: look for prereleases with "testing-" prefix
+			if release.Prerelease && strings.HasPrefix(release.TagName, "testing-") {
+				match = true
+			}
+		case "stable":
+			// Stable: look for non-prereleases with "v" prefix (e.g., v1.2.3)
+			if !release.Prerelease && strings.HasPrefix(release.TagName, "v") {
+				match = true
+			}
+		default:
+			// Fallback for unknown channels (legacy behavior: match channel prefix)
+			if strings.HasPrefix(release.TagName, channel+"-") {
+				match = true
+			}
+		}
+
+		if !match {
 			continue
 		}
 
@@ -495,10 +520,23 @@ func (u *Updater) findLatestRelease(releases []Release, variantID, channel strin
 			continue
 		}
 
-		// If this is the first matching release or it's newer than the current latest
-		if !found || release.PublishedAt.After(latestRelease.PublishedAt) {
+		// Comparison logic
+		if !found {
 			latestRelease = release
 			found = true
+			continue
+		}
+
+		// For stable, use semantic version comparison
+		if channel == "stable" {
+			if compareVersions(release.TagName, latestRelease.TagName) > 0 {
+				latestRelease = release
+			}
+		} else {
+			// For nightly/testing, rely on PublishedAt
+			if release.PublishedAt.After(latestRelease.PublishedAt) {
+				latestRelease = release
+			}
 		}
 	}
 
@@ -521,7 +559,25 @@ func (u *Updater) isUpdateNeeded(release Release) bool {
 		return true
 	}
 
-	// Extract the timestamp part from the release tag (format: nightly-20250506T214046)
+	// Handle stable channel version comparison (vX.Y.Z)
+	if u.config.Channel == "stable" {
+		// Current version might be just "1.2.3" or "v1.2.3", release tag is "v1.2.3"
+		// Normalize both to ensure comparison works
+		normCurrent := currentVersion
+		if !strings.HasPrefix(normCurrent, "v") {
+			normCurrent = "v" + normCurrent
+		}
+
+		if compareVersions(release.TagName, normCurrent) > 0 {
+			u.logger.Printf("Update needed for %s (stable): current=%s, release=%s", u.config.Component, currentVersion, release.TagName)
+			return true
+		}
+
+		u.logger.Printf("No update needed for %s (stable): current=%s, release=%s", u.config.Component, currentVersion, release.TagName)
+		return false
+	}
+
+	// Handle nightly/testing channels (timestamp based: channel-YYYYMMDD...)
 	parts := strings.Split(release.TagName, "-")
 	if len(parts) < 2 {
 		u.logger.Printf("Invalid release tag format: %s", release.TagName)
@@ -540,6 +596,52 @@ func (u *Updater) isUpdateNeeded(release Release) bool {
 	return false
 }
 
+// compareVersions compares two version strings (v1, v2).
+// Returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal.
+// Assumes format vX.Y.Z or X.Y.Z
+func compareVersions(v1, v2 string) int {
+	v1 = strings.TrimPrefix(v1, "v")
+	v2 = strings.TrimPrefix(v2, "v")
+
+	parts1 := strings.Split(v1, ".")
+	parts2 := strings.Split(v2, ".")
+
+	maxLen := len(parts1)
+	if len(parts2) > maxLen {
+		maxLen = len(parts2)
+	}
+
+	for i := 0; i < maxLen; i++ {
+		var n1, n2 int
+		var err error
+
+		if i < len(parts1) {
+			n1, err = strconv.Atoi(parts1[i])
+			if err != nil {
+				// If not a number, treat as 0 or handle differently if needed
+				// For now, simple integer comparison
+				n1 = 0
+			}
+		}
+
+		if i < len(parts2) {
+			n2, err = strconv.Atoi(parts2[i])
+			if err != nil {
+				n2 = 0
+			}
+		}
+
+		if n1 > n2 {
+			return 1
+		}
+		if n1 < n2 {
+			return -1
+		}
+	}
+
+	return 0
+}
+
 // getCurrentVersion gets the current version for this component
 func (u *Updater) getCurrentVersion() (string, error) {
 	result, err := u.redis.GetClient().HGet(u.ctx, fmt.Sprintf("version:%s", u.config.Component), "version_id").Result()
@@ -555,16 +657,21 @@ func (u *Updater) getCurrentVersion() (string, error) {
 func (u *Updater) performUpdate(release Release, assetURL string) {
 	u.logger.Printf("Starting update process for %s to version %s", u.config.Component, release.TagName)
 
-	// Extract version from release tag
-	parts := strings.Split(release.TagName, "-")
-	if len(parts) < 2 {
-		u.logger.Printf("Invalid release tag format: %s", release.TagName)
-		if err := u.status.SetError(u.ctx, "invalid-release-tag", fmt.Sprintf("Invalid release tag format: %s", release.TagName)); err != nil {
-			u.logger.Printf("Failed to set error status: %v", err)
+	var version string
+	if u.config.Channel == "stable" {
+		version = release.TagName
+	} else {
+		// Extract version from release tag for nightly/testing
+		parts := strings.Split(release.TagName, "-")
+		if len(parts) < 2 {
+			u.logger.Printf("Invalid release tag format: %s", release.TagName)
+			if err := u.status.SetError(u.ctx, "invalid-release-tag", fmt.Sprintf("Invalid release tag format: %s", release.TagName)); err != nil {
+				u.logger.Printf("Failed to set error status: %v", err)
+			}
+			return
 		}
-		return
+		version = strings.ToLower(parts[1])
 	}
-	version := strings.ToLower(parts[1])
 
 	// Step 0: Check and commit any pending Mender update
 	u.logger.Printf("Checking and attempting to commit any pending Mender update for %s before starting new update to %s", u.config.Component, release.TagName)
@@ -965,7 +1072,7 @@ func (u *Updater) TriggerReboot(component string) error {
 	case "mdb":
 		const requiredStandbyDuration = 3 * time.Minute
 		const safetyBuffer = 5 * time.Second
-		
+
 		u.logger.Printf("Preparing to reboot MDB. Waiting for vehicle to be in 'stand-by' state for at least %v.", requiredStandbyDuration)
 
 		// Check if we already have a valid standby timestamp
@@ -976,11 +1083,11 @@ func (u *Updater) TriggerReboot(component string) error {
 				u.logger.Printf("Triggering MDB reboot via Redis command")
 				return u.redis.TriggerReboot()
 			}
-			
+
 			// Calculate exact remaining time plus safety buffer
 			remainingTime := requiredStandbyDuration - durationInStandby + safetyBuffer
 			u.logger.Printf("Vehicle in 'stand-by' for %v (since %s). Sleeping for %v then rebooting.", durationInStandby, u.standbyStartTime.Format(time.RFC3339), remainingTime)
-			
+
 			// Sleep for the exact remaining time plus buffer
 			select {
 			case <-u.ctx.Done():
@@ -994,7 +1101,7 @@ func (u *Updater) TriggerReboot(component string) error {
 					u.logger.Printf("Vehicle left 'stand-by' state (current: %s) during wait. Restarting wait process.", currentState)
 					return u.waitForStandbyWithSubscription(requiredStandbyDuration)
 				}
-				
+
 				totalDuration := time.Since(u.standbyStartTime)
 				u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", totalDuration, u.standbyStartTime.Format(time.RFC3339))
 				u.logger.Printf("Triggering MDB reboot via Redis command")
@@ -1085,7 +1192,7 @@ func (u *Updater) waitForStandbyTimer(waitDuration time.Duration) error {
 			u.logger.Printf("Timer expired but no standby timestamp. Restarting wait.")
 			return u.waitForStandbyWithSubscription(3 * time.Minute)
 		}
-		
+
 		totalDuration := time.Since(u.standbyStartTime)
 		if totalDuration >= 3*time.Minute {
 			// Double-check vehicle is still in standby
@@ -1096,7 +1203,7 @@ func (u *Updater) waitForStandbyTimer(waitDuration time.Duration) error {
 				u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Restarting wait.", currentState)
 				return u.waitForStandbyWithSubscription(3 * time.Minute)
 			}
-			
+
 			u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", totalDuration, u.standbyStartTime.Format(time.RFC3339))
 			u.logger.Printf("Triggering MDB reboot via Redis command")
 			return u.redis.TriggerReboot()

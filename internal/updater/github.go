@@ -29,6 +29,7 @@ type Release struct {
 	TagName     string    `json:"tag_name"`
 	Name        string    `json:"name"`
 	PublishedAt time.Time `json:"published_at"`
+	Prerelease  bool      `json:"prerelease"`
 	Assets      []Asset   `json:"assets"`
 }
 
