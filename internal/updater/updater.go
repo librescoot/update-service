@@ -422,6 +422,15 @@ func (u *Updater) checkForUpdates() {
 	updateMethod := u.getUpdateMethod()
 	u.logger.Printf("Update method for %s: %s", u.config.Component, updateMethod)
 
+	// Check for channel switch
+	if currentVersion != "" {
+		currentChannel := u.inferChannelFromVersion(currentVersion)
+		if currentChannel != "" && currentChannel != u.config.Channel {
+			u.logger.Printf("Channel switch detected from %s to %s for component %s. Forcing full update.", currentChannel, u.config.Channel, u.config.Component)
+			updateMethod = "full"
+		}
+	}
+
 	// If delta updates are configured and we have a current version
 	if updateMethod == "delta" && currentVersion != "" {
 		// Attempt delta update
@@ -470,6 +479,24 @@ func (u *Updater) checkForUpdates() {
 
 	// Start the update process
 	go u.performUpdate(release, assetURL)
+}
+
+// inferChannelFromVersion attempts to infer the channel from the version string
+func (u *Updater) inferChannelFromVersion(version string) string {
+	// Clean up version string (remove potential codename suffix like " (none)")
+	version = strings.Split(version, " ")[0]
+
+	if strings.HasPrefix(version, "nightly-") {
+		return "nightly"
+	}
+	if strings.HasPrefix(version, "testing-") {
+		return "testing"
+	}
+	if strings.HasPrefix(version, "v") || (len(version) > 0 && version[0] >= '0' && version[0] <= '9') {
+		// Starts with 'v' or a number, assume stable
+		return "stable"
+	}
+	return ""
 }
 
 // findLatestRelease finds the latest release for the given variant and channel
@@ -578,16 +605,20 @@ func (u *Updater) isUpdateNeeded(release Release) bool {
 	}
 
 	// Handle nightly/testing channels (timestamp based: channel-YYYYMMDD...)
-	parts := strings.Split(release.TagName, "-")
-	if len(parts) < 2 {
-		u.logger.Printf("Invalid release tag format: %s", release.TagName)
-		return true
+	// Handle nightly/testing channels (timestamp based: channel-YYYYMMDD...)
+	normalizedReleaseVersion := strings.ToLower(release.TagName)
+	normalizedCurrentVersion := strings.ToLower(currentVersion)
+
+	// If current version is short (legacy), try to match it against the short part of release
+	if !strings.HasPrefix(normalizedCurrentVersion, u.config.Channel+"-") {
+		parts := strings.Split(normalizedReleaseVersion, "-")
+		if len(parts) >= 2 && normalizedCurrentVersion == parts[1] {
+			u.logger.Printf("No update needed for %s: current=%s (legacy), release=%s", u.config.Component, currentVersion, normalizedReleaseVersion)
+			return false
+		}
 	}
 
-	// Convert to lowercase for comparison
-	normalizedReleaseVersion := strings.ToLower(parts[1])
-
-	if currentVersion != normalizedReleaseVersion {
+	if normalizedCurrentVersion != normalizedReleaseVersion {
 		u.logger.Printf("Update needed for %s: current=%s, release=%s", u.config.Component, currentVersion, normalizedReleaseVersion)
 		return true
 	}
@@ -661,16 +692,8 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	if u.config.Channel == "stable" {
 		version = release.TagName
 	} else {
-		// Extract version from release tag for nightly/testing
-		parts := strings.Split(release.TagName, "-")
-		if len(parts) < 2 {
-			u.logger.Printf("Invalid release tag format: %s", release.TagName)
-			if err := u.status.SetError(u.ctx, "invalid-release-tag", fmt.Sprintf("Invalid release tag format: %s", release.TagName)); err != nil {
-				u.logger.Printf("Failed to set error status: %v", err)
-			}
-			return
-		}
-		version = strings.ToLower(parts[1])
+		// Use full tag name for nightly/testing too
+		version = strings.ToLower(release.TagName)
 	}
 
 	// Step 0: Check and commit any pending Mender update
@@ -840,21 +863,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		return
 	}
 
-	// Extract version from the next release tag
-	parts := strings.Split(nextRelease.TagName, "-")
-	if len(parts) < 2 {
-		u.logger.Printf("Invalid release tag format: %s, falling back to full update", nextRelease.TagName)
-		// Fall back to full update with latest version
-		latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
-		if found {
-			menderURL := u.findMenderAsset(latestRelease, variantID)
-			if menderURL != "" {
-				u.performUpdate(latestRelease, menderURL)
-			}
-		}
-		return
-	}
-	nextVersion := strings.ToLower(parts[1])
+	nextVersion := strings.ToLower(nextRelease.TagName)
 
 	// Check if we have the .mender file for the current version
 	_, hasMenderFile := u.mender.FindMenderFileForVersion(currentVersion)
@@ -1362,15 +1371,19 @@ func (u *Updater) findNextRelease(releases []Release, currentVersion, channel, v
 
 	// Find the first release that's newer than the current version
 	// Normalize currentTag to lowercase for consistent comparison
-	currentTag := strings.ToLower(channel + "-" + currentVersion)
+	currentTag := strings.ToLower(currentVersion)
+	if !strings.HasPrefix(currentTag, channel+"-") {
+		currentTag = strings.ToLower(channel + "-" + currentVersion)
+	}
+
 	for _, release := range candidateReleases {
 		if strings.ToLower(release.TagName) > currentTag {
-			u.logger.Printf("Found next release after %s: %s", channel+"-"+currentVersion, release.TagName)
+			u.logger.Printf("Found next release after %s: %s", currentTag, release.TagName)
 			return release, true
 		}
 	}
 
-	u.logger.Printf("No release found after current version %s", channel+"-"+currentVersion)
+	u.logger.Printf("No release found after current version %s", currentTag)
 	return Release{}, false
 }
 
