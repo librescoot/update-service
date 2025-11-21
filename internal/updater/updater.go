@@ -1358,33 +1358,46 @@ func (u *Updater) findNextRelease(releases []Release, currentVersion, channel, v
 		}
 	}
 
-	// Sort releases by tag name (which includes the timestamp)
-	// Tags are in format: channel-YYYYMMDDTHHMMSS
-	// Use case-insensitive comparison to handle both 't' and 'T' separators
+	// Sort releases by normalized version (timestamp)
 	for i := 0; i < len(candidateReleases)-1; i++ {
 		for j := i + 1; j < len(candidateReleases); j++ {
-			if strings.ToLower(candidateReleases[i].TagName) > strings.ToLower(candidateReleases[j].TagName) {
+			v1 := u.normalizeVersion(candidateReleases[i].TagName, channel)
+			v2 := u.normalizeVersion(candidateReleases[j].TagName, channel)
+			if v1 > v2 {
 				candidateReleases[i], candidateReleases[j] = candidateReleases[j], candidateReleases[i]
 			}
 		}
 	}
 
 	// Find the first release that's newer than the current version
-	// Normalize currentTag to lowercase for consistent comparison
-	currentTag := strings.ToLower(currentVersion)
-	if !strings.HasPrefix(currentTag, channel+"-") {
-		currentTag = strings.ToLower(channel + "-" + currentVersion)
-	}
+	normalizedCurrent := u.normalizeVersion(currentVersion, channel)
 
 	for _, release := range candidateReleases {
-		if strings.ToLower(release.TagName) > currentTag {
-			u.logger.Printf("Found next release after %s: %s", currentTag, release.TagName)
+		normalizedRelease := u.normalizeVersion(release.TagName, channel)
+		if normalizedRelease > normalizedCurrent {
+			u.logger.Printf("Found next release after %s (norm: %s): %s (norm: %s)", currentVersion, normalizedCurrent, release.TagName, normalizedRelease)
 			return release, true
 		}
 	}
 
-	u.logger.Printf("No release found after current version %s", currentTag)
+	u.logger.Printf("No release found after current version %s (norm: %s)", currentVersion, normalizedCurrent)
 	return Release{}, false
+}
+
+// normalizeVersion strips the channel prefix (and potential double prefixes) from the version string
+// to return just the timestamp/version part for comparison.
+// e.g. "nightly-2025..." -> "2025..."
+// e.g. "nightly-nightly-2025..." -> "2025..."
+func (u *Updater) normalizeVersion(version, channel string) string {
+	normalized := strings.ToLower(version)
+	prefix := strings.ToLower(channel) + "-"
+
+	// repeatedly strip the prefix to handle cases like "nightly-nightly-..."
+	for strings.HasPrefix(normalized, prefix) {
+		normalized = strings.TrimPrefix(normalized, prefix)
+	}
+
+	return normalized
 }
 
 // findDeltaAsset finds a delta asset in a release for the specified variant
