@@ -207,7 +207,7 @@ func (u *Updater) initializeRedisKeys() error {
 
 // checkInitialStandbyState checks the initial vehicle state on startup and sets standby timestamp
 func (u *Updater) checkInitialStandbyState() {
-	currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+	currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
 	if err != nil {
 		u.logger.Printf("Failed to get initial vehicle state: %v", err)
 		return
@@ -216,10 +216,16 @@ func (u *Updater) checkInitialStandbyState() {
 	u.logger.Printf("Checking initial vehicle state for MDB reboot optimization...")
 
 	if currentState == "stand-by" {
-		if !stateTimestamp.IsZero() {
-			u.standbyStartTime = stateTimestamp
-			elapsed := time.Since(stateTimestamp)
-			u.logger.Printf("Vehicle in 'stand-by' since %s (elapsed: %v) - MDB reboot will use this timestamp", stateTimestamp.Format(time.RFC3339), elapsed)
+		standbyTimerStart, err := u.redis.GetStandbyTimerStart()
+		if err != nil {
+			u.logger.Printf("Failed to get standby timer start: %v", err)
+			return
+		}
+
+		if !standbyTimerStart.IsZero() {
+			u.standbyStartTime = standbyTimerStart
+			elapsed := time.Since(standbyTimerStart)
+			u.logger.Printf("Vehicle in 'stand-by' since %s (elapsed: %v) - MDB reboot will use this timestamp", standbyTimerStart.Format(time.RFC3339), elapsed)
 		} else {
 			u.standbyStartTime = time.Now()
 			u.logger.Printf("Vehicle in 'stand-by' with no timestamp - using current time for MDB reboot tracking")
@@ -235,7 +241,7 @@ func (u *Updater) checkInitialStandbyState() {
 // delta patch application which can take 20+ minutes during which the vehicle state
 // may have changed multiple times.
 func (u *Updater) revalidateStandbyState() {
-	currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+	currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
 	if err != nil {
 		u.logger.Printf("Failed to get vehicle state after long-running operation: %v (clearing standby timestamp)", err)
 		u.standbyStartTime = time.Time{} // Clear on error to be safe
@@ -243,10 +249,17 @@ func (u *Updater) revalidateStandbyState() {
 	}
 
 	if currentState == "stand-by" {
-		if !stateTimestamp.IsZero() {
-			u.standbyStartTime = stateTimestamp
-			elapsed := time.Since(stateTimestamp)
-			u.logger.Printf("Vehicle in 'stand-by' after operation completion (timestamp: %s, elapsed: %v) - standby timer reset", stateTimestamp.Format(time.RFC3339), elapsed)
+		standbyTimerStart, err := u.redis.GetStandbyTimerStart()
+		if err != nil {
+			u.logger.Printf("Failed to get standby timer start: %v (clearing standby timestamp)", err)
+			u.standbyStartTime = time.Time{}
+			return
+		}
+
+		if !standbyTimerStart.IsZero() {
+			u.standbyStartTime = standbyTimerStart
+			elapsed := time.Since(standbyTimerStart)
+			u.logger.Printf("Vehicle in 'stand-by' after operation completion (timestamp: %s, elapsed: %v) - standby timer reset", standbyTimerStart.Format(time.RFC3339), elapsed)
 		} else {
 			u.standbyStartTime = time.Now()
 			u.logger.Printf("Vehicle in 'stand-by' after operation completion (no timestamp) - using current time for standby tracking")
@@ -1251,16 +1264,22 @@ func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration)
 			return u.ctx.Err()
 		case <-stateChanges:
 			// State changed, check current state
-			currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+			currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
 			if err != nil {
 				u.logger.Printf("Failed to get vehicle state after change: %v. Continuing.", err)
 				continue
 			}
 
 			if currentState == "stand-by" {
-				// Set standby timestamp
-				if !stateTimestamp.IsZero() {
-					u.standbyStartTime = stateTimestamp
+				// Get standby timer start
+				standbyTimerStart, err := u.redis.GetStandbyTimerStart()
+				if err != nil {
+					u.logger.Printf("Failed to get standby timer start: %v. Continuing.", err)
+					continue
+				}
+
+				if !standbyTimerStart.IsZero() {
+					u.standbyStartTime = standbyTimerStart
 				} else {
 					u.standbyStartTime = time.Now()
 				}
