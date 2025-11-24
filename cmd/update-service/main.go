@@ -65,28 +65,29 @@ func main() {
 	}
 	defer redisClient.Close()
 
-	// Detect channel from installed version if --channel flag not explicitly set
+	// Track which CLI flags were explicitly set (non-default)
 	cliChannelSet := flag.Lookup("channel").Value.String() != flag.Lookup("channel").DefValue
+	cliCheckIntervalSet := flag.Lookup("check-interval").Value.String() != flag.Lookup("check-interval").DefValue
+	cliGithubURLSet := flag.Lookup("github-releases-url").Value.String() != flag.Lookup("github-releases-url").DefValue
+	cliDryRunSet := flag.Lookup("dry-run").Value.String() != flag.Lookup("dry-run").DefValue
 
+	// Always detect channel from installed version for logging/debugging purposes
 	detectedChannel := ""
-	if !cliChannelSet {
-		// CLI flag not explicitly set, try to detect from installed version
-		installedVersion, err := redisClient.GetComponentVersion(*component)
-		if err != nil {
-			logger.Printf("Warning: Failed to get installed version for channel detection: %v (defaulting to nightly)", err)
-		} else if installedVersion != "" {
-			detectedChannel = config.InferChannelFromVersion(installedVersion)
-			if detectedChannel != "" {
-				logger.Printf("Detected channel '%s' from installed version: %s", detectedChannel, installedVersion)
-			} else {
-				logger.Printf("Could not infer channel from installed version: %s (defaulting to nightly)", installedVersion)
-			}
+	installedVersion, err := redisClient.GetComponentVersion(*component)
+	if err != nil {
+		logger.Printf("Warning: Failed to get installed version for channel detection: %v", err)
+	} else if installedVersion != "" {
+		detectedChannel = config.InferChannelFromVersion(installedVersion)
+		if detectedChannel != "" {
+			logger.Printf("Detected channel '%s' from installed version: %s", detectedChannel, installedVersion)
 		} else {
-			logger.Printf("No installed version found, defaulting to nightly channel")
+			logger.Printf("Could not infer channel from installed version: %s", installedVersion)
 		}
+	} else {
+		logger.Printf("No installed version found")
 	}
 
-	// Determine the effective channel: detected channel if available, otherwise "nightly" default
+	// Determine the effective channel: CLI flag > Redis > detected > "nightly" default
 	effectiveChannel := *channel
 	if !cliChannelSet {
 		if detectedChannel != "" {
@@ -105,12 +106,6 @@ func main() {
 		effectiveChannel,
 		*dryRun,
 	)
-
-	// Track which CLI flags were explicitly set (non-default)
-	// Note: cliChannelSet already tracked above during channel detection
-	cliCheckIntervalSet := flag.Lookup("check-interval").Value.String() != flag.Lookup("check-interval").DefValue
-	cliGithubURLSet := flag.Lookup("github-releases-url").Value.String() != flag.Lookup("github-releases-url").DefValue
-	cliDryRunSet := flag.Lookup("dry-run").Value.String() != flag.Lookup("dry-run").DefValue
 
 	// Save CLI values if they were explicitly set
 	cliChannel := cfg.Channel
