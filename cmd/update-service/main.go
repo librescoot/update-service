@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -113,6 +114,14 @@ func main() {
 	cliGithubURL := cfg.GitHubReleasesURL
 	cliDryRun := cfg.DryRun
 
+	// Check if channel will come from Redis settings
+	redisChannelSet := false
+	if !cliChannelSet {
+		if redisChannel, err := redisClient.HGet(config.SettingsHashKey, fmt.Sprintf("updates.%s.channel", *component)); err == nil && redisChannel != "" && config.IsValidChannel(redisChannel) {
+			redisChannelSet = true
+		}
+	}
+
 	// Load settings from Redis (will be overridden by CLI flags if they were set)
 	if err := cfg.LoadFromRedis(redisClient); err != nil {
 		logger.Printf("Warning: Failed to load settings from Redis: %v", err)
@@ -171,6 +180,8 @@ func main() {
 	// Log channel with source information
 	if cliChannelSet {
 		logger.Printf("  Channel: %s (explicitly set via CLI flag)", cfg.Channel)
+	} else if redisChannelSet {
+		logger.Printf("  Channel: %s (from Redis settings)", cfg.Channel)
 	} else if detectedChannel != "" {
 		logger.Printf("  Channel: %s (detected from installed version)", cfg.Channel)
 	} else {
