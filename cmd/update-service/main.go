@@ -65,18 +65,49 @@ func main() {
 	}
 	defer redisClient.Close()
 
-	// Initialize config with CLI flags and defaults
+	// Detect channel from installed version if --channel flag not explicitly set
+	cliChannelSet := flag.Lookup("channel").Value.String() != flag.Lookup("channel").DefValue
+
+	detectedChannel := ""
+	if !cliChannelSet {
+		// CLI flag not explicitly set, try to detect from installed version
+		installedVersion, err := redisClient.GetComponentVersion(*component)
+		if err != nil {
+			logger.Printf("Warning: Failed to get installed version for channel detection: %v (defaulting to nightly)", err)
+		} else if installedVersion != "" {
+			detectedChannel = config.InferChannelFromVersion(installedVersion)
+			if detectedChannel != "" {
+				logger.Printf("Detected channel '%s' from installed version: %s", detectedChannel, installedVersion)
+			} else {
+				logger.Printf("Could not infer channel from installed version: %s (defaulting to nightly)", installedVersion)
+			}
+		} else {
+			logger.Printf("No installed version found, defaulting to nightly channel")
+		}
+	}
+
+	// Determine the effective channel: detected channel if available, otherwise "nightly" default
+	effectiveChannel := *channel
+	if !cliChannelSet {
+		if detectedChannel != "" {
+			effectiveChannel = detectedChannel
+		} else {
+			effectiveChannel = "nightly"
+		}
+	}
+
+	// Initialize config with CLI flags and detected/default values
 	cfg := config.New(
 		*redisAddr,
 		*githubReleasesURL,
 		*checkInterval,
 		*component,
-		*channel,
+		effectiveChannel,
 		*dryRun,
 	)
 
 	// Track which CLI flags were explicitly set (non-default)
-	cliChannelSet := flag.Lookup("channel").Value.String() != flag.Lookup("channel").DefValue
+	// Note: cliChannelSet already tracked above during channel detection
 	cliCheckIntervalSet := flag.Lookup("check-interval").Value.String() != flag.Lookup("check-interval").DefValue
 	cliGithubURLSet := flag.Lookup("github-releases-url").Value.String() != flag.Lookup("github-releases-url").DefValue
 	cliDryRunSet := flag.Lookup("dry-run").Value.String() != flag.Lookup("dry-run").DefValue
@@ -141,7 +172,16 @@ func main() {
 	logger.Printf("  GitHub Releases URL: %s", cfg.GitHubReleasesURL)
 	logger.Printf("  Check interval: %v", cfg.CheckInterval)
 	logger.Printf("  Component: %s", cfg.Component)
-	logger.Printf("  Channel: %s", cfg.Channel)
+
+	// Log channel with source information
+	if cliChannelSet {
+		logger.Printf("  Channel: %s (explicitly set via CLI flag)", cfg.Channel)
+	} else if detectedChannel != "" {
+		logger.Printf("  Channel: %s (detected from installed version)", cfg.Channel)
+	} else {
+		logger.Printf("  Channel: %s (default)", cfg.Channel)
+	}
+
 	logger.Printf("  Dry-run mode: %v", cfg.DryRun)
 
 	// Wait for context cancellation
