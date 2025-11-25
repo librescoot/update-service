@@ -167,11 +167,14 @@ func (u *Updater) clearRebootingStatus() error {
 
 		// For DBC component, notify vehicle-service that update is complete
 		// (the defer that normally sends this didn't execute due to reboot)
+		// Use a timer to allow logs to flush before MDB cuts power
 		if u.config.Component == "dbc" {
-			u.logger.Printf("Sending complete-dbc command after reboot")
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("Failed to send complete-dbc command: %v", err)
-			}
+			u.logger.Printf("Scheduling complete-dbc command (5s delay)")
+			time.AfterFunc(5*time.Second, func() {
+				if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+					u.logger.Printf("Failed to send complete-dbc command: %v", err)
+				}
+			})
 		}
 	}
 
@@ -744,11 +747,14 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 		}
 
 		// For DBC updates, notify vehicle-service that update is complete
+		// Use a timer to allow logs to flush before MDB cuts power
 		if u.config.Component == "dbc" {
-			u.logger.Printf("DBC update cleanup - sending complete-dbc command")
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("Failed to send complete-dbc command: %v", err)
-			}
+			u.logger.Printf("DBC update cleanup - scheduling complete-dbc command (5s delay)")
+			time.AfterFunc(5*time.Second, func() {
+				if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+					u.logger.Printf("Failed to send complete-dbc command: %v", err)
+				}
+			})
 		}
 	}()
 
@@ -943,11 +949,14 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		}
 
 		// For DBC updates, notify vehicle-service that update is complete
+		// Use a timer to allow logs to flush before MDB cuts power
 		if u.config.Component == "dbc" {
-			u.logger.Printf("DBC update cleanup - sending complete-dbc command")
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("Failed to send complete-dbc command: %v", err)
-			}
+			u.logger.Printf("DBC update cleanup - scheduling complete-dbc command (5s delay)")
+			time.AfterFunc(5*time.Second, func() {
+				if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+					u.logger.Printf("Failed to send complete-dbc command: %v", err)
+				}
+			})
 		}
 	}()
 
