@@ -35,6 +35,9 @@ type Updater struct {
 	// Update method configuration
 	updateMethodMu sync.RWMutex
 	updateMethod   string
+
+	// Prevent concurrent update checks
+	updateCheckMu sync.Mutex
 }
 
 // New creates a new component-aware updater
@@ -80,13 +83,11 @@ func (u *Updater) CheckAndCommitPendingUpdate() error {
 
 	if needsCommit {
 		u.logger.Printf("Found pending update for %s, attempting to commit...", u.config.Component)
-		// Attempt to commit, log outcome (mender.Commit logs details), but don't let failure here stop startup.
 		if errCommit := u.mender.Commit(); errCommit != nil {
-			u.logger.Printf("Attempt to commit pending Mender update for %s during startup resulted in an error (continuing startup): %v", u.config.Component, errCommit)
+			u.logger.Printf("Commit failed (continuing startup): %v", errCommit)
 		} else {
-			u.logger.Printf("Attempt to commit pending Mender update for %s during startup completed.", u.config.Component)
+			u.logger.Printf("Commit succeeded")
 		}
-		// Regardless of commit outcome, we consider this check handled for startup purposes.
 	} else {
 		u.logger.Printf("No pending update to commit for %s", u.config.Component)
 	}
@@ -393,6 +394,13 @@ func (u *Updater) updateCheckLoop() {
 
 // checkForUpdates checks for updates and initiates the update process if updates are available
 func (u *Updater) checkForUpdates() {
+	// Prevent concurrent update checks - if an update is already in progress, skip
+	if !u.updateCheckMu.TryLock() {
+		u.logger.Printf("Update check already in progress for %s, skipping duplicate request", u.config.Component)
+		return
+	}
+	defer u.updateCheckMu.Unlock()
+
 	u.logger.Printf("Checking for updates for component %s on channel %s", u.config.Component, u.config.Channel)
 
 	// Store the timestamp of this check
@@ -713,14 +721,9 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	}
 
 	// Step 0: Check and commit any pending Mender update
-	u.logger.Printf("Checking and attempting to commit any pending Mender update for %s before starting new update to %s", u.config.Component, release.TagName)
-	// Attempt to commit. Log outcome (mender.Commit logs details), but don't let failure here stop the new update.
 	if errCommit := u.mender.Commit(); errCommit != nil {
-		u.logger.Printf("Attempt to commit pending Mender update for %s before new update to %s resulted in an error (proceeding with new update): %v", u.config.Component, release.TagName, errCommit)
-	} else {
-		u.logger.Printf("Attempt to commit pending Mender update for %s before new update to %s completed.", u.config.Component, release.TagName)
+		u.logger.Printf("Pending update commit failed (proceeding anyway): %v", errCommit)
 	}
-	u.logger.Printf("Proceeding with update to %s for component %s.", release.TagName, u.config.Component)
 
 	// Step 1: Set downloading status, update method, and add download inhibitor
 	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, version); err != nil {
@@ -816,6 +819,22 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	// Step 4: Install the update
 	if err := u.mender.Install(filePath); err != nil {
 		u.logger.Printf("Failed to install update: %v", err)
+
+		// Check if this is a corruption error (gzip decompression, checksum failure, etc.)
+		errStr := err.Error()
+		isCorruptionError := strings.Contains(errStr, "gzip decompression") ||
+			strings.Contains(errStr, "checksum") ||
+			strings.Contains(errStr, "corrupt")
+
+		if isCorruptionError {
+			u.logger.Printf("Installation failed due to file corruption, deleting corrupted file: %s", filePath)
+			if removeErr := u.mender.RemoveFile(filePath); removeErr != nil {
+				u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
+			} else {
+				u.logger.Printf("Deleted corrupted file, next update check will re-download")
+			}
+		}
+
 		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update: %v", err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
@@ -917,11 +936,8 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	u.logger.Printf("Starting delta update process for %s to version %s", u.config.Component, nextVersion)
 
 	// Step 0: Check and commit any pending Mender update
-	u.logger.Printf("Checking and attempting to commit any pending Mender update for %s before starting delta update to %s", u.config.Component, nextVersion)
 	if errCommit := u.mender.Commit(); errCommit != nil {
-		u.logger.Printf("Attempt to commit pending Mender update for %s before delta update to %s resulted in an error (proceeding with delta update): %v", u.config.Component, nextVersion, errCommit)
-	} else {
-		u.logger.Printf("Attempt to commit pending Mender update for %s before delta update to %s completed.", u.config.Component, nextVersion)
+		u.logger.Printf("Pending update commit failed (proceeding anyway): %v", errCommit)
 	}
 
 	// Step 1: Set downloading status, update method, and add download inhibitor
@@ -1043,6 +1059,22 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	// Step 4: Install the update
 	if err := u.mender.Install(newMenderPath); err != nil {
 		u.logger.Printf("Failed to install delta-generated update: %v", err)
+
+		// Check if this is a corruption error (gzip decompression, checksum failure, etc.)
+		errStr := err.Error()
+		isCorruptionError := strings.Contains(errStr, "gzip decompression") ||
+			strings.Contains(errStr, "checksum") ||
+			strings.Contains(errStr, "corrupt")
+
+		if isCorruptionError {
+			u.logger.Printf("Installation failed due to file corruption, deleting corrupted file: %s", newMenderPath)
+			if removeErr := u.mender.RemoveFile(newMenderPath); removeErr != nil {
+				u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
+			} else {
+				u.logger.Printf("Deleted corrupted file, next update check will re-download")
+			}
+		}
+
 		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install delta-generated update: %v", err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
