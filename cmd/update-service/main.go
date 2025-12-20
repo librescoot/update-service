@@ -72,28 +72,62 @@ func main() {
 	}
 	defer redisClient.Close()
 
-	// Initialize config with CLI flags and defaults
-	cfg := config.New(
-		*redisAddr,
-		*githubReleasesURL,
-		*checkInterval,
-		*component,
-		*channel,
-		dlDir,
-		*dryRun,
-	)
-
 	// Track which CLI flags were explicitly set (non-default)
 	cliChannelSet := flag.Lookup("channel").Value.String() != flag.Lookup("channel").DefValue
 	cliCheckIntervalSet := flag.Lookup("check-interval").Value.String() != flag.Lookup("check-interval").DefValue
 	cliGithubURLSet := flag.Lookup("github-releases-url").Value.String() != flag.Lookup("github-releases-url").DefValue
 	cliDryRunSet := flag.Lookup("dry-run").Value.String() != flag.Lookup("dry-run").DefValue
 
+	// Always detect channel from installed version for logging/debugging purposes
+	detectedChannel := ""
+	installedVersion, err := redisClient.GetComponentVersion(*component)
+	if err != nil {
+		logger.Printf("Warning: Failed to get installed version for channel detection: %v", err)
+	} else if installedVersion != "" {
+		detectedChannel = config.InferChannelFromVersion(installedVersion)
+		if detectedChannel != "" {
+			logger.Printf("Detected channel '%s' from installed version: %s", detectedChannel, installedVersion)
+		} else {
+			logger.Printf("Could not infer channel from installed version: %s", installedVersion)
+		}
+	} else {
+		logger.Printf("No installed version found")
+	}
+
+	// Determine the effective channel: CLI flag > Redis > detected > "nightly" default
+	effectiveChannel := *channel
+	if !cliChannelSet {
+		if detectedChannel != "" {
+			effectiveChannel = detectedChannel
+		} else {
+			effectiveChannel = "nightly"
+		}
+	}
+
+	// Initialize config with CLI flags and detected/default values
+	cfg := config.New(
+		*redisAddr,
+		*githubReleasesURL,
+		*checkInterval,
+		*component,
+		effectiveChannel,
+		dlDir,
+		*dryRun,
+	)
+
 	// Save CLI values if they were explicitly set
 	cliChannel := cfg.Channel
 	cliCheckInterval := cfg.CheckInterval
 	cliGithubURL := cfg.GitHubReleasesURL
 	cliDryRun := cfg.DryRun
+
+	// Check if channel will come from Redis settings
+	redisChannelSet := false
+	if !cliChannelSet {
+		if redisChannel, err := redisClient.HGet(config.SettingsHashKey, fmt.Sprintf("updates.%s.channel", *component)); err == nil && redisChannel != "" && config.IsValidChannel(redisChannel) {
+			redisChannelSet = true
+		}
+	}
 
 	// Load settings from Redis (will be overridden by CLI flags if they were set)
 	if err := cfg.LoadFromRedis(redisClient); err != nil {
@@ -149,7 +183,18 @@ func main() {
 	logger.Printf("  GitHub Releases URL: %s", cfg.GitHubReleasesURL)
 	logger.Printf("  Check interval: %v", cfg.CheckInterval)
 	logger.Printf("  Component: %s", cfg.Component)
-	logger.Printf("  Channel: %s", cfg.Channel)
+
+	// Log channel with source information
+	if cliChannelSet {
+		logger.Printf("  Channel: %s (explicitly set via CLI flag)", cfg.Channel)
+	} else if redisChannelSet {
+		logger.Printf("  Channel: %s (from Redis settings)", cfg.Channel)
+	} else if detectedChannel != "" {
+		logger.Printf("  Channel: %s (detected from installed version)", cfg.Channel)
+	} else {
+		logger.Printf("  Channel: %s (default)", cfg.Channel)
+	}
+
 	logger.Printf("  Download directory: %s", cfg.DownloadDir)
 	logger.Printf("  Dry-run mode: %v", cfg.DryRun)
 

@@ -119,6 +119,20 @@ func (m *Manager) CleanupFile(filePath string) error {
 	})
 }
 
+// RemoveFile removes a specific file (used for cleaning up corrupted downloads)
+func (m *Manager) RemoveFile(filePath string) error {
+	// Only remove files within our download directory
+	if !filepath.HasPrefix(filePath, m.downloader.downloadDir) {
+		return fmt.Errorf("refusing to remove file outside download directory: %s", filePath)
+	}
+
+	m.logger.Printf("Removing file: %s", filePath)
+	if err := os.Remove(filePath); err != nil {
+		return fmt.Errorf("failed to remove file %s: %w", filePath, err)
+	}
+	return nil
+}
+
 // FindMenderFileForVersion checks if a .mender file exists for the specified version
 // Returns the full path to the file and whether it exists
 func (m *Manager) FindMenderFileForVersion(version string) (string, bool) {
@@ -145,7 +159,6 @@ func (m *Manager) FindMenderFileForVersion(version string) (string, bool) {
 		}
 	}
 
-	m.logger.Printf("No mender file found for version %s", version)
 	return "", false
 }
 

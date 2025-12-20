@@ -178,28 +178,26 @@ func (c *Client) GetVariantID(component string) (string, error) {
 	return variantID, nil
 }
 
-// GetVehicleStateWithTimestamp gets vehicle state and last state change timestamp
-func (c *Client) GetVehicleStateWithTimestamp(vehicleHashKey string) (string, time.Time, error) {
-	result, err := c.client.HMGet(c.ctx, vehicleHashKey, "state", "state_timestamp").Result()
+// GetStandbyTimerStart gets the standby timer start timestamp from ota:standby-timer-start
+// Returns zero time if not set
+func (c *Client) GetStandbyTimerStart() (time.Time, error) {
+	// Get standby timer start from ota hash (Unix timestamp as string)
+	timestampStr, err := c.client.HGet(c.ctx, "ota", "standby-timer-start").Result()
 	if err != nil {
-		return "", time.Time{}, err
-	}
-
-	state := ""
-	if result[0] != nil {
-		state = result[0].(string)
-	}
-
-	var timestamp time.Time
-	if result[1] != nil {
-		if ts, ok := result[1].(string); ok && ts != "" {
-			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
-				timestamp = parsed
-			}
+		if err == redis.Nil {
+			// Not set, return zero time
+			return time.Time{}, nil
 		}
+		return time.Time{}, fmt.Errorf("failed to get standby timer start: %w", err)
 	}
 
-	return state, timestamp, nil
+	// Parse Unix timestamp (seconds since epoch)
+	var seconds int64
+	if _, err := fmt.Sscanf(timestampStr, "%d", &seconds); err != nil {
+		return time.Time{}, fmt.Errorf("failed to parse standby timer timestamp '%s': %w", timestampStr, err)
+	}
+
+	return time.Unix(seconds, 0), nil
 }
 
 // SubscribeToVehicleStateChanges subscribes to vehicle state changes

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -80,6 +81,24 @@ func IsValidChannel(channel string) bool {
 		}
 	}
 	return false
+}
+
+// InferChannelFromVersion attempts to infer the channel from a version string.
+// Returns empty string if channel cannot be determined.
+func InferChannelFromVersion(version string) string {
+	// Clean up version string (remove potential codename suffix like " (none)")
+	version = strings.Split(version, " ")[0]
+
+	if strings.HasPrefix(version, "nightly-") {
+		return "nightly"
+	}
+	if strings.HasPrefix(version, "testing-") {
+		return "testing"
+	}
+	if strings.HasPrefix(version, "v") || (len(version) > 0 && version[0] >= '0' && version[0] <= '9') {
+		return "stable"
+	}
+	return ""
 }
 
 // RedisSettings defines the interface for reading settings from Redis

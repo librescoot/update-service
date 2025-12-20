@@ -43,6 +43,48 @@ func NewDownloader(downloadDir string, logger *log.Logger) *Downloader {
 	}
 }
 
+// getExpectedFileSize makes a HEAD request to determine the expected file size
+func (d *Downloader) getExpectedFileSize(ctx context.Context, url string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("error creating HEAD request: %w", err)
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			VerifyConnection: func(cs tls.ConnectionState) error {
+				return nil // Skip certificate time validation
+			},
+		},
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   15 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("HEAD request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("unexpected status code from HEAD request: %d", resp.StatusCode)
+	}
+
+	if resp.ContentLength <= 0 {
+		return 0, fmt.Errorf("server did not provide Content-Length header")
+	}
+
+	return resp.ContentLength, nil
+}
+
 // CleanupStaleTmpFiles removes .tmp files that don't match the current download filename
 func (d *Downloader) CleanupStaleTmpFiles(currentFilename string) error {
 	currentTmpFile := currentFilename + ".tmp"
@@ -80,10 +122,32 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 	finalPath := filepath.Join(d.downloadDir, filename)
 	downloadTempPath := filepath.Join(d.downloadDir, filename+".tmp")
 
-	// Check if final file already exists first
+	// Check if final file already exists - verify it's complete before skipping download
 	if finalInfo, err := os.Stat(finalPath); err == nil {
-		d.logger.Printf("File already exists: %s (%d bytes), skipping download", finalPath, finalInfo.Size())
-		return finalPath, nil
+		// File exists, but we need to verify it's complete by checking size against server
+		expectedSize, err := d.getExpectedFileSize(ctx, url)
+		if err != nil {
+			d.logger.Printf("Warning: Failed to get expected file size from server: %v", err)
+			d.logger.Printf("File exists locally (%d bytes) but cannot verify completeness, renaming to .tmp for resume", finalInfo.Size())
+			if renameErr := os.Rename(finalPath, downloadTempPath); renameErr != nil {
+				d.logger.Printf("Warning: Failed to rename incomplete file to .tmp: %v", renameErr)
+				// Fall through to attempt download anyway
+			}
+		} else if finalInfo.Size() == expectedSize {
+			d.logger.Printf("File already exists and is complete: %s (%d bytes), skipping download", finalPath, finalInfo.Size())
+			return finalPath, nil
+		} else if finalInfo.Size() < expectedSize {
+			d.logger.Printf("File exists but incomplete (local: %d bytes, expected: %d bytes), renaming to .tmp for resume", finalInfo.Size(), expectedSize)
+			if renameErr := os.Rename(finalPath, downloadTempPath); renameErr != nil {
+				return "", fmt.Errorf("failed to rename incomplete file for resume: %w", renameErr)
+			}
+		} else {
+			// Local file is larger than expected - this is corrupted, delete it
+			d.logger.Printf("File exists but corrupted (local: %d bytes > expected: %d bytes), deleting and re-downloading", finalInfo.Size(), expectedSize)
+			if removeErr := os.Remove(finalPath); removeErr != nil {
+				return "", fmt.Errorf("failed to remove corrupted file: %w", removeErr)
+			}
+		}
 	} else if !os.IsNotExist(err) {
 		return "", fmt.Errorf("error checking final file: %w", err)
 	}

@@ -44,7 +44,6 @@ func (i *Installer) Install(filePath string) error {
 
 // Commit commits the installed update
 func (i *Installer) Commit() error {
-	i.logger.Printf("Committing update")
 	cmd := exec.Command("mender-update", "commit")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
