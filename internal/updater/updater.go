@@ -822,9 +822,10 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 
 		// Check if this is a corruption error (gzip decompression, checksum failure, etc.)
 		errStr := err.Error()
-		isCorruptionError := strings.Contains(errStr, "gzip decompression") ||
+		isCorruptionError := strings.Contains(errStr, "gzip") ||
 			strings.Contains(errStr, "checksum") ||
-			strings.Contains(errStr, "corrupt")
+			strings.Contains(errStr, "corrupt") ||
+			strings.Contains(errStr, "truncated")
 
 		if isCorruptionError {
 			u.logger.Printf("Installation failed due to file corruption, deleting corrupted file: %s", filePath)
@@ -1062,9 +1063,10 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 		// Check if this is a corruption error (gzip decompression, checksum failure, etc.)
 		errStr := err.Error()
-		isCorruptionError := strings.Contains(errStr, "gzip decompression") ||
+		isCorruptionError := strings.Contains(errStr, "gzip") ||
 			strings.Contains(errStr, "checksum") ||
-			strings.Contains(errStr, "corrupt")
+			strings.Contains(errStr, "corrupt") ||
+			strings.Contains(errStr, "truncated")
 
 		if isCorruptionError {
 			u.logger.Printf("Installation failed due to file corruption, deleting corrupted file: %s", newMenderPath)
