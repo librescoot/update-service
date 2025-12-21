@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,8 +45,11 @@ type Updater struct {
 func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inhibitorClient *inhibitor.Client, powerClient *power.Client, logger *log.Logger) *Updater {
 	updaterCtx, cancel := context.WithCancel(ctx)
 
-	// Create download directory in /data/ota/{component}
-	downloadDir := filepath.Join("/data/ota", cfg.Component)
+	// Determine download directory
+	downloadDir := cfg.DownloadDir
+	if downloadDir == "" {
+		downloadDir = filepath.Join("/data/ota", cfg.Component)
+	}
 
 	u := &Updater{
 		config:    cfg,
@@ -168,14 +172,11 @@ func (u *Updater) clearRebootingStatus() error {
 
 		// For DBC component, notify vehicle-service that update is complete
 		// (the defer that normally sends this didn't execute due to reboot)
-		// Use a timer to allow logs to flush before MDB cuts power
 		if u.config.Component == "dbc" {
-			u.logger.Printf("Scheduling complete-dbc command (5s delay)")
-			time.AfterFunc(5*time.Second, func() {
-				if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-					u.logger.Printf("Failed to send complete-dbc command: %v", err)
-				}
-			})
+			u.logger.Printf("Sending complete-dbc command after reboot")
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
+			}
 		}
 	}
 
@@ -208,7 +209,7 @@ func (u *Updater) initializeRedisKeys() error {
 
 // checkInitialStandbyState checks the initial vehicle state on startup and sets standby timestamp
 func (u *Updater) checkInitialStandbyState() {
-	currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+	currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
 	if err != nil {
 		u.logger.Printf("Failed to get initial vehicle state: %v", err)
 		return
@@ -217,16 +218,10 @@ func (u *Updater) checkInitialStandbyState() {
 	u.logger.Printf("Checking initial vehicle state for MDB reboot optimization...")
 
 	if currentState == "stand-by" {
-		standbyTimerStart, err := u.redis.GetStandbyTimerStart()
-		if err != nil {
-			u.logger.Printf("Failed to get standby timer start: %v", err)
-			return
-		}
-
-		if !standbyTimerStart.IsZero() {
-			u.standbyStartTime = standbyTimerStart
-			elapsed := time.Since(standbyTimerStart)
-			u.logger.Printf("Vehicle in 'stand-by' since %s (elapsed: %v) - MDB reboot will use this timestamp", standbyTimerStart.Format(time.RFC3339), elapsed)
+		if !stateTimestamp.IsZero() {
+			u.standbyStartTime = stateTimestamp
+			elapsed := time.Since(stateTimestamp)
+			u.logger.Printf("Vehicle in 'stand-by' since %s (elapsed: %v) - MDB reboot will use this timestamp", stateTimestamp.Format(time.RFC3339), elapsed)
 		} else {
 			u.standbyStartTime = time.Now()
 			u.logger.Printf("Vehicle in 'stand-by' with no timestamp - using current time for MDB reboot tracking")
@@ -242,7 +237,7 @@ func (u *Updater) checkInitialStandbyState() {
 // delta patch application which can take 20+ minutes during which the vehicle state
 // may have changed multiple times.
 func (u *Updater) revalidateStandbyState() {
-	currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+	currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
 	if err != nil {
 		u.logger.Printf("Failed to get vehicle state after long-running operation: %v (clearing standby timestamp)", err)
 		u.standbyStartTime = time.Time{} // Clear on error to be safe
@@ -250,17 +245,10 @@ func (u *Updater) revalidateStandbyState() {
 	}
 
 	if currentState == "stand-by" {
-		standbyTimerStart, err := u.redis.GetStandbyTimerStart()
-		if err != nil {
-			u.logger.Printf("Failed to get standby timer start: %v (clearing standby timestamp)", err)
-			u.standbyStartTime = time.Time{}
-			return
-		}
-
-		if !standbyTimerStart.IsZero() {
-			u.standbyStartTime = standbyTimerStart
-			elapsed := time.Since(standbyTimerStart)
-			u.logger.Printf("Vehicle in 'stand-by' after operation completion (timestamp: %s, elapsed: %v) - standby timer reset", standbyTimerStart.Format(time.RFC3339), elapsed)
+		if !stateTimestamp.IsZero() {
+			u.standbyStartTime = stateTimestamp
+			elapsed := time.Since(stateTimestamp)
+			u.logger.Printf("Vehicle in 'stand-by' after operation completion (timestamp: %s, elapsed: %v) - standby timer reset", stateTimestamp.Format(time.RFC3339), elapsed)
 		} else {
 			u.standbyStartTime = time.Now()
 			u.logger.Printf("Vehicle in 'stand-by' after operation completion (no timestamp) - using current time for standby tracking")
@@ -763,14 +751,11 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 		}
 
 		// For DBC updates, notify vehicle-service that update is complete
-		// Use a timer to allow logs to flush before MDB cuts power
 		if u.config.Component == "dbc" {
-			u.logger.Printf("DBC update cleanup - scheduling complete-dbc command (5s delay)")
-			time.AfterFunc(5*time.Second, func() {
-				if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-					u.logger.Printf("Failed to send complete-dbc command: %v", err)
-				}
-			})
+			u.logger.Printf("DBC update cleanup - sending complete-dbc command")
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
+			}
 		}
 	}()
 
@@ -890,81 +875,69 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	}
 }
 
-// performDeltaUpdate attempts to perform a delta update to the next version
-// Falls back to full update if delta update is not possible
+// performDeltaUpdate attempts to apply a chain of delta updates to reach the latest version
 func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string) {
-	u.logger.Printf("Attempting delta update for %s from version %s", u.config.Component, currentVersion)
+	// Step 1: Build the delta chain
+	deltaChain, err := u.buildDeltaChain(releases, currentVersion, u.config.Channel, variantID)
+	if err != nil {
+		u.logger.Printf("Failed to build delta chain: %v", err)
 
-	// Find the next release after the current version
-	nextRelease, found := u.findNextRelease(releases, currentVersion, u.config.Channel, variantID)
-	if !found {
-		u.logger.Printf("No newer version available for delta update, component is up to date")
-		return
-	}
-
-	nextVersion := strings.ToLower(nextRelease.TagName)
-
-	// Check if we have the .mender file for the current version
-	_, hasMenderFile := u.mender.FindMenderFileForVersion(currentVersion)
-	if !hasMenderFile {
-		u.logger.Printf("No .mender file found for current version %s, falling back to full update", currentVersion)
-		// Fall back to full update with latest version
+		// Fall back to full update
 		latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
 		if found {
 			menderURL := u.findMenderAsset(latestRelease, variantID)
 			if menderURL != "" {
+				u.logger.Printf("Falling back to full update with latest version")
 				u.performUpdate(latestRelease, menderURL)
 			}
 		}
 		return
 	}
 
-	// Look for a delta asset in the next release
-	deltaURL := u.findDeltaAsset(nextRelease, variantID)
-	if deltaURL == "" {
-		u.logger.Printf("No delta asset found in release %s, falling back to full update", nextRelease.TagName)
-		// Fall back to full update with latest version
-		latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
-		if found {
-			menderURL := u.findMenderAsset(latestRelease, variantID)
-			if menderURL != "" {
-				u.performUpdate(latestRelease, menderURL)
-			}
-		}
+	if deltaChain == nil || len(deltaChain) == 0 {
+		u.logger.Printf("Already at latest version %s", currentVersion)
 		return
 	}
 
-	u.logger.Printf("Starting delta update process for %s to version %s", u.config.Component, nextVersion)
+	// Get latest version from chain
+	latestVersion := strings.ToLower(deltaChain[len(deltaChain)-1].TagName)
+
+	// Log the delta chain
+	u.logger.Printf("Built delta chain with %d updates: %s -> %s", len(deltaChain), currentVersion, latestVersion)
+	for i, release := range deltaChain {
+		u.logger.Printf("  Delta %d/%d: %s", i+1, len(deltaChain), release.TagName)
+	}
+	u.logger.Printf("Starting multi-delta update process for %s: %s -> %s (%d deltas)", u.config.Component, currentVersion, latestVersion, len(deltaChain))
 
 	// Step 0: Check and commit any pending Mender update
-	if errCommit := u.mender.Commit(); errCommit != nil {
-		u.logger.Printf("Pending update commit failed (proceeding anyway): %v", errCommit)
+	if err := u.mender.Commit(); err != nil {
+		u.logger.Printf("Pending update commit failed (proceeding anyway): %v", err)
 	}
 
-	// Step 1: Set downloading status, update method, and add download inhibitor
-	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, nextVersion); err != nil {
+	// Set status
+	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, latestVersion); err != nil {
 		u.logger.Printf("Failed to set downloading status: %v", err)
-		return
 	}
 
-	// Set update method to delta
+	// Set update method
 	if err := u.status.SetUpdateMethod(u.ctx, "delta"); err != nil {
 		u.logger.Printf("Failed to set update method: %v", err)
 	}
 
 	// For DBC updates, notify vehicle-service to keep dashboard power on
 	if u.config.Component == "dbc" {
-		u.logger.Printf("Starting DBC delta update - sending start-dbc command")
+		u.logger.Printf("Starting DBC multi-delta update - sending start-dbc command")
 		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
 			u.logger.Printf("Failed to send start-dbc command: %v", err)
 		}
 	}
 
+	// Add power inhibit
 	if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
 		u.logger.Printf("Failed to add download inhibit: %v", err)
 	}
 
-	// Request ondemand CPU governor for optimal download performance
+	// Request ondemand CPU governor
 	if err := u.power.RequestOndemandGovernor(); err != nil {
 		u.logger.Printf("Failed to request ondemand governor: %v", err)
 	}
@@ -979,68 +952,127 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		}
 
 		// For DBC updates, notify vehicle-service that update is complete
-		// Use a timer to allow logs to flush before MDB cuts power
 		if u.config.Component == "dbc" {
-			u.logger.Printf("DBC update cleanup - scheduling complete-dbc command (5s delay)")
-			time.AfterFunc(5*time.Second, func() {
-				if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-					u.logger.Printf("Failed to send complete-dbc command: %v", err)
-				}
-			})
+			u.logger.Printf("DBC update cleanup - sending complete-dbc command")
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
+			}
 		}
 	}()
 
-	// Step 2: Apply delta update
+	// Progress callbacks
 	downloadProgressCallback := func(downloaded, total int64) {
 		if err := u.status.SetDownloadProgress(u.ctx, downloaded, total); err != nil {
-			u.logger.Printf("Failed to update download progress: %v", err)
+			u.logger.Printf("Failed to set download progress: %v", err)
 		}
 	}
 
 	installProgressCallback := func(percent int) {
 		if err := u.status.SetInstallProgress(u.ctx, percent); err != nil {
-			u.logger.Printf("Failed to update install progress: %v", err)
+			u.logger.Printf("Failed to set install progress: %v", err)
 		}
 	}
 
-	newMenderPath, err := u.mender.ApplyDeltaUpdate(u.ctx, deltaURL, currentVersion, downloadProgressCallback, installProgressCallback)
-	if err != nil {
-		u.logger.Printf("Delta update failed: %v, falling back to full update", err)
-		if err := u.status.SetError(u.ctx, "delta-failed", fmt.Sprintf("Delta update failed: %v", err)); err != nil {
-			u.logger.Printf("Failed to set error status: %v", err)
-		}
+	// Step 2: Apply all deltas in the chain sequentially
+	var finalMenderPath string
+	workingVersion := currentVersion
 
-		// Clear error status before attempting full update
-		time.Sleep(2 * time.Second) // Brief pause before retry
-		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
-			u.logger.Printf("Failed to clear status before fallback: %v", err)
-		}
+	for deltaIndex, release := range deltaChain {
+		deltaNum := deltaIndex + 1
+		u.logger.Printf("=== Applying delta %d/%d: %s ===", deltaNum, len(deltaChain), release.TagName)
 
-		// Fall back to full update with latest version
-		latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
-		if found {
-			menderURL := u.findMenderAsset(latestRelease, variantID)
-			if menderURL != "" {
-				u.logger.Printf("Falling back to full update with latest version")
-				u.performUpdate(latestRelease, menderURL)
+		// Find delta URL for this release
+		deltaURL := ""
+		for _, asset := range release.Assets {
+			if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
+				u.logger.Printf("Found delta asset: %s", asset.Name)
+				deltaURL = asset.BrowserDownloadURL
+				break
 			}
 		}
-		return
+
+		if deltaURL == "" {
+			u.logger.Printf("No delta asset found for %s, cannot continue multi-delta chain", release.TagName)
+			if err := u.status.SetError(u.ctx, "delta-failed", fmt.Sprintf("Delta %d/%d failed: no delta asset found", deltaNum, len(deltaChain))); err != nil {
+				u.logger.Printf("Failed to set error status: %v", err)
+			}
+
+			// Clear error and fall back to full update
+			time.Sleep(2 * time.Second)
+			if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+				u.logger.Printf("Failed to clear status before fallback: %v", err)
+			}
+
+			latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
+			if found {
+				menderURL := u.findMenderAsset(latestRelease, variantID)
+				if menderURL != "" {
+					u.logger.Printf("Falling back to full update with latest version")
+					u.performUpdate(latestRelease, menderURL)
+				}
+			}
+			return
+		}
+
+		targetVersion := strings.ToLower(release.TagName)
+
+		u.logger.Printf("Downloading and applying delta %d/%d: %s -> %s", deltaNum, len(deltaChain), workingVersion, targetVersion)
+
+		// Apply this delta
+		newMenderPath, err := u.mender.ApplyDeltaUpdate(u.ctx, deltaURL, workingVersion, downloadProgressCallback, installProgressCallback)
+		if err != nil {
+			u.logger.Printf("Delta %d/%d failed: %v", deltaNum, len(deltaChain), err)
+			if err := u.status.SetError(u.ctx, "delta-failed", fmt.Sprintf("Delta %d/%d failed: %v", deltaNum, len(deltaChain), err)); err != nil {
+				u.logger.Printf("Failed to set error status: %v", err)
+			}
+
+			// Clear error and fall back to full update
+			time.Sleep(2 * time.Second)
+			if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+				u.logger.Printf("Failed to clear status before fallback: %v", err)
+			}
+
+			latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
+			if found {
+				menderURL := u.findMenderAsset(latestRelease, variantID)
+				if menderURL != "" {
+					u.logger.Printf("Falling back to full update with latest version")
+					u.performUpdate(latestRelease, menderURL)
+				}
+			}
+			return
+		}
+
+		u.logger.Printf("Delta %d/%d applied successfully: %s", deltaNum, len(deltaChain), newMenderPath)
+
+		// Clear progress for this delta
+		if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
+			u.logger.Printf("Failed to clear download progress: %v", err)
+		}
+		if err := u.status.ClearInstallProgress(u.ctx); err != nil {
+			u.logger.Printf("Failed to clear install progress: %v", err)
+		}
+
+		// Update working version and final path for next iteration
+		workingVersion = targetVersion
+		finalMenderPath = newMenderPath
 	}
 
-	// Clear download and install progress after successful delta application
-	if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
-		u.logger.Printf("Failed to clear download progress: %v", err)
-	}
-	if err := u.status.ClearInstallProgress(u.ctx); err != nil {
-		u.logger.Printf("Failed to clear install progress: %v", err)
-	}
-
-	u.logger.Printf("Delta update successful, new mender file created: %s", newMenderPath)
+	u.logger.Printf("All deltas applied successfully, final mender file: %s", finalMenderPath)
 
 	// Re-validate vehicle state after long-running delta patch operation
 	// This ensures the 3-minute standby requirement starts fresh from the current state
 	u.revalidateStandbyState()
+
+	// If dry-run mode, stop here - don't install or reboot
+	if u.config.DryRun {
+		u.logger.Printf("DRY-RUN: Multi-delta update complete. Final mender file ready at: %s", finalMenderPath)
+		u.logger.Printf("DRY-RUN: Skipping mender-update install and reboot")
+		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+			u.logger.Printf("Failed to set idle status in dry run: %v", err)
+		}
+		return
+	}
 
 	// Step 3: Set installing status and add install inhibitor
 	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
@@ -1058,7 +1090,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 
 	// Step 4: Install the update
-	if err := u.mender.Install(newMenderPath); err != nil {
+	if err := u.mender.Install(finalMenderPath); err != nil {
 		u.logger.Printf("Failed to install delta-generated update: %v", err)
 
 		// Check if this is a corruption error (gzip decompression, checksum failure, etc.)
@@ -1069,8 +1101,8 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			strings.Contains(errStr, "truncated")
 
 		if isCorruptionError {
-			u.logger.Printf("Installation failed due to file corruption, deleting corrupted file: %s", newMenderPath)
-			if removeErr := u.mender.RemoveFile(newMenderPath); removeErr != nil {
+			u.logger.Printf("Installation failed due to file corruption, deleting corrupted file: %s", finalMenderPath)
+			if removeErr := u.mender.RemoveFile(finalMenderPath); removeErr != nil {
 				u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
 			} else {
 				u.logger.Printf("Deleted corrupted file, next update check will re-download")
@@ -1095,7 +1127,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		u.logger.Printf("Failed to remove install inhibit: %v", err)
 	}
 
-	// Step 6: Trigger reboot (same as full update)
+	// Step 6: Trigger reboot
 	u.logger.Printf("Delta update installation complete, system will reboot to apply changes")
 
 	// Trigger reboot
@@ -1298,22 +1330,16 @@ func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration)
 			return u.ctx.Err()
 		case <-stateChanges:
 			// State changed, check current state
-			currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+			currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
 			if err != nil {
 				u.logger.Printf("Failed to get vehicle state after change: %v. Continuing.", err)
 				continue
 			}
 
 			if currentState == "stand-by" {
-				// Get standby timer start
-				standbyTimerStart, err := u.redis.GetStandbyTimerStart()
-				if err != nil {
-					u.logger.Printf("Failed to get standby timer start: %v. Continuing.", err)
-					continue
-				}
-
-				if !standbyTimerStart.IsZero() {
-					u.standbyStartTime = standbyTimerStart
+				// Set standby timestamp
+				if !stateTimestamp.IsZero() {
+					u.standbyStartTime = stateTimestamp
 				} else {
 					u.standbyStartTime = time.Now()
 				}
@@ -1420,46 +1446,33 @@ func (u *Updater) findNextRelease(releases []Release, currentVersion, channel, v
 		}
 	}
 
-	// Sort releases by normalized version (timestamp)
+	// Sort releases by tag name (which includes the timestamp)
+	// Tags are in format: channel-YYYYMMDDTHHMMSS
+	// Use case-insensitive comparison to handle both 't' and 'T' separators
 	for i := 0; i < len(candidateReleases)-1; i++ {
 		for j := i + 1; j < len(candidateReleases); j++ {
-			v1 := u.normalizeVersion(candidateReleases[i].TagName, channel)
-			v2 := u.normalizeVersion(candidateReleases[j].TagName, channel)
-			if v1 > v2 {
+			if strings.ToLower(candidateReleases[i].TagName) > strings.ToLower(candidateReleases[j].TagName) {
 				candidateReleases[i], candidateReleases[j] = candidateReleases[j], candidateReleases[i]
 			}
 		}
 	}
 
 	// Find the first release that's newer than the current version
-	normalizedCurrent := u.normalizeVersion(currentVersion, channel)
+	// Normalize currentTag to lowercase for consistent comparison
+	currentTag := strings.ToLower(currentVersion)
+	if !strings.HasPrefix(currentTag, channel+"-") {
+		currentTag = strings.ToLower(channel + "-" + currentVersion)
+	}
 
 	for _, release := range candidateReleases {
-		normalizedRelease := u.normalizeVersion(release.TagName, channel)
-		if normalizedRelease > normalizedCurrent {
-			u.logger.Printf("Found next release after %s (norm: %s): %s (norm: %s)", currentVersion, normalizedCurrent, release.TagName, normalizedRelease)
+		if strings.ToLower(release.TagName) > currentTag {
+			u.logger.Printf("Found next release after %s: %s", currentTag, release.TagName)
 			return release, true
 		}
 	}
 
-	u.logger.Printf("No release found after current version %s (norm: %s)", currentVersion, normalizedCurrent)
+	u.logger.Printf("No release found after current version %s", currentTag)
 	return Release{}, false
-}
-
-// normalizeVersion strips the channel prefix (and potential double prefixes) from the version string
-// to return just the timestamp/version part for comparison.
-// e.g. "nightly-2025..." -> "2025..."
-// e.g. "nightly-nightly-2025..." -> "2025..."
-func (u *Updater) normalizeVersion(version, channel string) string {
-	normalized := strings.ToLower(version)
-	prefix := strings.ToLower(channel) + "-"
-
-	// repeatedly strip the prefix to handle cases like "nightly-nightly-..."
-	for strings.HasPrefix(normalized, prefix) {
-		normalized = strings.TrimPrefix(normalized, prefix)
-	}
-
-	return normalized
 }
 
 // findDeltaAsset finds a delta asset in a release for the specified variant
@@ -1485,4 +1498,62 @@ func (u *Updater) findMenderAsset(release Release, variantID string) string {
 		}
 	}
 	return ""
+}
+
+// buildDeltaChain builds a complete chain of deltas from currentVersion to the latest release
+// Returns nil if already at latest version, or error if chain cannot be built
+func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, variantID string) ([]Release, error) {
+	// Filter and sort releases for our channel and variant
+	var candidateReleases []Release
+	for _, release := range releases {
+		// Check if the release is for the specified channel
+		if !strings.HasPrefix(release.TagName, channel+"-") {
+			continue
+		}
+
+		// Check if the release has delta assets for the specified variant
+		hasDelta := false
+		for _, asset := range release.Assets {
+			if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
+				hasDelta = true
+				break
+			}
+		}
+
+		if hasDelta {
+			candidateReleases = append(candidateReleases, release)
+		}
+	}
+
+	// Sort releases by tag name (ascending chronological order)
+	sort.Slice(candidateReleases, func(i, j int) bool {
+		return strings.ToLower(candidateReleases[i].TagName) < strings.ToLower(candidateReleases[j].TagName)
+	})
+
+	// Find where we are in the chain
+	currentTag := strings.ToLower(currentVersion)
+	if !strings.HasPrefix(currentTag, channel+"-") {
+		currentTag = strings.ToLower(channel + "-" + currentVersion)
+	}
+	var deltaChain []Release
+	foundCurrent := false
+
+	for _, release := range candidateReleases {
+		if strings.ToLower(release.TagName) == currentTag {
+			foundCurrent = true
+			continue
+		}
+
+		// Collect all releases after current version
+		if foundCurrent && strings.ToLower(release.TagName) > currentTag {
+			deltaChain = append(deltaChain, release)
+		}
+	}
+
+	// If no deltas needed, return nil (already at latest)
+	if len(deltaChain) == 0 {
+		return nil, nil
+	}
+
+	return deltaChain, nil
 }

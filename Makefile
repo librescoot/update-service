@@ -1,4 +1,5 @@
-BIN := update-service
+BINARY_NAME := update-service
+BUILD_DIR := bin
 GIT_REV := $(shell git describe --tags --always 2>/dev/null)
 ifdef GIT_REV
 LDFLAGS := -X main.version=$(GIT_REV)
@@ -8,64 +9,43 @@ endif
 BUILDFLAGS := -tags netgo,osusergo
 MAIN := ./cmd/update-service
 
-.PHONY: build host arm amd64 dist clean test fmt tidy all run run-mdb run-dbc run-dev install install-template
+.PHONY: build build-arm build-host dist clean test fmt deps lint run run-mdb run-dbc run-dev
 
-build: host
-host:
-	go build -ldflags "$(LDFLAGS)" -o ${BIN}-host ${MAIN}
+build:
+	mkdir -p $(BUILD_DIR)
+	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS) -s -w" $(BUILDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(MAIN)
 
-amd64:
-	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" $(BUILDFLAGS) -o ${BIN}-amd64 ${MAIN}
+build-arm: build
 
-arm:
-	GOOS=linux GOARCH=arm GOARM=7 go build -ldflags "$(LDFLAGS)" $(BUILDFLAGS) -o ${BIN}-arm ${MAIN}
+build-host:
+	mkdir -p $(BUILD_DIR)
+	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME) $(MAIN)
 
-dist:
-	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS) -s -w" $(BUILDFLAGS) -o ${BIN}-arm-dist ${MAIN}
+dist: build
 
 clean:
-	rm -f ${BIN} ${BIN}-host ${BIN}-amd64 ${BIN}-arm ${BIN}-arm-dist
+	rm -rf $(BUILD_DIR)
 
-# Run the service
-run: host
-	./${BIN}-host
-
-# Run with component flag for new architecture (MDB)
-run-mdb: host
-	./${BIN}-host --component=mdb --channel=nightly --dry-run
-
-# Run with component flag for new architecture (DBC)  
-run-dbc: host
-	./${BIN}-host --component=dbc --channel=nightly --dry-run
-
-# Run with shorter check interval for development (legacy)
-run-dev: host
-	./${BIN}-host -check-interval=1m -default-channel=nightly -dry-run
-
-# Run tests
 test:
 	go test -v ./...
 
-# Format code
 fmt:
 	go fmt ./...
 
-# Run go mod tidy
-tidy:
-	go mod tidy
+deps:
+	go mod download && go mod tidy
 
-# Install binary and systemd template (requires sudo)
-install: dist
-	sudo cp ${BIN}-arm-dist /usr/bin/update-service
-	sudo chmod +x /usr/bin/update-service
+lint:
+	golangci-lint run
 
-# Install systemd template (requires sudo)
-install-template:
-	sudo cp librescoot-update@.service /etc/systemd/system/
-	sudo systemctl daemon-reload
+run: build-host
+	./$(BUILD_DIR)/$(BINARY_NAME)
 
-# Install everything (binary + template)
-install-all: install install-template
+run-mdb: build-host
+	./$(BUILD_DIR)/$(BINARY_NAME) --component=mdb --channel=nightly --dry-run
 
-# All-in-one setup
-all: tidy fmt test arm amd64
+run-dbc: build-host
+	./$(BUILD_DIR)/$(BINARY_NAME) --component=dbc --channel=nightly --dry-run
+
+run-dev: build-host
+	./$(BUILD_DIR)/$(BINARY_NAME) -check-interval=1m -default-channel=nightly -dry-run

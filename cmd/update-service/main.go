@@ -23,6 +23,7 @@ var (
 	checkInterval     = flag.Duration("check-interval", 6*time.Hour, "Interval between update checks (use 0 or 'never' to disable)")
 	component         = flag.String("component", "", "Component to manage updates for (mdb or dbc)")
 	channel           = flag.String("channel", "nightly", "Update channel (stable, testing, nightly)")
+	downloadDir       = flag.String("download-dir", "", "Download directory for OTA files (default: /data/ota/{component})")
 	dryRun            = flag.Bool("dry-run", false, "If true, don't actually reboot, just notify")
 )
 
@@ -35,6 +36,12 @@ func main() {
 	}
 	if *component != "mdb" && *component != "dbc" {
 		log.Fatalf("Invalid component '%s'. Must be 'mdb' or 'dbc'", *component)
+	}
+
+	// Set default download directory if not specified
+	dlDir := *downloadDir
+	if dlDir == "" {
+		dlDir = "/data/ota/" + *component
 	}
 
 	// Set up logger
@@ -105,6 +112,7 @@ func main() {
 		*checkInterval,
 		*component,
 		effectiveChannel,
+		dlDir,
 		*dryRun,
 	)
 
@@ -188,6 +196,7 @@ func main() {
 		logger.Printf("  Channel: %s (default)", cfg.Channel)
 	}
 
+	logger.Printf("  Download directory: %s", cfg.DownloadDir)
 	logger.Printf("  Dry-run mode: %v", cfg.DryRun)
 
 	// Wait for context cancellation

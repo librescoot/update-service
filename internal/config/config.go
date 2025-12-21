@@ -30,6 +30,9 @@ type Config struct {
 	Component string // "mdb" or "dbc" - which component this instance manages (CLI-only, never from Redis)
 	Channel   string // "stable", "testing", "nightly"
 
+	// Download directory (CLI-only, never from Redis)
+	DownloadDir string // Directory where OTA files are downloaded (default: /data/ota/{component})
+
 	// Update constraints
 	MdbRebootCheckInterval time.Duration // How often to check if MDB can be rebooted
 	UpdateRetryInterval    time.Duration // How often to retry updates if conditions aren't met
@@ -45,6 +48,7 @@ func New(
 	checkInterval time.Duration,
 	component string,
 	channel string,
+	downloadDir string,
 	dryRun bool,
 ) *Config {
 	return &Config{
@@ -53,6 +57,7 @@ func New(
 		CheckInterval:     checkInterval,
 		Component:         component,
 		Channel:           channel,
+		DownloadDir:       downloadDir,
 		// Default values for update constraints
 		MdbRebootCheckInterval: 5 * time.Minute,
 		UpdateRetryInterval:    15 * time.Minute,
