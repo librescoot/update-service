@@ -76,36 +76,77 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 	return u
 }
 
-// CheckAndCommitPendingUpdate checks for and commits any pending updates on startup
-func (u *Updater) CheckAndCommitPendingUpdate() error {
-	u.logger.Printf("Checking for pending updates to commit for component %s", u.config.Component)
+// CheckAndCommitPendingUpdate checks mender state and commits if ready.
+// Returns true if an update is waiting for reboot.
+func (u *Updater) CheckAndCommitPendingUpdate() (needsReboot bool, err error) {
+	u.logger.Printf("Checking mender update state for %s", u.config.Component)
 
-	needsCommit, err := u.mender.NeedsCommit()
+	// Get expected version from Redis (set during download/install)
+	expectedVersion, err := u.redis.GetTargetVersion(u.config.Component)
+	if err != nil || expectedVersion == "" {
+		// No expected version tracked - just try to commit anything pending
+		u.logger.Printf("No target version in Redis, attempting blind commit")
+		return u.tryBlindCommit()
+	}
+
+	state, err := u.mender.CheckUpdateState(expectedVersion)
 	if err != nil {
-		return fmt.Errorf("failed to check if commit is needed: %w", err)
+		u.logger.Printf("Failed to check update state: %v", err)
+		return false, nil // Don't fail startup
 	}
 
-	if needsCommit {
-		u.logger.Printf("Found pending update for %s, attempting to commit...", u.config.Component)
-		if errCommit := u.mender.Commit(); errCommit != nil {
-			u.logger.Printf("Commit failed (continuing startup): %v", errCommit)
-		} else {
-			u.logger.Printf("Commit succeeded")
-		}
-	} else {
-		u.logger.Printf("No pending update to commit for %s", u.config.Component)
+	switch state {
+	case mender.StateCommitted:
+		u.logger.Printf("Update to %s committed successfully", expectedVersion)
+		return false, nil
+	case mender.StateNoUpdate:
+		u.logger.Printf("No update in progress")
+		return false, nil
+	case mender.StateNeedsReboot:
+		u.logger.Printf("Update installed, waiting for reboot")
+		return true, nil
+	case mender.StateInconsistent:
+		u.logger.Printf("WARNING: System in inconsistent state after failed update")
+		return false, nil
 	}
 
-	return nil
+	return false, nil
 }
 
-// Start starts the updater
-func (u *Updater) Start() error {
+// tryBlindCommit attempts to commit without knowing the expected version
+func (u *Updater) tryBlindCommit() (needsReboot bool, err error) {
+	result := u.mender.CommitWithResult()
+
+	if result.Success {
+		u.logger.Printf("Commit succeeded")
+		return false, nil
+	}
+
+	// Check exit code to determine state
+	switch result.ExitCode {
+	case 2:
+		// No update in progress
+		u.logger.Printf("No update in progress")
+		return false, nil
+	case 1:
+		// Update waiting for reboot
+		u.logger.Printf("Update waiting for reboot: %s", result.Error)
+		return true, nil
+	default:
+		// Other error
+		u.logger.Printf("Commit failed (exit %d): %s", result.ExitCode, result.Error)
+		return false, nil
+	}
+}
+
+// Start starts the updater. The menderNeedsReboot parameter indicates if
+// CheckAndCommitPendingUpdate detected that mender has an update waiting for reboot.
+func (u *Updater) Start(menderNeedsReboot bool) error {
 	u.logger.Printf("Starting component-aware updater for %s", u.config.Component)
 
-	// Clear rebooting status if present (reboot completed or failed)
-	if err := u.clearRebootingStatus(); err != nil {
-		u.logger.Printf("Warning: Failed to clear rebooting status: %v", err)
+	// Recover from any stuck status on startup
+	if err := u.recoverFromStuckState(menderNeedsReboot); err != nil {
+		u.logger.Printf("Warning: Failed to recover from stuck state: %v", err)
 	}
 
 	// Initialize Redis keys if they don't exist
@@ -156,19 +197,56 @@ func (u *Updater) setUpdateMethod(method string) {
 	}
 }
 
-// clearRebootingStatus clears the rebooting status if present on startup
-func (u *Updater) clearRebootingStatus() error {
+// recoverFromStuckState recovers from any stuck status on startup.
+// The menderNeedsReboot parameter indicates if mender has an update waiting for reboot.
+func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 	currentStatus, err := u.status.GetStatus(u.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get current status: %w", err)
 	}
 
-	if currentStatus == status.StatusRebooting {
-		u.logger.Printf("Found rebooting status for %s on startup, clearing (reboot completed or failed)", u.config.Component)
+	// Nothing to recover if already idle or empty
+	if currentStatus == status.StatusIdle || currentStatus == "" {
+		return nil
+	}
+
+	u.logger.Printf("Found %s status for %s on startup", currentStatus, u.config.Component)
+
+	switch currentStatus {
+	case status.StatusDownloading:
+		// Check if file exists for logging purposes
+		targetVersion, _ := u.redis.GetTargetVersion(u.config.Component)
+		if targetVersion != "" {
+			if filePath, exists := u.mender.FindMenderFileForVersion(targetVersion); exists {
+				u.logger.Printf("Found complete file %s, next check will resume install", filePath)
+			}
+		}
+		u.logger.Printf("Clearing downloading status")
+		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+			return fmt.Errorf("failed to clear downloading status: %w", err)
+		}
+
+	case status.StatusInstalling:
+		if menderNeedsReboot {
+			// Mender install completed but needs reboot - transition to rebooting
+			u.logger.Printf("Mender install complete, setting status to rebooting")
+			if err := u.status.SetStatus(u.ctx, status.StatusRebooting); err != nil {
+				return fmt.Errorf("failed to set rebooting status: %w", err)
+			}
+		} else {
+			// Mender install failed or was interrupted
+			u.logger.Printf("Clearing installing status (mender has no pending update)")
+			if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+				return fmt.Errorf("failed to clear installing status: %w", err)
+			}
+		}
+
+	case status.StatusRebooting:
+		// Reboot happened - commit was already attempted by CheckAndCommitPendingUpdate
+		u.logger.Printf("Clearing rebooting status (reboot completed)")
 		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
 			return fmt.Errorf("failed to clear rebooting status: %w", err)
 		}
-		u.logger.Printf("Cleared rebooting status for %s", u.config.Component)
 
 		// For DBC component, notify vehicle-service that update is complete
 		// (the defer that normally sends this didn't execute due to reboot)
@@ -177,6 +255,12 @@ func (u *Updater) clearRebootingStatus() error {
 			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
 				u.logger.Printf("Failed to send complete-dbc command: %v", err)
 			}
+		}
+
+	case status.StatusError:
+		u.logger.Printf("Clearing error status to allow retry")
+		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+			return fmt.Errorf("failed to clear error status: %w", err)
 		}
 	}
 
@@ -365,8 +449,8 @@ func (u *Updater) checkForUpdates() {
 		return
 	}
 
-	if currentStatus == status.StatusRebooting {
-		u.logger.Printf("Component %s is in rebooting state, deferring update check until reboot completes", u.config.Component)
+	if currentStatus != status.StatusIdle && currentStatus != "" {
+		u.logger.Printf("Component %s is in %s state, deferring update check", u.config.Component, currentStatus)
 		return
 	}
 

@@ -62,9 +62,24 @@ func (m *Manager) Commit() error {
 	return m.installer.Commit()
 }
 
+// CommitWithResult commits the installed update and returns detailed result info
+func (m *Manager) CommitWithResult() CommitResult {
+	return m.installer.CommitWithResult()
+}
+
 // NeedsCommit checks if there's a pending update that needs to be committed
 func (m *Manager) NeedsCommit() (bool, error) {
 	return m.installer.NeedsCommit()
+}
+
+// GetCurrentArtifact returns the currently committed artifact name
+func (m *Manager) GetCurrentArtifact() (string, error) {
+	return m.installer.GetCurrentArtifact()
+}
+
+// CheckUpdateState checks the current mender update state relative to expected version
+func (m *Manager) CheckUpdateState(expectedVersion string) (UpdateState, error) {
+	return m.installer.CheckUpdateState(expectedVersion)
 }
 
 // GetDownloadDir returns the download directory path

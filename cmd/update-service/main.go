@@ -171,11 +171,12 @@ func main() {
 	defer updater.Close()
 
 	// Check if there's a pending update that needs to be committed on startup
-	if err := updater.CheckAndCommitPendingUpdate(); err != nil {
+	menderNeedsReboot, err := updater.CheckAndCommitPendingUpdate()
+	if err != nil {
 		logger.Printf("Warning: Failed to check/commit pending update: %v", err)
 	}
 
-	if err := updater.Start(); err != nil {
+	if err := updater.Start(menderNeedsReboot); err != nil {
 		logger.Fatalf("Failed to start updater: %v", err)
 	}
 

@@ -251,3 +251,14 @@ func (c *Client) HandleUpdateCommands(component string, handler func(string) err
 	channel := fmt.Sprintf("scooter:update:%s", component)
 	return ipc.HandleRequests(c.client, channel, handler)
 }
+
+// GetTargetVersion gets the target update version for a component from the OTA hash
+// This is set during download/install to track what version we're updating to
+func (c *Client) GetTargetVersion(component string) (string, error) {
+	key := fmt.Sprintf("update-version:%s", component)
+	version, err := c.client.HGet("ota", key)
+	if err != nil {
+		return "", nil // Not set
+	}
+	return version, nil
+}
