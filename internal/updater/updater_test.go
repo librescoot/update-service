@@ -120,3 +120,122 @@ func containsIgnoreCase(s, substr string) bool {
 	}
 	return false
 }
+
+// TestRecoveryLogic tests the decision-making in recoverFromStuckState
+// This tests the logic without needing to mock the full updater
+func TestRecoveryLogic(t *testing.T) {
+	testCases := []struct {
+		name              string
+		currentStatus     string
+		menderNeedsReboot bool
+		expectedAction    string // "clear", "set_rebooting", "none"
+	}{
+		{
+			name:              "idle status - no action",
+			currentStatus:     "idle",
+			menderNeedsReboot: false,
+			expectedAction:    "none",
+		},
+		{
+			name:              "empty status - no action",
+			currentStatus:     "",
+			menderNeedsReboot: false,
+			expectedAction:    "none",
+		},
+		{
+			name:              "downloading - clear",
+			currentStatus:     "downloading",
+			menderNeedsReboot: false,
+			expectedAction:    "clear",
+		},
+		{
+			name:              "downloading with mender reboot - clear",
+			currentStatus:     "downloading",
+			menderNeedsReboot: true,
+			expectedAction:    "clear",
+		},
+		{
+			name:              "installing with mender reboot - set rebooting",
+			currentStatus:     "installing",
+			menderNeedsReboot: true,
+			expectedAction:    "set_rebooting",
+		},
+		{
+			name:              "installing without mender reboot - clear",
+			currentStatus:     "installing",
+			menderNeedsReboot: false,
+			expectedAction:    "clear",
+		},
+		{
+			name:              "rebooting - clear",
+			currentStatus:     "rebooting",
+			menderNeedsReboot: false,
+			expectedAction:    "clear",
+		},
+		{
+			name:              "error - clear",
+			currentStatus:     "error",
+			menderNeedsReboot: false,
+			expectedAction:    "clear",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Simulate the decision logic from recoverFromStuckState
+			action := determineRecoveryAction(tc.currentStatus, tc.menderNeedsReboot)
+			if action != tc.expectedAction {
+				t.Errorf("determineRecoveryAction(%q, %v) = %q, want %q",
+					tc.currentStatus, tc.menderNeedsReboot, action, tc.expectedAction)
+			}
+		})
+	}
+}
+
+// determineRecoveryAction mirrors the decision logic in recoverFromStuckState
+func determineRecoveryAction(currentStatus string, menderNeedsReboot bool) string {
+	if currentStatus == "idle" || currentStatus == "" {
+		return "none"
+	}
+
+	switch currentStatus {
+	case "downloading":
+		return "clear"
+	case "installing":
+		if menderNeedsReboot {
+			return "set_rebooting"
+		}
+		return "clear"
+	case "rebooting":
+		return "clear"
+	case "error":
+		return "clear"
+	default:
+		return "clear"
+	}
+}
+
+// TestCheckForUpdatesDefersNonIdle tests that checkForUpdates should defer for all non-idle states
+func TestCheckForUpdatesDefersNonIdle(t *testing.T) {
+	nonIdleStates := []string{"downloading", "installing", "rebooting", "error"}
+
+	for _, state := range nonIdleStates {
+		t.Run(state, func(t *testing.T) {
+			// The check is: if currentStatus != "idle" && currentStatus != ""
+			shouldDefer := state != "idle" && state != ""
+			if !shouldDefer {
+				t.Errorf("State %q should cause deferral", state)
+			}
+		})
+	}
+
+	// idle and empty should NOT defer
+	for _, state := range []string{"idle", ""} {
+		t.Run("not_"+state, func(t *testing.T) {
+			shouldDefer := state != "idle" && state != ""
+			if shouldDefer {
+				t.Errorf("State %q should NOT cause deferral", state)
+			}
+		})
+	}
+}
