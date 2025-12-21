@@ -67,7 +67,7 @@ func main() {
 	}()
 
 	// Initialize Redis client early so we can load settings from it
-	redisClient, err := redis.New(ctx, *redisAddr)
+	redisClient, err := redis.New(*redisAddr)
 	if err != nil {
 		logger.Fatalf("Failed to initialize Redis client: %v", err)
 	}
@@ -153,14 +153,14 @@ func main() {
 	go watchSettingsChanges(ctx, redisClient, cfg, logger, cliChannelSet, cliCheckIntervalSet, cliGithubURLSet, cliDryRunSet)
 
 	// Initialize power inhibitor client
-	inhibitorClient, err := inhibitor.New(ctx, *redisAddr, logger)
+	inhibitorClient, err := inhibitor.New(*redisAddr, logger)
 	if err != nil {
 		logger.Fatalf("Failed to initialize inhibitor client: %v", err)
 	}
 	defer inhibitorClient.Close()
 
 	// Initialize power client
-	powerClient, err := power.New(ctx, *redisAddr, logger)
+	powerClient, err := power.New(*redisAddr, logger)
 	if err != nil {
 		logger.Fatalf("Failed to initialize power client: %v", err)
 	}
@@ -206,76 +206,64 @@ func main() {
 
 // watchSettingsChanges monitors Redis for settings changes and applies them to the config
 func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger, cliChannelSet, cliCheckIntervalSet, cliGithubURLSet, cliDryRunSet bool) {
-	msgChan, cleanup, err := redisClient.SubscribeToSettingsChanges(config.SettingsChannel)
-	if err != nil {
-		logger.Printf("Warning: Failed to subscribe to settings changes: %v", err)
-		return
-	}
-	defer cleanup()
+	logger.Printf("Watching for settings changes using HashWatcher")
 
-	logger.Printf("Watching for settings changes on channel '%s'", config.SettingsChannel)
+	// Use HashWatcher to monitor settings hash
+	watcher := redisClient.NewSettingsWatcher()
+	watcher.OnAny(func(settingKey, value string) error {
+		logger.Printf("Settings change notification received for key: %s", settingKey)
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case settingKey, ok := <-msgChan:
-			if !ok {
-				logger.Printf("Settings channel closed")
-				return
-			}
-
-			logger.Printf("Settings change notification received for key: %s", settingKey)
-
-			// Get the new value from Redis
-			value, err := redisClient.HGet(config.SettingsHashKey, settingKey)
-			if err != nil {
-				logger.Printf("Warning: Failed to read setting %s from Redis: %v", settingKey, err)
-				continue
-			}
-
-			// Skip applying settings that were overridden by CLI flags
-			prefix := "updates." + cfg.Component + "."
-			if len(settingKey) > len(prefix) && settingKey[:len(prefix)] == prefix {
-				settingName := settingKey[len(prefix):]
-				switch settingName {
-				case "channel":
-					if cliChannelSet {
-						logger.Printf("Ignoring Redis update for channel (overridden by CLI flag)")
-						continue
-					}
-				case "check-interval":
-					if cliCheckIntervalSet {
-						logger.Printf("Ignoring Redis update for check-interval (overridden by CLI flag)")
-						continue
-					}
-				case "github-releases-url":
-					if cliGithubURLSet {
-						logger.Printf("Ignoring Redis update for github-releases-url (overridden by CLI flag)")
-						continue
-					}
-				case "dry-run":
-					if cliDryRunSet {
-						logger.Printf("Ignoring Redis update for dry-run (overridden by CLI flag)")
-						continue
-					}
+		// Skip applying settings that were overridden by CLI flags
+		prefix := "updates." + cfg.Component + "."
+		if len(settingKey) > len(prefix) && settingKey[:len(prefix)] == prefix {
+			settingName := settingKey[len(prefix):]
+			switch settingName {
+			case "channel":
+				if cliChannelSet {
+					logger.Printf("Ignoring Redis update for channel (overridden by CLI flag)")
+					return nil
 				}
-			}
-
-			// Apply the setting update
-			if cfg.ApplyRedisUpdate(settingKey, value) {
-				logger.Printf("Applied setting update: %s = %s", settingKey, value)
-
-				// If check-interval was updated, evaluate if we should check now
-				if len(settingKey) > len(prefix) && settingKey[:len(prefix)] == prefix {
-					settingName := settingKey[len(prefix):]
-					if settingName == "check-interval" {
-						evaluateCheckIntervalChange(ctx, redisClient, cfg, logger)
-					}
+			case "check-interval":
+				if cliCheckIntervalSet {
+					logger.Printf("Ignoring Redis update for check-interval (overridden by CLI flag)")
+					return nil
+				}
+			case "github-releases-url":
+				if cliGithubURLSet {
+					logger.Printf("Ignoring Redis update for github-releases-url (overridden by CLI flag)")
+					return nil
+				}
+			case "dry-run":
+				if cliDryRunSet {
+					logger.Printf("Ignoring Redis update for dry-run (overridden by CLI flag)")
+					return nil
 				}
 			}
 		}
+
+		// Apply the setting update
+		if cfg.ApplyRedisUpdate(settingKey, value) {
+			logger.Printf("Applied setting update: %s = %s", settingKey, value)
+
+			// If check-interval was updated, evaluate if we should check now
+			if len(settingKey) > len(prefix) && settingKey[:len(prefix)] == prefix {
+				settingName := settingKey[len(prefix):]
+				if settingName == "check-interval" {
+					evaluateCheckIntervalChange(ctx, redisClient, cfg, logger)
+				}
+			}
+		}
+		return nil
+	})
+
+	if err := watcher.Start(); err != nil {
+		logger.Printf("Warning: Failed to start settings watcher: %v", err)
+		return
 	}
+	defer watcher.Stop()
+
+	// Wait for context cancellation
+	<-ctx.Done()
 }
 
 // evaluateCheckIntervalChange evaluates if an update check should be triggered based on the new check interval

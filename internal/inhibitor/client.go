@@ -43,12 +43,13 @@ type Client struct {
 }
 
 // New creates a new power inhibitor client
-func New(ctx context.Context, redisAddr string, logger *log.Logger) (*Client, error) {
+func New(redisAddr string, logger *log.Logger) (*Client, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr: redisAddr,
 		DB:   0,
 	})
 
+	ctx := context.Background()
 	// Test connection
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
