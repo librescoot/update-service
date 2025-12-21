@@ -57,7 +57,7 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		inhibitor: inhibitorClient,
 		power:     powerClient,
 		mender:    mender.NewManager(downloadDir, logger),
-		status:    status.NewReporter(redisClient.GetClient(), cfg.Component, logger), // status.NewReporter expects the underlying go-redis/v9 client
+		status:    status.NewReporter(redisClient.GetClient(), cfg.Component, logger),
 		githubAPI: NewGitHubAPI(updaterCtx, cfg.GitHubReleasesURL, logger),
 		logger:    logger,
 		ctx:       updaterCtx,
@@ -187,9 +187,9 @@ func (u *Updater) clearRebootingStatus() error {
 func (u *Updater) initializeRedisKeys() error {
 	// Check if status key exists and get its value
 	statusKey := fmt.Sprintf("status:%s", u.config.Component)
-	statusValue, err := u.redis.GetClient().HGet(u.ctx, "ota", statusKey).Result()
+	statusValue, err := u.redis.GetOTAField("ota", statusKey)
 
-	// Initialize if key doesn't exist (redis.Nil) or if it's empty
+	// Initialize if key doesn't exist or if it's empty
 	needsInit := err != nil || statusValue == ""
 
 	if needsInit {
@@ -261,35 +261,14 @@ func (u *Updater) revalidateStandbyState() {
 
 // listenForCommands listens for Redis commands on scooter:update:{component}
 func (u *Updater) listenForCommands() {
-	channel := fmt.Sprintf("scooter:update:%s", u.config.Component)
-	u.logger.Printf("Starting update command listener on %s", channel)
+	u.logger.Printf("Starting update command listener for component %s", u.config.Component)
 
-	for {
-		select {
-		case <-u.ctx.Done():
-			u.logger.Printf("Update command listener stopped")
-			return
-
-		default:
-			// Use BRPOP with 5 second timeout to allow periodic context checks
-			result, err := u.redis.GetClient().BRPop(u.ctx, 5*time.Second, channel).Result()
-			if err != nil {
-				// Ignore timeout and context cancellation errors
-				if err.Error() == "redis: nil" || err == context.Canceled {
-					continue
-				}
-				u.logger.Printf("Error reading from %s: %v", channel, err)
-				continue
-			}
-
-			// BRPOP returns [key, value]
-			if len(result) >= 2 {
-				command := result[1]
-				u.logger.Printf("Received update command: %s", command)
-				u.handleCommand(command)
-			}
-		}
-	}
+	// Use redis-ipc HandleRequests to process commands
+	u.redis.HandleUpdateCommands(u.config.Component, func(command string) error {
+		u.logger.Printf("Received update command: %s", command)
+		u.handleCommand(command)
+		return nil
+	})
 }
 
 // handleCommand handles incoming Redis commands
@@ -305,51 +284,34 @@ func (u *Updater) handleCommand(command string) {
 
 // monitorSettingsChanges monitors Redis pub/sub for update method configuration changes
 func (u *Updater) monitorSettingsChanges() {
-	// Subscribe to the general settings channel
-	channel := "settings"
-	u.logger.Printf("Subscribing to settings changes on channel: %s", channel)
+	// Use HashWatcher to monitor settings hash
+	settingKey := fmt.Sprintf("updates.%s.method", u.config.Component)
+	u.logger.Printf("Subscribing to settings changes, monitoring for key: %s", settingKey)
 
-	settingsChanges, cleanup, err := u.redis.SubscribeToSettingsChanges(channel)
-	if err != nil {
-		u.logger.Printf("Failed to subscribe to settings changes: %v", err)
+	watcher := u.redis.NewSettingsWatcher()
+	watcher.OnField(settingKey, func(value string) error {
+		u.logger.Printf("Received settings change for %s: %s", settingKey, value)
+
+		// Validate the method
+		if value != "delta" && value != "full" {
+			u.logger.Printf("Invalid update method value '%s', ignoring", value)
+			return nil
+		}
+
+		// Update the cached value
+		u.setUpdateMethod(value)
+		return nil
+	})
+
+	if err := watcher.Start(); err != nil {
+		u.logger.Printf("Failed to start settings watcher: %v", err)
 		return
 	}
-	defer cleanup()
+	defer watcher.Stop()
 
-	// The setting key we're interested in for this component
-	settingKey := fmt.Sprintf("updates.%s.method", u.config.Component)
-	u.logger.Printf("Successfully subscribed to settings changes, monitoring for key: %s", settingKey)
-
-	for {
-		select {
-		case <-u.ctx.Done():
-			u.logger.Printf("Settings monitor stopped for %s", u.config.Component)
-			return
-		case msg, ok := <-settingsChanges:
-			if !ok {
-				u.logger.Printf("Settings changes channel closed for %s", u.config.Component)
-				return
-			}
-
-			// Check if this message is for our component's update method setting
-			if msg != settingKey {
-				// Not our setting, ignore
-				continue
-			}
-
-			// When we receive a notification for our setting, fetch the new value from Redis
-			u.logger.Printf("Received settings change notification for %s", settingKey)
-
-			newMethod, err := u.redis.GetUpdateMethod(u.config.Component)
-			if err != nil {
-				u.logger.Printf("Failed to get updated method for %s: %v", u.config.Component, err)
-				continue
-			}
-
-			// Update the cached value
-			u.setUpdateMethod(newMethod)
-		}
-	}
+	// Wait for context cancellation
+	<-u.ctx.Done()
+	u.logger.Printf("Settings monitor stopped for %s", u.config.Component)
 }
 
 // updateCheckLoop periodically checks for updates
@@ -687,13 +649,7 @@ func compareVersions(v1, v2 string) int {
 
 // getCurrentVersion gets the current version for this component
 func (u *Updater) getCurrentVersion() (string, error) {
-	result, err := u.redis.GetClient().HGet(u.ctx, fmt.Sprintf("version:%s", u.config.Component), "version_id").Result()
-	if err == nil && result != "" {
-		return result, nil
-	}
-
-	// If not found in Redis, return empty (needs update)
-	return "", nil
+	return u.redis.GetComponentVersion(u.config.Component)
 }
 
 // performUpdate performs the actual update process
@@ -1315,56 +1271,65 @@ func (u *Updater) waitForStandbyTimer(waitDuration time.Duration) error {
 
 // waitForStandbyWithSubscription waits for standby state using real-time subscription
 func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration) error {
-	// Try to subscribe to vehicle state changes
-	stateChanges, cleanup, err := u.redis.SubscribeToVehicleStateChanges("vehicle:state:change")
-	if err != nil {
-		u.logger.Printf("Failed to subscribe to vehicle state changes: %v. Falling back to polling.", err)
-		return u.waitForStandbyWithPolling(requiredDuration)
-	}
-	defer cleanup()
+	u.logger.Printf("Monitoring vehicle state for 'stand-by' using HashWatcher")
 
-	for {
-		select {
-		case <-u.ctx.Done():
-			u.logger.Printf("MDB reboot cancelled due to context done.")
-			return u.ctx.Err()
-		case <-stateChanges:
-			// State changed, check current state
-			currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
-			if err != nil {
-				u.logger.Printf("Failed to get vehicle state after change: %v. Continuing.", err)
-				continue
+	// Create a channel to signal when standby duration is met
+	standbyMet := make(chan error, 1)
+
+	// Use HashWatcher to monitor vehicle state changes
+	watcher := u.redis.NewVehicleWatcher(config.VehicleHashKey)
+	watcher.OnField("state", func(state string) error {
+		currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+		if err != nil {
+			u.logger.Printf("Failed to get vehicle state after change: %v", err)
+			return nil
+		}
+
+		if currentState == "stand-by" {
+			// Set standby timestamp
+			if !stateTimestamp.IsZero() {
+				u.standbyStartTime = stateTimestamp
+			} else {
+				u.standbyStartTime = time.Now()
 			}
+			u.logger.Printf("Vehicle entered 'stand-by' state at %s. Monitoring for %v.", u.standbyStartTime.Format(time.RFC3339), requiredDuration)
 
-			if currentState == "stand-by" {
-				// Set standby timestamp
-				if !stateTimestamp.IsZero() {
-					u.standbyStartTime = stateTimestamp
-				} else {
-					u.standbyStartTime = time.Now()
-				}
-				u.logger.Printf("Vehicle entered 'stand-by' state at %s. Monitoring for %v.", u.standbyStartTime.Format(time.RFC3339), requiredDuration)
-
-				// Check if already waited long enough
-				durationInStandby := time.Since(u.standbyStartTime)
-				if durationInStandby >= requiredDuration {
-					u.logger.Printf("Vehicle has been in 'stand-by' for %v. Proceeding with MDB reboot.", durationInStandby)
-					u.logger.Printf("Triggering MDB reboot via Redis command")
-					return u.redis.TriggerReboot()
-				}
+			// Check if already waited long enough
+			durationInStandby := time.Since(u.standbyStartTime)
+			if durationInStandby >= requiredDuration {
+				u.logger.Printf("Vehicle has been in 'stand-by' for %v. Proceeding with MDB reboot.", durationInStandby)
+				u.logger.Printf("Triggering MDB reboot via Redis command")
+				standbyMet <- u.redis.TriggerReboot()
+			} else {
 				// Start precise timer for remaining duration
 				remainingTime := requiredDuration - durationInStandby
 				u.logger.Printf("Vehicle in 'stand-by' for %v. Starting precise timer for %v.", durationInStandby, remainingTime)
-				return u.waitForStandbyTimer(remainingTime)
+				standbyMet <- u.waitForStandbyTimer(remainingTime)
+			}
+		} else {
+			if !u.standbyStartTime.IsZero() {
+				u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Resetting standby timer.", currentState)
+				u.standbyStartTime = time.Time{}
 			} else {
-				if !u.standbyStartTime.IsZero() {
-					u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Resetting standby timer.", currentState)
-					u.standbyStartTime = time.Time{}
-				} else {
-					u.logger.Printf("Vehicle not in 'stand-by' (current: %s). Waiting.", currentState)
-				}
+				u.logger.Printf("Vehicle not in 'stand-by' (current: %s). Waiting.", currentState)
 			}
 		}
+		return nil
+	})
+
+	if err := watcher.Start(); err != nil {
+		u.logger.Printf("Failed to start vehicle watcher: %v. Falling back to polling.", err)
+		return u.waitForStandbyWithPolling(requiredDuration)
+	}
+	defer watcher.Stop()
+
+	// Wait for either context cancellation or standby duration to be met
+	select {
+	case <-u.ctx.Done():
+		u.logger.Printf("MDB reboot cancelled due to context done.")
+		return u.ctx.Err()
+	case err := <-standbyMet:
+		return err
 	}
 }
 

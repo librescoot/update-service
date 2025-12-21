@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/redis/go-redis/v9"
+	ipc "github.com/librescoot/redis-ipc"
 )
 
 // Status represents the possible update states
@@ -19,17 +19,17 @@ const (
 	StatusError       Status = "error"
 )
 
-// Reporter handles Redis status reporting for OTA updates
+// Reporter handles Redis status reporting for OTA updates using HashPublisher
 type Reporter struct {
-	client    *redis.Client
+	pub       *ipc.HashPublisher
 	component string
 	logger    *log.Logger
 }
 
 // NewReporter creates a new status reporter for the given component
-func NewReporter(client *redis.Client, component string, logger *log.Logger) *Reporter {
+func NewReporter(client *ipc.Client, component string, logger *log.Logger) *Reporter {
 	return &Reporter{
-		client:    client,
+		pub:       client.NewHashPublisher("ota"),
 		component: component,
 		logger:    logger,
 	}
@@ -39,7 +39,7 @@ func NewReporter(client *redis.Client, component string, logger *log.Logger) *Re
 func (r *Reporter) SetStatus(ctx context.Context, status Status) error {
 	key := fmt.Sprintf("status:%s", r.component)
 
-	err := r.client.HSet(ctx, "ota", key, string(status)).Err()
+	err := r.pub.Set(key, string(status))
 	if err != nil {
 		return fmt.Errorf("failed to set status for component %s: %w", r.component, err)
 	}
@@ -52,7 +52,7 @@ func (r *Reporter) SetStatus(ctx context.Context, status Status) error {
 func (r *Reporter) SetUpdateVersion(ctx context.Context, version string) error {
 	key := fmt.Sprintf("update-version:%s", r.component)
 
-	err := r.client.HSet(ctx, "ota", key, version).Err()
+	err := r.pub.Set(key, version)
 	if err != nil {
 		return fmt.Errorf("failed to set update version for component %s: %w", r.component, err)
 	}
@@ -65,7 +65,7 @@ func (r *Reporter) SetUpdateVersion(ctx context.Context, version string) error {
 func (r *Reporter) ClearUpdateVersion(ctx context.Context) error {
 	key := fmt.Sprintf("update-version:%s", r.component)
 
-	err := r.client.HDel(ctx, "ota", key).Err()
+	err := r.pub.Delete(key)
 	if err != nil {
 		return fmt.Errorf("failed to clear update version for component %s: %w", r.component, err)
 	}
@@ -78,12 +78,9 @@ func (r *Reporter) ClearUpdateVersion(ctx context.Context) error {
 func (r *Reporter) GetStatus(ctx context.Context) (Status, error) {
 	key := fmt.Sprintf("status:%s", r.component)
 
-	result, err := r.client.HGet(ctx, "ota", key).Result()
-	if err == redis.Nil {
-		return StatusIdle, nil // Default to idle if not set
-	}
+	result, err := r.pub.Get(key)
 	if err != nil {
-		return "", fmt.Errorf("failed to get status for component %s: %w", r.component, err)
+		return StatusIdle, nil // Default to idle if not set
 	}
 
 	return Status(result), nil
@@ -91,15 +88,13 @@ func (r *Reporter) GetStatus(ctx context.Context) (Status, error) {
 
 // SetStatusAndVersion atomically sets both status and update version
 func (r *Reporter) SetStatusAndVersion(ctx context.Context, status Status, version string) error {
-	pipe := r.client.Pipeline()
-
 	statusKey := fmt.Sprintf("status:%s", r.component)
 	versionKey := fmt.Sprintf("update-version:%s", r.component)
 
-	pipe.HSet(ctx, "ota", statusKey, string(status))
-	pipe.HSet(ctx, "ota", versionKey, version)
-
-	_, err := pipe.Exec(ctx)
+	err := r.pub.SetMany(map[string]any{
+		statusKey:  string(status),
+		versionKey: version,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to set status and version for component %s: %w", r.component, err)
 	}
@@ -110,8 +105,6 @@ func (r *Reporter) SetStatusAndVersion(ctx context.Context, status Status, versi
 
 // SetIdleAndClearVersion atomically sets status to idle and clears update version, error, progress, and method keys
 func (r *Reporter) SetIdleAndClearVersion(ctx context.Context) error {
-	pipe := r.client.Pipeline()
-
 	statusKey := fmt.Sprintf("status:%s", r.component)
 	versionKey := fmt.Sprintf("update-version:%s", r.component)
 	errorKey := fmt.Sprintf("error:%s", r.component)
@@ -121,18 +114,14 @@ func (r *Reporter) SetIdleAndClearVersion(ctx context.Context) error {
 	totalKey := fmt.Sprintf("download-total:%s", r.component)
 	methodKey := fmt.Sprintf("update-method:%s", r.component)
 
-	pipe.HSet(ctx, "ota", statusKey, string(StatusIdle))
-	pipe.HDel(ctx, "ota", versionKey)
-	pipe.HDel(ctx, "ota", errorKey)
-	pipe.HDel(ctx, "ota", errorMessageKey)
-	pipe.HDel(ctx, "ota", progressKey)
-	pipe.HDel(ctx, "ota", downloadedKey)
-	pipe.HDel(ctx, "ota", totalKey)
-	pipe.HDel(ctx, "ota", methodKey)
+	// Set status to idle
+	if err := r.pub.Set(statusKey, string(StatusIdle)); err != nil {
+		return fmt.Errorf("failed to set idle status for component %s: %w", r.component, err)
+	}
 
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to set idle and clear version for component %s: %w", r.component, err)
+	// Delete the other keys
+	for _, key := range []string{versionKey, errorKey, errorMessageKey, progressKey, downloadedKey, totalKey, methodKey} {
+		_ = r.pub.Delete(key) // Ignore errors on delete
 	}
 
 	r.logger.Printf("Set status to idle and cleared version for %s", r.component)
@@ -141,8 +130,6 @@ func (r *Reporter) SetIdleAndClearVersion(ctx context.Context) error {
 
 // SetError atomically sets status to error, stores error details, and clears download progress
 func (r *Reporter) SetError(ctx context.Context, errorType, errorMessage string) error {
-	pipe := r.client.Pipeline()
-
 	statusKey := fmt.Sprintf("status:%s", r.component)
 	errorKey := fmt.Sprintf("error:%s", r.component)
 	errorMessageKey := fmt.Sprintf("error-message:%s", r.component)
@@ -150,16 +137,19 @@ func (r *Reporter) SetError(ctx context.Context, errorType, errorMessage string)
 	downloadedKey := fmt.Sprintf("download-bytes:%s", r.component)
 	totalKey := fmt.Sprintf("download-total:%s", r.component)
 
-	pipe.HSet(ctx, "ota", statusKey, string(StatusError))
-	pipe.HSet(ctx, "ota", errorKey, errorType)
-	pipe.HSet(ctx, "ota", errorMessageKey, errorMessage)
-	pipe.HDel(ctx, "ota", progressKey)
-	pipe.HDel(ctx, "ota", downloadedKey)
-	pipe.HDel(ctx, "ota", totalKey)
-
-	_, err := pipe.Exec(ctx)
+	// Set error status and details
+	err := r.pub.SetMany(map[string]any{
+		statusKey:       string(StatusError),
+		errorKey:        errorType,
+		errorMessageKey: errorMessage,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to set error for component %s: %w", r.component, err)
+	}
+
+	// Clear download progress keys
+	for _, key := range []string{progressKey, downloadedKey, totalKey} {
+		_ = r.pub.Delete(key) // Ignore errors on delete
 	}
 
 	r.logger.Printf("Set error for %s: type=%s, message=%s", r.component, errorType, errorMessage)
@@ -168,18 +158,11 @@ func (r *Reporter) SetError(ctx context.Context, errorType, errorMessage string)
 
 // ClearError removes error and error-message keys from Redis
 func (r *Reporter) ClearError(ctx context.Context) error {
-	pipe := r.client.Pipeline()
-
 	errorKey := fmt.Sprintf("error:%s", r.component)
 	errorMessageKey := fmt.Sprintf("error-message:%s", r.component)
 
-	pipe.HDel(ctx, "ota", errorKey)
-	pipe.HDel(ctx, "ota", errorMessageKey)
-
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to clear error for component %s: %w", r.component, err)
-	}
+	_ = r.pub.Delete(errorKey)
+	_ = r.pub.Delete(errorMessageKey)
 
 	r.logger.Printf("Cleared error keys for %s", r.component)
 	return nil
@@ -187,8 +170,6 @@ func (r *Reporter) ClearError(ctx context.Context) error {
 
 // SetDownloadProgress sets the download progress with both percentage and byte counts
 func (r *Reporter) SetDownloadProgress(ctx context.Context, downloaded, total int64) error {
-	pipe := r.client.Pipeline()
-
 	progressKey := fmt.Sprintf("download-progress:%s", r.component)
 	downloadedKey := fmt.Sprintf("download-bytes:%s", r.component)
 	totalKey := fmt.Sprintf("download-total:%s", r.component)
@@ -199,11 +180,11 @@ func (r *Reporter) SetDownloadProgress(ctx context.Context, downloaded, total in
 		percentage = int((downloaded * 100) / total)
 	}
 
-	pipe.HSet(ctx, "ota", progressKey, percentage)
-	pipe.HSet(ctx, "ota", downloadedKey, downloaded)
-	pipe.HSet(ctx, "ota", totalKey, total)
-
-	_, err := pipe.Exec(ctx)
+	err := r.pub.SetMany(map[string]any{
+		progressKey:   percentage,
+		downloadedKey: downloaded,
+		totalKey:      total,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to set download progress for component %s: %w", r.component, err)
 	}
@@ -214,7 +195,7 @@ func (r *Reporter) SetDownloadProgress(ctx context.Context, downloaded, total in
 // SetInstallProgress sets the install/delta application progress (0-100)
 func (r *Reporter) SetInstallProgress(ctx context.Context, percent int) error {
 	progressKey := fmt.Sprintf("install-progress:%s", r.component)
-	err := r.client.HSet(ctx, "ota", progressKey, percent).Err()
+	err := r.pub.Set(progressKey, percent)
 	if err != nil {
 		return fmt.Errorf("failed to set install progress for component %s: %w", r.component, err)
 	}
@@ -224,25 +205,18 @@ func (r *Reporter) SetInstallProgress(ctx context.Context, percent int) error {
 // ClearInstallProgress removes the install progress key from Redis
 func (r *Reporter) ClearInstallProgress(ctx context.Context) error {
 	progressKey := fmt.Sprintf("install-progress:%s", r.component)
-	return r.client.HDel(ctx, "ota", progressKey).Err()
+	return r.pub.Delete(progressKey)
 }
 
 // ClearDownloadProgress removes the download progress keys from Redis
 func (r *Reporter) ClearDownloadProgress(ctx context.Context) error {
-	pipe := r.client.Pipeline()
-
 	progressKey := fmt.Sprintf("download-progress:%s", r.component)
 	downloadedKey := fmt.Sprintf("download-bytes:%s", r.component)
 	totalKey := fmt.Sprintf("download-total:%s", r.component)
 
-	pipe.HDel(ctx, "ota", progressKey)
-	pipe.HDel(ctx, "ota", downloadedKey)
-	pipe.HDel(ctx, "ota", totalKey)
-
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to clear download progress for component %s: %w", r.component, err)
-	}
+	_ = r.pub.Delete(progressKey)
+	_ = r.pub.Delete(downloadedKey)
+	_ = r.pub.Delete(totalKey)
 
 	return nil
 }
@@ -251,7 +225,7 @@ func (r *Reporter) ClearDownloadProgress(ctx context.Context) error {
 func (r *Reporter) SetUpdateMethod(ctx context.Context, method string) error {
 	key := fmt.Sprintf("update-method:%s", r.component)
 
-	err := r.client.HSet(ctx, "ota", key, method).Err()
+	err := r.pub.Set(key, method)
 	if err != nil {
 		return fmt.Errorf("failed to set update method for component %s: %w", r.component, err)
 	}
@@ -264,7 +238,7 @@ func (r *Reporter) SetUpdateMethod(ctx context.Context, method string) error {
 func (r *Reporter) ClearUpdateMethod(ctx context.Context) error {
 	key := fmt.Sprintf("update-method:%s", r.component)
 
-	err := r.client.HDel(ctx, "ota", key).Err()
+	err := r.pub.Delete(key)
 	if err != nil {
 		return fmt.Errorf("failed to clear update method for component %s: %w", r.component, err)
 	}
@@ -275,17 +249,15 @@ func (r *Reporter) ClearUpdateMethod(ctx context.Context) error {
 
 // Initialize sets initial values for OTA keys on service startup
 func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
-	pipe := r.client.Pipeline()
-
 	statusKey := fmt.Sprintf("status:%s", r.component)
 	progressKey := fmt.Sprintf("download-progress:%s", r.component)
 	methodKey := fmt.Sprintf("update-method:%s", r.component)
 
-	pipe.HSet(ctx, "ota", statusKey, string(StatusIdle))
-	pipe.HSet(ctx, "ota", progressKey, 0)
-	pipe.HSet(ctx, "ota", methodKey, updateMethod)
-
-	_, err := pipe.Exec(ctx)
+	err := r.pub.SetMany(map[string]any{
+		statusKey:   string(StatusIdle),
+		progressKey: 0,
+		methodKey:   updateMethod,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize OTA keys for component %s: %w", r.component, err)
 	}
