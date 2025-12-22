@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -221,6 +222,13 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 				u.logger.Printf("Found complete file %s, next check will resume install", filePath)
 			}
 		}
+
+		// Clean up stale temporary directories from interrupted delta applications
+		// The mender-apply-delta.py script creates temp dirs in /data/ota/tmp/
+		if err := u.cleanupDeltaTempDirs(); err != nil {
+			u.logger.Printf("Warning: Failed to cleanup delta temp dirs: %v", err)
+		}
+
 		u.logger.Printf("Clearing downloading status")
 		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
 			return fmt.Errorf("failed to clear downloading status: %w", err)
@@ -261,6 +269,38 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 		u.logger.Printf("Clearing error status to allow retry")
 		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
 			return fmt.Errorf("failed to clear error status: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// cleanupDeltaTempDirs removes stale temporary directories created by mender-apply-delta.py
+// The script creates temp dirs in /data/ota/tmp/ that need cleanup after interruptions
+func (u *Updater) cleanupDeltaTempDirs() error {
+	tmpDir := "/data/ota/tmp"
+
+	// Check if tmp directory exists
+	if _, err := os.Stat(tmpDir); os.IsNotExist(err) {
+		return nil // Nothing to clean
+	} else if err != nil {
+		return fmt.Errorf("failed to stat tmp directory: %w", err)
+	}
+
+	// Read all entries in the tmp directory
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		return fmt.Errorf("failed to read tmp directory: %w", err)
+	}
+
+	// Remove all temp directories (created by Python's tempfile.TemporaryDirectory)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirPath := filepath.Join(tmpDir, entry.Name())
+			u.logger.Printf("Removing stale delta temp directory: %s", dirPath)
+			if err := os.RemoveAll(dirPath); err != nil {
+				u.logger.Printf("Warning: Failed to remove temp directory %s: %v", dirPath, err)
+			}
 		}
 	}
 
