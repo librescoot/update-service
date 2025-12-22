@@ -17,6 +17,8 @@ import (
 	"github.com/librescoot/update-service/internal/updater"
 )
 
+var version = "dev"
+
 var (
 	redisAddr         = flag.String("redis-addr", "localhost:6379", "Redis server address")
 	githubReleasesURL = flag.String("github-releases-url", "https://api.github.com/repos/librescoot/librescoot/releases", "GitHub Releases API URL")
@@ -25,10 +27,16 @@ var (
 	channel           = flag.String("channel", "nightly", "Update channel (stable, testing, nightly)")
 	downloadDir       = flag.String("download-dir", "", "Download directory for OTA files (default: /data/ota/{component})")
 	dryRun            = flag.Bool("dry-run", false, "If true, don't actually reboot, just notify")
+	showVersion       = flag.Bool("version", false, "Print version and exit")
 )
 
 func main() {
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("update-service %s\n", version)
+		return
+	}
 
 	// Validate required component flag
 	if *component == "" {
