@@ -85,9 +85,8 @@ func (u *Updater) CheckAndCommitPendingUpdate() (needsReboot bool, err error) {
 	// Get expected version from Redis (set during download/install)
 	expectedVersion, err := u.redis.GetTargetVersion(u.config.Component)
 	if err != nil || expectedVersion == "" {
-		// No expected version tracked - just try to commit anything pending
-		u.logger.Printf("No target version in Redis, attempting blind commit")
-		return u.tryBlindCommit()
+		u.logger.Printf("No target version in Redis, checking current mender state")
+		expectedVersion = "" // Pass empty string to just check current state
 	}
 
 	state, err := u.mender.CheckUpdateState(expectedVersion)
@@ -98,7 +97,11 @@ func (u *Updater) CheckAndCommitPendingUpdate() (needsReboot bool, err error) {
 
 	switch state {
 	case mender.StateCommitted:
-		u.logger.Printf("Update to %s committed successfully", expectedVersion)
+		if expectedVersion != "" {
+			u.logger.Printf("Update to %s committed successfully", expectedVersion)
+		} else {
+			u.logger.Printf("No pending update, system is committed")
+		}
 		return false, nil
 	case mender.StateNoUpdate:
 		u.logger.Printf("No update in progress")
@@ -112,32 +115,6 @@ func (u *Updater) CheckAndCommitPendingUpdate() (needsReboot bool, err error) {
 	}
 
 	return false, nil
-}
-
-// tryBlindCommit attempts to commit without knowing the expected version
-func (u *Updater) tryBlindCommit() (needsReboot bool, err error) {
-	result := u.mender.CommitWithResult()
-
-	if result.Success {
-		u.logger.Printf("Commit succeeded")
-		return false, nil
-	}
-
-	// Check exit code to determine state
-	switch result.ExitCode {
-	case 2:
-		// No update in progress
-		u.logger.Printf("No update in progress")
-		return false, nil
-	case 1:
-		// Update waiting for reboot
-		u.logger.Printf("Update waiting for reboot: %s", result.Error)
-		return true, nil
-	default:
-		// Other error
-		u.logger.Printf("Commit failed (exit %d): %s", result.ExitCode, result.Error)
-		return false, nil
-	}
 }
 
 // Start starts the updater. The menderNeedsReboot parameter indicates if
