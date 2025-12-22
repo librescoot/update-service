@@ -6,6 +6,8 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+
+	menderstatus "github.com/librescoot/librescoot-mender-status/mender"
 )
 
 // UpdateState represents the state of a mender update
@@ -116,61 +118,57 @@ func (i *Installer) GetCurrentArtifact() (string, error) {
 }
 
 // CheckUpdateState checks the current mender update state relative to expected version.
-// Returns the state and attempts commit if appropriate.
+// Uses the mender-status library to read the standalone-state from Mender's LMDB database.
 func (i *Installer) CheckUpdateState(expectedVersion string) (UpdateState, error) {
-	current, err := i.GetCurrentArtifact()
+	// Read mender status from LMDB database
+	reader, err := menderstatus.NewReaderDefault()
 	if err != nil {
-		return StateNoUpdate, err
+		return StateNoUpdate, fmt.Errorf("failed to create mender status reader: %w", err)
 	}
 
-	i.logger.Printf("Current artifact: %s, expected: %s", current, expectedVersion)
+	status, err := reader.ReadStatus()
+	if err != nil {
+		return StateNoUpdate, fmt.Errorf("failed to read mender status: %w", err)
+	}
+
+	// Get committed artifact name
+	committedArtifact := status.CommittedArtifact
+	i.logger.Printf("Current artifact: %s, expected: %s", committedArtifact, expectedVersion)
 
 	// Check for inconsistent state (failed update)
-	if strings.HasSuffix(current, "_INCONSISTENT") {
-		i.logger.Printf("System in INCONSISTENT state: %s", current)
+	if strings.HasSuffix(committedArtifact, "_INCONSISTENT") {
+		i.logger.Printf("System in INCONSISTENT state: %s", committedArtifact)
 		return StateInconsistent, nil
 	}
 
-	// Check if already committed to expected version
-	if current == expectedVersion {
+	// Check if update is in progress
+	if status.UpdateInProgress {
+		i.logger.Printf("Update in progress: state=%s, artifact=%s, failed=%v",
+			status.State.InState, status.State.ArtifactName, status.State.Failed)
+
+		// Check if update failed
+		if status.State.Failed {
+			i.logger.Printf("Update failed, system may be inconsistent")
+			return StateInconsistent, nil
+		}
+
+		// Check if waiting for commit
+		if status.NeedsCommit() {
+			i.logger.Printf("Update waiting for commit (needs reboot)")
+			return StateNeedsReboot, nil
+		}
+
+		// Update in progress but not yet at commit stage
+		i.logger.Printf("Update in progress, not yet ready for commit")
+		return StateNoUpdate, nil
+	}
+
+	// No update in progress - check if we're on the expected version
+	if committedArtifact == expectedVersion {
 		i.logger.Printf("Already running expected version")
 		return StateCommitted, nil
 	}
 
-	// Try to commit - this tells us what state we're in
-	commitCmd := exec.Command("mender-update", "commit")
-	var commitStderr bytes.Buffer
-	commitCmd.Stderr = &commitStderr
-
-	commitErr := commitCmd.Run()
-	if commitErr == nil {
-		// Commit succeeded - verify we're now on expected version
-		newCurrent, _ := i.GetCurrentArtifact()
-		if newCurrent == expectedVersion {
-			i.logger.Printf("Commit succeeded, now running %s", newCurrent)
-			return StateCommitted, nil
-		}
-		i.logger.Printf("Commit succeeded but artifact is %s (expected %s)", newCurrent, expectedVersion)
-		return StateCommitted, nil
-	}
-
-	// Check exit code
-	if exitErr, ok := commitErr.(*exec.ExitError); ok {
-		exitCode := exitErr.ExitCode()
-		switch exitCode {
-		case 2:
-			// No update in progress
-			i.logger.Printf("No update in progress (current: %s)", current)
-			return StateNoUpdate, nil
-		case 1:
-			// Update waiting - either needs reboot or sanity check failed
-			i.logger.Printf("Update waiting (exit 1): %s", commitStderr.String())
-			return StateNeedsReboot, nil
-		default:
-			i.logger.Printf("Commit failed (exit %d): %s", exitCode, commitStderr.String())
-			return StateNeedsReboot, nil
-		}
-	}
-
-	return StateNoUpdate, fmt.Errorf("failed to run mender-update commit: %w", commitErr)
+	i.logger.Printf("No update in progress (current: %s)", committedArtifact)
+	return StateNoUpdate, nil
 }
