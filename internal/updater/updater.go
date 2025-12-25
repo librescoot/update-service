@@ -72,7 +72,6 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		updateMethod = "full"
 	}
 	u.updateMethod = updateMethod
-	logger.Printf("Initialized update method for %s: %s", cfg.Component, updateMethod)
 
 	return u
 }
@@ -80,48 +79,22 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 // CheckAndCommitPendingUpdate checks mender state and commits if ready.
 // Returns true if an update is waiting for reboot.
 func (u *Updater) CheckAndCommitPendingUpdate() (needsReboot bool, err error) {
-	u.logger.Printf("Checking mender update state for %s", u.config.Component)
-
 	// Get expected version from Redis (set during download/install)
-	expectedVersion, err := u.redis.GetTargetVersion(u.config.Component)
-	if err != nil || expectedVersion == "" {
-		u.logger.Printf("No target version in Redis, checking current mender state")
-		expectedVersion = "" // Pass empty string to just check current state
-	}
+	expectedVersion, _ := u.redis.GetTargetVersion(u.config.Component)
 
 	state, err := u.mender.CheckUpdateState(expectedVersion)
 	if err != nil {
-		u.logger.Printf("Failed to check update state: %v", err)
+		u.logger.Printf("Failed to check mender state: %v", err)
 		return false, nil // Don't fail startup
 	}
 
-	switch state {
-	case mender.StateCommitted:
-		if expectedVersion != "" {
-			u.logger.Printf("Update to %s committed successfully", expectedVersion)
-		} else {
-			u.logger.Printf("No pending update, system is committed")
-		}
-		return false, nil
-	case mender.StateNoUpdate:
-		u.logger.Printf("No update in progress")
-		return false, nil
-	case mender.StateNeedsReboot:
-		u.logger.Printf("Update installed, waiting for reboot")
-		return true, nil
-	case mender.StateInconsistent:
-		u.logger.Printf("WARNING: System in inconsistent state after failed update")
-		return false, nil
-	}
-
-	return false, nil
+	// CheckUpdateState already logs the state, just return the result
+	return state == mender.StateNeedsReboot, nil
 }
 
 // Start starts the updater. The menderNeedsReboot parameter indicates if
 // CheckAndCommitPendingUpdate detected that mender has an update waiting for reboot.
 func (u *Updater) Start(menderNeedsReboot bool) error {
-	u.logger.Printf("Starting component-aware updater for %s", u.config.Component)
-
 	// Recover from any stuck status on startup
 	if err := u.recoverFromStuckState(menderNeedsReboot); err != nil {
 		u.logger.Printf("Warning: Failed to recover from stuck state: %v", err)
@@ -312,23 +285,20 @@ func (u *Updater) initializeRedisKeys() error {
 func (u *Updater) checkInitialStandbyState() {
 	currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
 	if err != nil {
-		u.logger.Printf("Failed to get initial vehicle state: %v", err)
+		u.logger.Printf("Vehicle state: unknown (%v)", err)
 		return
 	}
-
-	u.logger.Printf("Checking initial vehicle state for MDB reboot optimization...")
 
 	if currentState == "stand-by" {
 		if !stateTimestamp.IsZero() {
 			u.standbyStartTime = stateTimestamp
-			elapsed := time.Since(stateTimestamp)
-			u.logger.Printf("Vehicle in 'stand-by' since %s (elapsed: %v) - MDB reboot will use this timestamp", stateTimestamp.Format(time.RFC3339), elapsed)
 		} else {
 			u.standbyStartTime = time.Now()
-			u.logger.Printf("Vehicle in 'stand-by' with no timestamp - using current time for MDB reboot tracking")
 		}
-	} else {
-		u.logger.Printf("Vehicle not in 'stand-by' (current: %s) - MDB reboot will wait for standby state", currentState)
+	}
+	// Only log if not in stand-by (interesting case)
+	if currentState != "stand-by" {
+		u.logger.Printf("Vehicle state: %s (will wait for stand-by before reboot)", currentState)
 	}
 }
 
@@ -362,11 +332,8 @@ func (u *Updater) revalidateStandbyState() {
 
 // listenForCommands listens for Redis commands on scooter:update:{component}
 func (u *Updater) listenForCommands() {
-	u.logger.Printf("Starting update command listener for component %s", u.config.Component)
-
 	// Use redis-ipc HandleRequests to process commands
 	u.redis.HandleUpdateCommands(u.config.Component, func(command string) error {
-		u.logger.Printf("Received update command: %s", command)
 		u.handleCommand(command)
 		return nil
 	})
@@ -385,10 +352,7 @@ func (u *Updater) handleCommand(command string) {
 
 // monitorSettingsChanges monitors Redis pub/sub for update method configuration changes
 func (u *Updater) monitorSettingsChanges() {
-	// Use HashWatcher to monitor settings hash
 	settingKey := fmt.Sprintf("updates.%s.method", u.config.Component)
-	u.logger.Printf("Subscribing to settings changes, monitoring for key: %s", settingKey)
-
 	watcher := u.redis.NewSettingsWatcher()
 	watcher.OnField(settingKey, func(value string) error {
 		u.logger.Printf("Received settings change for %s: %s", settingKey, value)
@@ -417,12 +381,8 @@ func (u *Updater) monitorSettingsChanges() {
 
 // updateCheckLoop periodically checks for updates
 func (u *Updater) updateCheckLoop() {
-	// If check interval is 0, automated updates are disabled
 	if u.config.CheckInterval == 0 {
-		u.logger.Printf("Automated update checks disabled (check-interval is 0 or 'never')")
-		// Wait for context cancellation
 		<-u.ctx.Done()
-		u.logger.Printf("Update check loop stopped")
 		return
 	}
 

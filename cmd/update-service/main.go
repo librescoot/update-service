@@ -59,8 +59,6 @@ func main() {
 	} else {
 		logger = log.New(os.Stdout, "librescoot-update: ", log.LstdFlags|log.Lmsgprefix)
 	}
-	logger.Printf("Starting update service for component: %s", *component)
-
 	// Create context that can be cancelled on SIGINT or SIGTERM
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -87,20 +85,11 @@ func main() {
 	cliGithubURLSet := flag.Lookup("github-releases-url").Value.String() != flag.Lookup("github-releases-url").DefValue
 	cliDryRunSet := flag.Lookup("dry-run").Value.String() != flag.Lookup("dry-run").DefValue
 
-	// Always detect channel from installed version for logging/debugging purposes
+	// Detect channel from installed version
 	detectedChannel := ""
 	installedVersion, err := redisClient.GetComponentVersion(*component)
-	if err != nil {
-		logger.Printf("Warning: Failed to get installed version for channel detection: %v", err)
-	} else if installedVersion != "" {
+	if err == nil && installedVersion != "" {
 		detectedChannel = config.InferChannelFromVersion(installedVersion)
-		if detectedChannel != "" {
-			logger.Printf("Detected channel '%s' from installed version: %s", detectedChannel, installedVersion)
-		} else {
-			logger.Printf("Could not infer channel from installed version: %s", installedVersion)
-		}
-	} else {
-		logger.Printf("No installed version found")
 	}
 
 	// Determine the effective channel: CLI flag > Redis > detected > "nightly" default
@@ -188,25 +177,21 @@ func main() {
 		logger.Fatalf("Failed to start updater: %v", err)
 	}
 
-	logger.Printf("Update service initialized with:")
-	logger.Printf("  Redis address: %s", cfg.RedisAddr)
-	logger.Printf("  GitHub Releases URL: %s", cfg.GitHubReleasesURL)
-	logger.Printf("  Check interval: %v", cfg.CheckInterval)
-	logger.Printf("  Component: %s", cfg.Component)
-
-	// Log channel with source information
+	// Log configuration summary
+	channelSource := "default"
 	if cliChannelSet {
-		logger.Printf("  Channel: %s (explicitly set via CLI flag)", cfg.Channel)
+		channelSource = "cli"
 	} else if redisChannelSet {
-		logger.Printf("  Channel: %s (from Redis settings)", cfg.Channel)
+		channelSource = "redis"
 	} else if detectedChannel != "" {
-		logger.Printf("  Channel: %s (detected from installed version)", cfg.Channel)
-	} else {
-		logger.Printf("  Channel: %s (default)", cfg.Channel)
+		channelSource = "detected"
 	}
 
-	logger.Printf("  Download directory: %s", cfg.DownloadDir)
-	logger.Printf("  Dry-run mode: %v", cfg.DryRun)
+	if cfg.CheckInterval > 0 {
+		logger.Printf("Config: %s on %s (%s), check every %v", cfg.Component, cfg.Channel, channelSource, cfg.CheckInterval)
+	} else {
+		logger.Printf("Config: %s on %s (%s), manual checks only", cfg.Component, cfg.Channel, channelSource)
+	}
 
 	// Wait for context cancellation
 	<-ctx.Done()
@@ -215,8 +200,6 @@ func main() {
 
 // watchSettingsChanges monitors Redis for settings changes and applies them to the config
 func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger, cliChannelSet, cliCheckIntervalSet, cliGithubURLSet, cliDryRunSet bool) {
-	logger.Printf("Watching for settings changes using HashWatcher")
-
 	// Use HashWatcher to monitor settings hash
 	watcher := redisClient.NewSettingsWatcher()
 	watcher.OnAny(func(settingKey, value string) error {

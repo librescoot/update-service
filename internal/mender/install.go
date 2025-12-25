@@ -133,42 +133,33 @@ func (i *Installer) CheckUpdateState(expectedVersion string) (UpdateState, error
 
 	// Get committed artifact name
 	committedArtifact := status.CommittedArtifact
-	i.logger.Printf("Current artifact: %s, expected: %s", committedArtifact, expectedVersion)
 
 	// Check for inconsistent state (failed update)
 	if strings.HasSuffix(committedArtifact, "_INCONSISTENT") {
-		i.logger.Printf("System in INCONSISTENT state: %s", committedArtifact)
+		i.logger.Printf("Mender: INCONSISTENT state (%s)", committedArtifact)
 		return StateInconsistent, nil
 	}
 
 	// Check if update is in progress
 	if status.UpdateInProgress {
-		i.logger.Printf("Update in progress: state=%s, artifact=%s, failed=%v",
-			status.State.InState, status.State.ArtifactName, status.State.Failed)
-
-		// Check if update failed
 		if status.State.Failed {
-			i.logger.Printf("Update failed, system may be inconsistent")
+			i.logger.Printf("Mender: update failed (state=%s)", status.State.InState)
 			return StateInconsistent, nil
 		}
-
-		// Check if waiting for commit
 		if status.NeedsCommit() {
-			i.logger.Printf("Update waiting for commit (needs reboot)")
+			i.logger.Printf("Mender: pending commit for %s", status.State.ArtifactName)
 			return StateNeedsReboot, nil
 		}
-
-		// Update in progress but not yet at commit stage
-		i.logger.Printf("Update in progress, not yet ready for commit")
+		i.logger.Printf("Mender: update in progress (state=%s)", status.State.InState)
 		return StateNoUpdate, nil
 	}
 
-	// No update in progress - check if we're on the expected version
-	if committedArtifact == expectedVersion {
-		i.logger.Printf("Already running expected version")
+	// No update in progress
+	if expectedVersion != "" && committedArtifact == expectedVersion {
+		i.logger.Printf("Mender: running %s (expected)", committedArtifact)
 		return StateCommitted, nil
 	}
 
-	i.logger.Printf("No update in progress (current: %s)", committedArtifact)
+	i.logger.Printf("Mender: running %s, no update pending", committedArtifact)
 	return StateNoUpdate, nil
 }
