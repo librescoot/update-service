@@ -1,6 +1,6 @@
-# Update Service
+# LibreScoot Update Service
 
-A service for managing over-the-air (OTA) updates for Librescoot vehicles.
+A service for managing over-the-air (OTA) updates for LibreScoot vehicles.
 
 ## Overview
 
