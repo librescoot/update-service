@@ -303,32 +303,35 @@ func (u *Updater) initializeRedisKeys() error {
 
 // checkInitialStandbyState checks the initial vehicle state on startup and sets standby timestamp
 func (u *Updater) checkInitialStandbyState() {
-	currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+	currentState, _, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
 	if err != nil {
 		u.logger.Printf("Vehicle state: unknown (%v)", err)
 		return
 	}
 
 	if currentState == "stand-by" {
-		if !stateTimestamp.IsZero() {
-			u.standbyStartTime = stateTimestamp
+		// Use ota:standby-timer-start as the authoritative source (set by vehicle-service on standby entry)
+		standbyTimerStart, err := u.redis.GetStandbyTimerStart()
+		if err == nil && !standbyTimerStart.IsZero() {
+			u.standbyStartTime = standbyTimerStart
+			elapsed := time.Since(standbyTimerStart)
+			u.logger.Printf("Vehicle in 'stand-by' since %s (%v ago)", standbyTimerStart.Format(time.RFC3339), elapsed)
 		} else {
+			// Fallback to current time if standby-timer-start is not set
 			u.standbyStartTime = time.Now()
+			u.logger.Printf("Vehicle in 'stand-by' (no timer-start timestamp, using current time)")
 		}
-	}
-	// Only log if not in stand-by (interesting case)
-	if currentState != "stand-by" {
+	} else {
 		u.logger.Printf("Vehicle state: %s (will wait for stand-by before reboot)", currentState)
 	}
 }
 
 // revalidateStandbyState re-validates the vehicle state after long-running operations
-// This ensures the standby timestamp reflects the current vehicle state, not a stale
-// timestamp from before the operation started. This is critical after operations like
-// delta patch application which can take 20+ minutes during which the vehicle state
-// may have changed multiple times.
+// Uses ota:standby-timer-start as the authoritative source (set by vehicle-service on standby entry).
+// If vehicle stayed in standby, the timer-start will be unchanged and we preserve the original time.
+// If vehicle left and re-entered standby, vehicle-service will have updated timer-start.
 func (u *Updater) revalidateStandbyState() {
-	currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+	currentState, _, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
 	if err != nil {
 		u.logger.Printf("Failed to get vehicle state after long-running operation: %v (clearing standby timestamp)", err)
 		u.standbyStartTime = time.Time{} // Clear on error to be safe
@@ -336,16 +339,23 @@ func (u *Updater) revalidateStandbyState() {
 	}
 
 	if currentState == "stand-by" {
-		if !stateTimestamp.IsZero() {
-			u.standbyStartTime = stateTimestamp
-			elapsed := time.Since(stateTimestamp)
-			u.logger.Printf("Vehicle in 'stand-by' after operation completion (timestamp: %s, elapsed: %v) - standby timer reset", stateTimestamp.Format(time.RFC3339), elapsed)
+		// Use ota:standby-timer-start as the authoritative source
+		standbyTimerStart, err := u.redis.GetStandbyTimerStart()
+		if err == nil && !standbyTimerStart.IsZero() {
+			elapsed := time.Since(standbyTimerStart)
+			if standbyTimerStart.Equal(u.standbyStartTime) {
+				u.logger.Printf("Vehicle still in 'stand-by' since %s (%v elapsed) - keeping original timestamp", standbyTimerStart.Format(time.RFC3339), elapsed)
+			} else {
+				u.standbyStartTime = standbyTimerStart
+				u.logger.Printf("Vehicle re-entered 'stand-by' at %s (%v ago)", standbyTimerStart.Format(time.RFC3339), elapsed)
+			}
 		} else {
+			// No standby-timer-start but vehicle is in standby - use current time
 			u.standbyStartTime = time.Now()
-			u.logger.Printf("Vehicle in 'stand-by' after operation completion (no timestamp) - using current time for standby tracking")
+			u.logger.Printf("Vehicle in 'stand-by' after operation (no timer-start) - using current time")
 		}
 	} else {
-		u.logger.Printf("Vehicle not in 'stand-by' after operation completion (current: %s) - clearing standby timestamp", currentState)
+		u.logger.Printf("Vehicle not in 'stand-by' after operation (current: %s) - clearing standby timestamp", currentState)
 		u.standbyStartTime = time.Time{}
 	}
 }
@@ -922,8 +932,24 @@ type deltaDownload struct {
 
 // performDeltaUpdate attempts to apply a chain of delta updates to reach the latest version
 func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string) {
-	// Step 1: Build the delta chain
-	deltaChain, err := u.buildDeltaChain(releases, currentVersion, u.config.Channel, variantID)
+	// Step 0: Determine the base version to start from
+	// First, check if we have a mender file for the current running version
+	baseVersion := currentVersion
+	if _, exists := u.mender.FindMenderFileForVersion(currentVersion); !exists {
+		// No mender file for current version - find the latest mender file we have for this channel
+		_, menderVersion, found := u.mender.FindLatestMenderFile(u.config.Channel)
+		if !found || menderVersion == "" {
+			u.logger.Printf("No mender file found for current version %s and no other mender files available for channel %s", currentVersion, u.config.Channel)
+			u.logger.Printf("Delta updates require a base mender file - would fall back to full update (DISABLED FOR TESTING)")
+			// TODO: Re-enable fallback after testing
+			return
+		}
+		u.logger.Printf("No mender file for running version %s, using available mender file version %s as base", currentVersion, menderVersion)
+		baseVersion = menderVersion
+	}
+
+	// Step 1: Build the delta chain from the base version
+	deltaChain, err := u.buildDeltaChain(releases, baseVersion, u.config.Channel, variantID)
 	if err != nil {
 		u.logger.Printf("Failed to build delta chain: %v", err)
 
@@ -940,7 +966,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 
 	if len(deltaChain) == 0 {
-		u.logger.Printf("Already at latest version %s", currentVersion)
+		u.logger.Printf("Already at latest version %s (base: %s)", currentVersion, baseVersion)
 		return
 	}
 
@@ -985,11 +1011,11 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 
 	// Log the delta chain
-	u.logger.Printf("Built delta chain with %d updates: %s -> %s", len(deltaChain), currentVersion, latestVersion)
+	u.logger.Printf("Built delta chain with %d updates: %s -> %s", len(deltaChain), baseVersion, latestVersion)
 	for i, release := range deltaChain {
 		u.logger.Printf("  Delta %d/%d: %s", i+1, len(deltaChain), release.TagName)
 	}
-	u.logger.Printf("Starting multi-delta update process for %s: %s -> %s (%d deltas)", u.config.Component, currentVersion, latestVersion, len(deltaChain))
+	u.logger.Printf("Starting multi-delta update process for %s: %s -> %s (%d deltas)", u.config.Component, baseVersion, latestVersion, len(deltaChain))
 
 	// Step 0: Check and commit any pending Mender update
 	if err := u.mender.Commit(); err != nil {
@@ -1103,7 +1129,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 	// Step 3: Apply all deltas sequentially
 	var finalMenderPath string
-	workingVersion := currentVersion
+	workingVersion := baseVersion
 
 	for i, dl := range downloads {
 		deltaNum := i + 1
@@ -1305,11 +1331,14 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 // fallbackToFullUpdate clears delta error state and falls back to a full update
 func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, reason string) {
-	u.logger.Printf("Delta update failed (%s), falling back to full update", reason)
+	u.logger.Printf("Delta update failed (%s), would fall back to full update (DISABLED FOR TESTING)", reason)
 
 	if err := u.status.SetError(u.ctx, "delta-failed", reason); err != nil {
 		u.logger.Printf("Failed to set error status: %v", err)
 	}
+
+	// TODO: Re-enable fallback after testing
+	return
 
 	time.Sleep(2 * time.Second)
 	if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
@@ -1491,16 +1520,17 @@ func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration)
 	// Use HashWatcher to monitor vehicle state changes
 	watcher := u.redis.NewVehicleWatcher(config.VehicleHashKey)
 	watcher.OnField("state", func(state string) error {
-		currentState, stateTimestamp, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+		currentState, _, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
 		if err != nil {
 			u.logger.Printf("Failed to get vehicle state after change: %v", err)
 			return nil
 		}
 
 		if currentState == "stand-by" {
-			// Set standby timestamp
-			if !stateTimestamp.IsZero() {
-				u.standbyStartTime = stateTimestamp
+			// Use ota:standby-timer-start as the authoritative source (set by vehicle-service on standby entry)
+			standbyTimerStart, err := u.redis.GetStandbyTimerStart()
+			if err == nil && !standbyTimerStart.IsZero() {
+				u.standbyStartTime = standbyTimerStart
 			} else {
 				u.standbyStartTime = time.Now()
 			}

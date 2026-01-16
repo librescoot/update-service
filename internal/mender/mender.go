@@ -177,6 +177,63 @@ func (m *Manager) FindMenderFileForVersion(version string) (string, bool) {
 	return "", false
 }
 
+// FindLatestMenderFile finds the newest .mender file in the download directory for the given channel
+// Returns the path, extracted version, and whether a file was found
+func (m *Manager) FindLatestMenderFile(channel string) (path string, version string, found bool) {
+	pattern := filepath.Join(m.downloader.downloadDir, "*.mender")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		m.logger.Printf("Error searching for mender files: %v", err)
+		return "", "", false
+	}
+
+	if len(files) == 0 {
+		return "", "", false
+	}
+
+	// Filter to files matching the channel and find the newest by modification time
+	var newestFile string
+	var newestTime int64
+	channelPrefix := channel + "-"
+
+	for _, file := range files {
+		basename := filepath.Base(file)
+		// Check if this file is for the right channel
+		if !strings.Contains(basename, channelPrefix) {
+			continue
+		}
+
+		info, err := os.Stat(file)
+		if err != nil {
+			continue
+		}
+		if info.ModTime().UnixNano() > newestTime {
+			newestTime = info.ModTime().UnixNano()
+			newestFile = file
+		}
+	}
+
+	if newestFile == "" {
+		return "", "", false
+	}
+
+	// Extract version from filename
+	// Format: librescoot-unu-mdb-nightly-20251226T091616.mender
+	// We want: nightly-20251226T091616
+	basename := filepath.Base(newestFile)
+	basename = strings.TrimSuffix(basename, ".mender")
+
+	// Find the channel-timestamp pattern
+	if idx := strings.Index(basename, channelPrefix); idx >= 0 {
+		version = basename[idx:]
+		m.logger.Printf("Found latest mender file: %s (version: %s)", newestFile, version)
+		return newestFile, version, true
+	}
+
+	m.logger.Printf("Found latest mender file but couldn't extract version: %s", newestFile)
+	return newestFile, "", true
+}
+
 // ApplyDeltaUpdate applies a delta update to generate a new mender file
 // Returns the path to the new mender file or an error
 func (m *Manager) ApplyDeltaUpdate(ctx context.Context, deltaURL, currentVersion string, downloadProgressCallback ProgressCallback, deltaProgressCallback DeltaProgressCallback) (string, error) {
