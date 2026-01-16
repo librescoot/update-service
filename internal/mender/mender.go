@@ -219,3 +219,55 @@ func (m *Manager) ApplyDeltaUpdate(ctx context.Context, deltaURL, currentVersion
 
 	return newMenderPath, nil
 }
+
+// DownloadDelta downloads a delta file without applying it
+// Returns the path to the downloaded delta file
+func (m *Manager) DownloadDelta(ctx context.Context, deltaURL string, progressCallback ProgressCallback) (string, error) {
+	m.logger.Printf("Downloading delta file from %s", deltaURL)
+	deltaPath, err := m.downloader.Download(ctx, deltaURL, progressCallback)
+	if err != nil {
+		return "", fmt.Errorf("failed to download delta file: %w", err)
+	}
+	return deltaPath, nil
+}
+
+// ApplyDownloadedDelta applies a pre-downloaded delta file to generate a new mender file
+// Returns the path to the new mender file or an error
+func (m *Manager) ApplyDownloadedDelta(deltaPath, currentVersion string, deltaProgressCallback DeltaProgressCallback) (string, error) {
+	// Find the existing mender file for the current version
+	oldMenderPath, exists := m.FindMenderFileForVersion(currentVersion)
+	if !exists {
+		return "", fmt.Errorf("no mender file found for current version %s, cannot apply delta", currentVersion)
+	}
+
+	// Generate the new mender filename based on the delta filename
+	deltaBaseName := filepath.Base(deltaPath)
+	newMenderName := deltaBaseName[:len(deltaBaseName)-6] + ".mender" // Replace .delta with .mender
+	newMenderPath := filepath.Join(m.downloader.downloadDir, newMenderName)
+
+	// Apply the delta
+	m.logger.Printf("Applying delta %s to %s -> %s", deltaPath, oldMenderPath, newMenderPath)
+	err := m.deltaApplier.ApplyDelta(oldMenderPath, deltaPath, newMenderPath, deltaProgressCallback)
+	if err != nil {
+		m.deltaApplier.CleanupDeltaFile(deltaPath)
+		return "", fmt.Errorf("failed to apply delta update: %w", err)
+	}
+
+	// Clean up the delta file after successful application
+	if err := m.deltaApplier.CleanupDeltaFile(deltaPath); err != nil {
+		m.logger.Printf("Warning: failed to cleanup delta file: %v", err)
+	}
+
+	// Clean up the old mender file after successful delta application
+	m.logger.Printf("Removing old mender file after successful delta application: %s", oldMenderPath)
+	if err := os.Remove(oldMenderPath); err != nil {
+		m.logger.Printf("Warning: failed to remove old mender file %s: %v", oldMenderPath, err)
+	}
+
+	return newMenderPath, nil
+}
+
+// CleanupDeltaFile removes a delta file (used when downloads are cancelled or fail)
+func (m *Manager) CleanupDeltaFile(deltaPath string) error {
+	return m.deltaApplier.CleanupDeltaFile(deltaPath)
+}

@@ -21,6 +21,7 @@ const (
 // Asset represents a GitHub release asset
 type Asset struct {
 	Name               string `json:"name"`
+	Size               int64  `json:"size"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 }
 

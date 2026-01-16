@@ -912,6 +912,14 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	}
 }
 
+// deltaDownload represents a downloaded delta file
+type deltaDownload struct {
+	release   Release
+	deltaPath string
+	deltaURL  string
+	err       error
+}
+
 // performDeltaUpdate attempts to apply a chain of delta updates to reach the latest version
 func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string) {
 	// Step 1: Build the delta chain
@@ -931,13 +939,50 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		return
 	}
 
-	if deltaChain == nil || len(deltaChain) == 0 {
+	if len(deltaChain) == 0 {
 		u.logger.Printf("Already at latest version %s", currentVersion)
 		return
 	}
 
 	// Get latest version from chain
 	latestVersion := strings.ToLower(deltaChain[len(deltaChain)-1].TagName)
+
+	// Calculate total delta size and compare with full update size
+	var totalDeltaSize int64
+	for _, release := range deltaChain {
+		for _, asset := range release.Assets {
+			if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
+				totalDeltaSize += asset.Size
+				break
+			}
+		}
+	}
+
+	// Find full update size from the latest release
+	latestRelease := deltaChain[len(deltaChain)-1]
+	var fullUpdateSize int64
+	for _, asset := range latestRelease.Assets {
+		if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".mender") {
+			fullUpdateSize = asset.Size
+			break
+		}
+	}
+
+	// If total delta size >= full update size, use full update instead
+	if fullUpdateSize > 0 && totalDeltaSize >= fullUpdateSize {
+		u.logger.Printf("Total delta size (%d bytes) >= full update size (%d bytes), using full update instead",
+			totalDeltaSize, fullUpdateSize)
+		menderURL := u.findMenderAsset(latestRelease, variantID)
+		if menderURL != "" {
+			u.performUpdate(latestRelease, menderURL)
+		}
+		return
+	}
+
+	if totalDeltaSize > 0 && fullUpdateSize > 0 {
+		u.logger.Printf("Delta chain size: %d bytes, full update: %d bytes (saving %d bytes)",
+			totalDeltaSize, fullUpdateSize, fullUpdateSize-totalDeltaSize)
+	}
 
 	// Log the delta chain
 	u.logger.Printf("Built delta chain with %d updates: %s -> %s", len(deltaChain), currentVersion, latestVersion)
@@ -997,7 +1042,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		}
 	}()
 
-	// Progress callbacks
+	// Progress callback for downloads (we'll track total across all deltas)
 	downloadProgressCallback := func(downloaded, total int64) {
 		if err := u.status.SetDownloadProgress(u.ctx, downloaded, total); err != nil {
 			u.logger.Printf("Failed to set download progress: %v", err)
@@ -1010,89 +1055,152 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		}
 	}
 
-	// Step 2: Apply all deltas in the chain sequentially
-	var finalMenderPath string
-	workingVersion := currentVersion
+	// Step 2: Download all deltas upfront
+	u.logger.Printf("=== Downloading all %d deltas ===", len(deltaChain))
+	downloads := make([]deltaDownload, len(deltaChain))
 
-	for deltaIndex, release := range deltaChain {
-		deltaNum := deltaIndex + 1
-		u.logger.Printf("=== Applying delta %d/%d: %s ===", deltaNum, len(deltaChain), release.TagName)
-
-		// Find delta URL for this release
+	for i, release := range deltaChain {
 		deltaURL := ""
 		for _, asset := range release.Assets {
 			if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
-				u.logger.Printf("Found delta asset: %s", asset.Name)
 				deltaURL = asset.BrowserDownloadURL
 				break
 			}
 		}
 
 		if deltaURL == "" {
-			u.logger.Printf("No delta asset found for %s, cannot continue multi-delta chain", release.TagName)
-			if err := u.status.SetError(u.ctx, "delta-failed", fmt.Sprintf("Delta %d/%d failed: no delta asset found", deltaNum, len(deltaChain))); err != nil {
-				u.logger.Printf("Failed to set error status: %v", err)
-			}
-
-			// Clear error and fall back to full update
-			time.Sleep(2 * time.Second)
-			if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
-				u.logger.Printf("Failed to clear status before fallback: %v", err)
-			}
-
-			latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
-			if found {
-				menderURL := u.findMenderAsset(latestRelease, variantID)
-				if menderURL != "" {
-					u.logger.Printf("Falling back to full update with latest version")
-					u.performUpdate(latestRelease, menderURL)
-				}
-			}
+			u.logger.Printf("No delta asset found for %s, cannot continue", release.TagName)
+			u.fallbackToFullUpdate(releases, variantID, "no delta asset found")
 			return
 		}
 
-		targetVersion := strings.ToLower(release.TagName)
+		downloads[i].release = release
+		downloads[i].deltaURL = deltaURL
 
-		u.logger.Printf("Downloading and applying delta %d/%d: %s -> %s", deltaNum, len(deltaChain), workingVersion, targetVersion)
-
-		// Apply this delta
-		newMenderPath, err := u.mender.ApplyDeltaUpdate(u.ctx, deltaURL, workingVersion, downloadProgressCallback, installProgressCallback)
+		u.logger.Printf("Downloading delta %d/%d: %s", i+1, len(deltaChain), release.TagName)
+		deltaPath, err := u.mender.DownloadDelta(u.ctx, deltaURL, downloadProgressCallback)
 		if err != nil {
-			u.logger.Printf("Delta %d/%d failed: %v", deltaNum, len(deltaChain), err)
-			if err := u.status.SetError(u.ctx, "delta-failed", fmt.Sprintf("Delta %d/%d failed: %v", deltaNum, len(deltaChain), err)); err != nil {
-				u.logger.Printf("Failed to set error status: %v", err)
-			}
-
-			// Clear error and fall back to full update
-			time.Sleep(2 * time.Second)
-			if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
-				u.logger.Printf("Failed to clear status before fallback: %v", err)
-			}
-
-			latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
-			if found {
-				menderURL := u.findMenderAsset(latestRelease, variantID)
-				if menderURL != "" {
-					u.logger.Printf("Falling back to full update with latest version")
-					u.performUpdate(latestRelease, menderURL)
+			u.logger.Printf("Failed to download delta %d/%d: %v", i+1, len(deltaChain), err)
+			// Clean up any previously downloaded deltas
+			for j := 0; j < i; j++ {
+				if downloads[j].deltaPath != "" {
+					u.mender.CleanupDeltaFile(downloads[j].deltaPath)
 				}
 			}
+			u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("download failed: %v", err))
 			return
 		}
+		downloads[i].deltaPath = deltaPath
+		u.logger.Printf("Downloaded delta %d/%d to %s", i+1, len(deltaChain), deltaPath)
 
-		u.logger.Printf("Delta %d/%d applied successfully: %s", deltaNum, len(deltaChain), newMenderPath)
-
-		// Clear progress for this delta
+		// Clear download progress between deltas
 		if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
 			u.logger.Printf("Failed to clear download progress: %v", err)
 		}
+	}
+
+	u.logger.Printf("=== All deltas downloaded, applying sequentially ===")
+
+	// Step 3: Apply all deltas sequentially
+	var finalMenderPath string
+	workingVersion := currentVersion
+
+	for i, dl := range downloads {
+		deltaNum := i + 1
+		targetVersion := strings.ToLower(dl.release.TagName)
+
+		u.logger.Printf("=== Applying delta %d/%d: %s -> %s ===", deltaNum, len(downloads), workingVersion, targetVersion)
+
+		newMenderPath, err := u.mender.ApplyDownloadedDelta(dl.deltaPath, workingVersion, installProgressCallback)
+		if err != nil {
+			u.logger.Printf("Delta %d/%d failed: %v", deltaNum, len(downloads), err)
+			// Clean up remaining downloaded deltas
+			for j := i + 1; j < len(downloads); j++ {
+				if downloads[j].deltaPath != "" {
+					u.mender.CleanupDeltaFile(downloads[j].deltaPath)
+				}
+			}
+			u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("apply failed: %v", err))
+			return
+		}
+
+		u.logger.Printf("Delta %d/%d applied successfully: %s", deltaNum, len(downloads), newMenderPath)
+
+		// Clear progress
 		if err := u.status.ClearInstallProgress(u.ctx); err != nil {
 			u.logger.Printf("Failed to clear install progress: %v", err)
 		}
 
-		// Update working version and final path for next iteration
 		workingVersion = targetVersion
 		finalMenderPath = newMenderPath
+	}
+
+	u.logger.Printf("All %d deltas applied successfully", len(downloads))
+
+	// Step 4: Check for additional deltas that may have been released during the update
+	u.logger.Printf("Checking for additional deltas released during update...")
+	freshReleases, err := u.githubAPI.GetReleases()
+	if err != nil {
+		u.logger.Printf("Warning: Failed to check for new releases: %v (proceeding with install)", err)
+	} else {
+		additionalChain, err := u.buildDeltaChain(freshReleases, workingVersion, u.config.Channel, variantID)
+		if err == nil && len(additionalChain) > 0 {
+			u.logger.Printf("Found %d additional deltas released during update!", len(additionalChain))
+
+			// Update target version
+			newLatestVersion := strings.ToLower(additionalChain[len(additionalChain)-1].TagName)
+			if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, newLatestVersion); err != nil {
+				u.logger.Printf("Failed to update target version: %v", err)
+			}
+
+			// Download and apply additional deltas
+			for i, release := range additionalChain {
+				deltaURL := ""
+				for _, asset := range release.Assets {
+					if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
+						deltaURL = asset.BrowserDownloadURL
+						break
+					}
+				}
+
+				if deltaURL == "" {
+					u.logger.Printf("No delta asset for additional release %s, stopping here", release.TagName)
+					break
+				}
+
+				targetVersion := strings.ToLower(release.TagName)
+				u.logger.Printf("=== Applying additional delta %d/%d: %s -> %s ===", i+1, len(additionalChain), workingVersion, targetVersion)
+
+				// Download
+				deltaPath, err := u.mender.DownloadDelta(u.ctx, deltaURL, downloadProgressCallback)
+				if err != nil {
+					u.logger.Printf("Failed to download additional delta: %v (proceeding with install)", err)
+					break
+				}
+
+				if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
+					u.logger.Printf("Failed to clear download progress: %v", err)
+				}
+
+				// Apply
+				newMenderPath, err := u.mender.ApplyDownloadedDelta(deltaPath, workingVersion, installProgressCallback)
+				if err != nil {
+					u.logger.Printf("Failed to apply additional delta: %v (proceeding with install)", err)
+					u.mender.CleanupDeltaFile(deltaPath)
+					break
+				}
+
+				if err := u.status.ClearInstallProgress(u.ctx); err != nil {
+					u.logger.Printf("Failed to clear install progress: %v", err)
+				}
+
+				workingVersion = targetVersion
+				finalMenderPath = newMenderPath
+				u.logger.Printf("Additional delta applied: now at %s", workingVersion)
+			}
+		} else {
+			u.logger.Printf("No additional deltas found")
+		}
 	}
 
 	u.logger.Printf("All deltas applied successfully, final mender file: %s", finalMenderPath)
@@ -1191,6 +1299,29 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		u.logger.Printf("Unknown component %s, cannot determine reboot strategy. Setting to idle.", u.config.Component)
 		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
 			u.logger.Printf("Failed to set idle status for unknown component: %v", err)
+		}
+	}
+}
+
+// fallbackToFullUpdate clears delta error state and falls back to a full update
+func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, reason string) {
+	u.logger.Printf("Delta update failed (%s), falling back to full update", reason)
+
+	if err := u.status.SetError(u.ctx, "delta-failed", reason); err != nil {
+		u.logger.Printf("Failed to set error status: %v", err)
+	}
+
+	time.Sleep(2 * time.Second)
+	if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+		u.logger.Printf("Failed to clear status before fallback: %v", err)
+	}
+
+	latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
+	if found {
+		menderURL := u.findMenderAsset(latestRelease, variantID)
+		if menderURL != "" {
+			u.logger.Printf("Starting full update to %s", latestRelease.TagName)
+			u.performUpdate(latestRelease, menderURL)
 		}
 	}
 }
