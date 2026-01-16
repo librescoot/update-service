@@ -76,8 +76,8 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 	return u
 }
 
-// CheckAndCommitPendingUpdate checks mender state and commits if ready.
-// Returns true if an update is waiting for reboot.
+// CheckAndCommitPendingUpdate checks mender state and commits if needed.
+// Returns true if an update is installed but waiting for reboot.
 func (u *Updater) CheckAndCommitPendingUpdate() (needsReboot bool, err error) {
 	// Get expected version from Redis (set during download/install)
 	expectedVersion, _ := u.redis.GetTargetVersion(u.config.Component)
@@ -88,8 +88,28 @@ func (u *Updater) CheckAndCommitPendingUpdate() (needsReboot bool, err error) {
 		return false, nil // Don't fail startup
 	}
 
-	// CheckUpdateState already logs the state, just return the result
-	return state == mender.StateNeedsReboot, nil
+	switch state {
+	case mender.StateNeedsCommit:
+		// We've rebooted into the new partition - commit it
+		u.logger.Printf("Committing pending update")
+		if err := u.mender.Commit(); err != nil {
+			u.logger.Printf("Failed to commit update: %v", err)
+			return false, err
+		}
+		u.logger.Printf("Update committed successfully")
+		return false, nil
+
+	case mender.StateNeedsReboot:
+		// Update installed but not yet rebooted
+		return true, nil
+
+	case mender.StateInconsistent:
+		u.logger.Printf("Mender in inconsistent state, may need manual intervention")
+		return false, nil
+
+	default:
+		return false, nil
+	}
 }
 
 // Start starts the updater. The menderNeedsReboot parameter indicates if

@@ -7,7 +7,7 @@ import (
 
 func TestUpdateState_Constants(t *testing.T) {
 	// Ensure the constants have distinct values
-	states := []UpdateState{StateNoUpdate, StateCommitted, StateNeedsReboot, StateInconsistent}
+	states := []UpdateState{StateNoUpdate, StateCommitted, StateNeedsReboot, StateNeedsCommit, StateInconsistent}
 	seen := make(map[UpdateState]bool)
 
 	for _, state := range states {

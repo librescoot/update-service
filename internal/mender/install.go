@@ -17,6 +17,7 @@ const (
 	StateNoUpdate     UpdateState = iota // No update in progress
 	StateCommitted                       // Update successfully committed
 	StateNeedsReboot                     // Update installed, waiting for reboot
+	StateNeedsCommit                     // Rebooted into new partition, needs commit
 	StateInconsistent                    // Update failed, system inconsistent
 )
 
@@ -148,10 +149,11 @@ func (i *Installer) CheckUpdateState(expectedVersion string) (UpdateState, error
 		}
 		if status.NeedsCommit() {
 			i.logger.Printf("Mender: pending commit for %s", status.State.ArtifactName)
-			return StateNeedsReboot, nil
+			return StateNeedsCommit, nil
 		}
-		i.logger.Printf("Mender: update in progress (state=%s)", status.State.InState)
-		return StateNoUpdate, nil
+		// Update installed but not yet rebooted
+		i.logger.Printf("Mender: reboot pending for %s (state=%s)", status.State.ArtifactName, status.State.InState)
+		return StateNeedsReboot, nil
 	}
 
 	// No update in progress
