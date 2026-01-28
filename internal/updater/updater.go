@@ -1137,7 +1137,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 		u.logger.Printf("=== Applying delta %d/%d: %s -> %s ===", deltaNum, len(downloads), workingVersion, targetVersion)
 
-		newMenderPath, err := u.mender.ApplyDownloadedDelta(dl.deltaPath, workingVersion, installProgressCallback)
+		newMenderPath, err := u.mender.ApplyDownloadedDelta(u.ctx, dl.deltaPath, workingVersion, installProgressCallback)
 		if err != nil {
 			u.logger.Printf("Delta %d/%d failed: %v", deltaNum, len(downloads), err)
 			// Clean up remaining downloaded deltas
@@ -1209,7 +1209,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 				}
 
 				// Apply
-				newMenderPath, err := u.mender.ApplyDownloadedDelta(deltaPath, workingVersion, installProgressCallback)
+				newMenderPath, err := u.mender.ApplyDownloadedDelta(u.ctx, deltaPath, workingVersion, installProgressCallback)
 				if err != nil {
 					u.logger.Printf("Failed to apply additional delta: %v (proceeding with install)", err)
 					u.mender.CleanupDeltaFile(deltaPath)
@@ -1516,6 +1516,7 @@ func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration)
 
 	// Create a channel to signal when standby duration is met
 	standbyMet := make(chan error, 1)
+	var once sync.Once
 
 	// Use HashWatcher to monitor vehicle state changes
 	watcher := u.redis.NewVehicleWatcher(config.VehicleHashKey)
@@ -1541,12 +1542,12 @@ func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration)
 			if durationInStandby >= requiredDuration {
 				u.logger.Printf("Vehicle has been in 'stand-by' for %v. Proceeding with MDB reboot.", durationInStandby)
 				u.logger.Printf("Triggering MDB reboot via Redis command")
-				standbyMet <- u.redis.TriggerReboot()
+				once.Do(func() { standbyMet <- u.redis.TriggerReboot() })
 			} else {
 				// Start precise timer for remaining duration
 				remainingTime := requiredDuration - durationInStandby
 				u.logger.Printf("Vehicle in 'stand-by' for %v. Starting precise timer for %v.", durationInStandby, remainingTime)
-				standbyMet <- u.waitForStandbyTimer(remainingTime)
+				once.Do(func() { standbyMet <- u.waitForStandbyTimer(remainingTime) })
 			}
 		} else {
 			if !u.standbyStartTime.IsZero() {

@@ -3,6 +3,7 @@ package mender
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // DeltaApplier handles applying delta updates to generate new mender files
@@ -34,7 +36,7 @@ type DeltaProgressCallback func(percent int)
 // deltaPath: path to the downloaded .delta file
 // newMenderPath: path where the new .mender file should be created
 // progressCallback: optional callback for progress updates (can be nil)
-func (a *DeltaApplier) ApplyDelta(oldMenderPath, deltaPath, newMenderPath string, progressCallback DeltaProgressCallback) error {
+func (a *DeltaApplier) ApplyDelta(ctx context.Context, oldMenderPath, deltaPath, newMenderPath string, progressCallback DeltaProgressCallback) error {
 	// Verify input files exist
 	if _, err := os.Stat(oldMenderPath); err != nil {
 		if os.IsNotExist(err) {
@@ -57,7 +59,10 @@ func (a *DeltaApplier) ApplyDelta(oldMenderPath, deltaPath, newMenderPath string
 	}
 
 	// Execute the delta application script with nice priority (lower CPU priority)
-	cmd := exec.Command("nice", "-n", "10", "/usr/bin/mender-apply-delta.py", oldMenderPath, deltaPath, newMenderPath)
+	// Use a 30-minute timeout to prevent indefinite hangs
+	deltaCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(deltaCtx, "nice", "-n", "10", "/usr/bin/mender-apply-delta.py", oldMenderPath, deltaPath, newMenderPath)
 
 	// Set up pipes to capture and parse stdout/stderr
 	stdoutPipe, err := cmd.StdoutPipe()
