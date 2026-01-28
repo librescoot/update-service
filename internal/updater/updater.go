@@ -1757,8 +1757,10 @@ func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, v
 		}
 	}
 
-	// If no deltas needed, return nil (already at latest)
 	if len(deltaChain) == 0 {
+		if !foundCurrent {
+			return nil, fmt.Errorf("current version %s not found in %s releases", currentVersion, channel)
+		}
 		return nil, nil
 	}
 

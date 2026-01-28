@@ -200,6 +200,9 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 	var resp *http.Response
 	maxRetries := 5
 	for i := 0; i < maxRetries; i++ {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		d.logger.Printf("Starting download attempt %d/%d", i+1, maxRetries)
 		resp, err = client.Do(req)
 		if err == nil {
@@ -209,7 +212,11 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 		if i < maxRetries-1 {
 			sleepTime := time.Duration(1<<uint(i)) * time.Second
 			d.logger.Printf("Waiting %v before retry...", sleepTime)
-			time.Sleep(sleepTime)
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(sleepTime):
+			}
 		}
 	}
 	if err != nil {
