@@ -371,12 +371,331 @@ func (u *Updater) listenForCommands() {
 
 // handleCommand handles incoming Redis commands
 func (u *Updater) handleCommand(command string) {
-	switch command {
-	case "check-now":
+	switch {
+	case command == "check-now":
 		u.logger.Printf("Received check-now command, triggering immediate update check")
 		go u.checkForUpdates()
+
+	case strings.HasPrefix(command, "update-from-file:"):
+		filePath := strings.TrimPrefix(command, "update-from-file:")
+		u.logger.Printf("Received update-from-file command: %s", filePath)
+		go func() {
+			u.handleUpdateFromFile(filePath)
+		}()
+
+	case strings.HasPrefix(command, "update-from-url:"):
+		url := strings.TrimPrefix(command, "update-from-url:")
+		u.logger.Printf("Received update-from-url command: %s", url)
+		go func() {
+			u.handleUpdateFromURL(url)
+		}()
+
 	default:
 		u.logger.Printf("Unknown update command: %s", command)
+	}
+}
+
+// parseUpdateSource parses an update source (file path or URL) and extracts optional checksum
+// Returns: (source, checksum, isURL)
+func (u *Updater) parseUpdateSource(source string) (string, string, bool) {
+	parts := strings.SplitN(source, ":", 3)
+
+	if len(parts) >= 2 && (parts[0] == "http" || parts[0] == "https" || parts[0] == "file") {
+		if len(parts) == 3 && parts[1] == "sha256" {
+			return parts[0] + ":" + parts[1], parts[2], true
+		}
+		return source, "", true
+	}
+
+	if len(parts) == 3 && parts[1] == "sha256" {
+		return parts[0], parts[2], false
+	}
+
+	return source, "", false
+}
+
+// isURL checks if the given string is a URL
+func (u *Updater) isURL(source string) bool {
+	return strings.HasPrefix(source, "http://") ||
+		strings.HasPrefix(source, "https://") ||
+		strings.HasPrefix(source, "file://")
+}
+
+// handleUpdateFromFile processes an update from a local file path
+// Supports format: /path/to/file.mender or /path/to/file.mender:sha256:checksum
+func (u *Updater) handleUpdateFromFile(filePath string) {
+	source, _, _ := u.parseUpdateSource(filePath)
+	isURL := u.isURL(filePath)
+
+	if isURL {
+		u.handleUpdateFromURL(filePath)
+		return
+	}
+
+	u.logger.Printf("Processing update from local file: %s", source)
+
+	if _, err := os.Stat(source); err != nil {
+		u.logger.Printf("Error: file not found: %s", source)
+		if err := u.status.SetError(u.ctx, "file-not-found", fmt.Sprintf("File not found: %s", source)); err != nil {
+			u.logger.Printf("Failed to set error status: %v", err)
+		}
+		return
+	}
+
+	if !strings.HasSuffix(source, ".mender") {
+		u.logger.Printf("Error: file is not a .mender file: %s", source)
+		if err := u.status.SetError(u.ctx, "invalid-file", fmt.Sprintf("File is not a .mender file: %s", source)); err != nil {
+			u.logger.Printf("Failed to set error status: %v", err)
+		}
+		return
+	}
+
+	u.logger.Printf("File exists: %s", source)
+
+	var version string
+	filename := filepath.Base(source)
+	filename = strings.TrimSuffix(filename, ".mender")
+
+	if strings.Contains(filename, "nightly-") {
+		version = strings.ToLower(filename)
+	} else if strings.Contains(filename, "testing-") {
+		version = strings.ToLower(filename)
+	} else if strings.HasPrefix(filename, "v") {
+		version = filename
+	} else {
+		version = filename
+	}
+
+	u.logger.Printf("Detected version from filename: %s", version)
+
+	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, version); err != nil {
+		u.logger.Printf("Failed to set downloading status: %v", err)
+		return
+	}
+
+	u.logger.Printf("Setting update method to full for file update")
+	if err := u.status.SetUpdateMethod(u.ctx, "full"); err != nil {
+		u.logger.Printf("Failed to set update method: %v", err)
+	}
+
+	u.logger.Printf("File ready for installation: %s", source)
+
+	if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
+		u.logger.Printf("Failed to add download inhibit: %v", err)
+	}
+
+	defer func() {
+		if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove download inhibit: %v", err)
+		}
+		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove install inhibit: %v", err)
+		}
+
+		if u.config.Component == "dbc" {
+			u.logger.Printf("File update cleanup - sending complete-dbc command")
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
+			}
+		}
+	}()
+
+	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
+		u.logger.Printf("Failed to set installing status: %v", err)
+		return
+	}
+
+	if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
+		u.logger.Printf("Failed to add install inhibit: %v", err)
+	}
+
+	if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
+		u.logger.Printf("Failed to remove download inhibit: %v", err)
+	}
+
+	if err := u.mender.Install(source); err != nil {
+		u.logger.Printf("Failed to install update: %v", err)
+		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update: %v", err)); err != nil {
+			u.logger.Printf("Failed to set error status: %v", err)
+		}
+		return
+	}
+
+	u.logger.Printf("Successfully installed update from file")
+
+	if err := u.status.SetStatus(u.ctx, status.StatusRebooting); err != nil {
+		u.logger.Printf("Failed to set rebooting status: %v", err)
+	}
+
+	if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+		u.logger.Printf("Failed to remove install inhibit: %v", err)
+	}
+
+	u.logger.Printf("Update installation complete, system will reboot to apply changes")
+
+	if u.config.Component == "mdb" || u.config.Component == "dbc" {
+		u.logger.Printf("%s update installed, triggering reboot", strings.ToUpper(u.config.Component))
+		err := u.TriggerReboot(u.config.Component)
+		if err != nil {
+			u.logger.Printf("Failed to trigger %s reboot: %v", u.config.Component, err)
+			if !strings.Contains(err.Error(), "DRY-RUN") {
+				if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
+					u.logger.Printf("Additionally failed to set error status after %s reboot trigger failure: %v", u.config.Component, statusErr)
+				}
+			}
+
+			if u.config.DryRun || strings.Contains(err.Error(), "DRY-RUN") {
+				u.logger.Printf("Dry run or simulated reboot: Simulating post-reboot state by setting idle status for %s.", u.config.Component)
+				if idleErr := u.status.SetIdleAndClearVersion(u.ctx); idleErr != nil {
+					u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
+				}
+			}
+		}
+	} else {
+		u.logger.Printf("Unknown component %s, cannot determine reboot strategy. Setting to idle.", u.config.Component)
+		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+			u.logger.Printf("Failed to set idle status for unknown component: %v", err)
+		}
+	}
+}
+
+// handleUpdateFromURL processes an update from a URL
+// Supports format: https://example.com/file.mender or https://example.com/file.mender:sha256:checksum
+func (u *Updater) handleUpdateFromURL(url string) {
+	source, checksum, _ := u.parseUpdateSource(url)
+	if checksum != "" {
+		u.logger.Printf("Checksum provided: %s", checksum)
+	}
+
+	u.logger.Printf("Processing update from URL: %s", source)
+
+	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, "unknown"); err != nil {
+		u.logger.Printf("Failed to set downloading status: %v", err)
+		return
+	}
+
+	u.logger.Printf("Setting update method based on configuration")
+	updateMethod := u.getUpdateMethod()
+	if err := u.status.SetUpdateMethod(u.ctx, updateMethod); err != nil {
+		u.logger.Printf("Failed to set update method: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		if u.ctx.Err() != nil {
+			u.logger.Printf("Context cancelled during download attempt %d", i+1)
+			return
+		}
+
+		u.logger.Printf("Starting download attempt %d/5", i+1)
+
+		filePath, err := u.mender.DownloadAndVerify(u.ctx, source, checksum, func(downloaded, total int64) {
+			if err := u.status.SetDownloadProgress(u.ctx, downloaded, total); err != nil {
+				u.logger.Printf("Failed to update download progress: %v", err)
+			}
+		})
+
+		if err != nil {
+			u.logger.Printf("Download failed (attempt %d/5): %v", i+1, err)
+			if i < 4 {
+				sleepTime := time.Duration(1<<uint(i)) * time.Second
+				u.logger.Printf("Waiting %v before retry...", sleepTime)
+				select {
+				case <-u.ctx.Done():
+					return
+				case <-time.After(sleepTime):
+				}
+				continue
+			}
+			u.logger.Printf("Failed to download update after 5 attempts: %v", err)
+			if err := u.status.SetError(u.ctx, "download-failed", fmt.Sprintf("Failed to download update: %v", err)); err != nil {
+				u.logger.Printf("Failed to set error status: %v", err)
+			}
+			return
+		}
+
+		u.logger.Printf("Successfully downloaded update to: %s", filePath)
+
+		if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
+			u.logger.Printf("Failed to clear download progress: %v", err)
+		}
+
+		u.revalidateStandbyState()
+
+		if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
+			u.logger.Printf("Failed to set installing status: %v", err)
+			return
+		}
+
+		if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to add install inhibit: %v", err)
+		}
+
+		if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove download inhibit: %v", err)
+		}
+
+		if err := u.mender.Install(filePath); err != nil {
+			u.logger.Printf("Failed to install update: %v", err)
+
+			errStr := err.Error()
+			isCorruptionError := strings.Contains(errStr, "gzip") ||
+				strings.Contains(errStr, "checksum") ||
+				strings.Contains(errStr, "corrupt") ||
+				strings.Contains(errStr, "truncated")
+
+			if isCorruptionError {
+				u.logger.Printf("Installation failed due to file corruption, deleting corrupted file: %s", filePath)
+				if removeErr := u.mender.RemoveFile(filePath); removeErr != nil {
+					u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
+				} else {
+					u.logger.Printf("Deleted corrupted file, next update check will re-download")
+				}
+			}
+
+			if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update: %v", err)); err != nil {
+				u.logger.Printf("Failed to set error status: %v", err)
+			}
+			return
+		}
+
+		u.logger.Printf("Successfully installed update")
+
+		if err := u.status.SetStatus(u.ctx, status.StatusRebooting); err != nil {
+			u.logger.Printf("Failed to set rebooting status: %v", err)
+		}
+
+		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove install inhibit: %v", err)
+		}
+
+		u.logger.Printf("Update installation complete, system will reboot to apply changes")
+
+		if u.config.Component == "mdb" || u.config.Component == "dbc" {
+			u.logger.Printf("%s update installed, triggering reboot", strings.ToUpper(u.config.Component))
+			err := u.TriggerReboot(u.config.Component)
+			if err != nil {
+				u.logger.Printf("Failed to trigger %s reboot: %v", u.config.Component, err)
+				if !strings.Contains(err.Error(), "DRY-RUN") {
+					if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
+						u.logger.Printf("Additionally failed to set error status after %s reboot trigger failure: %v", u.config.Component, statusErr)
+					}
+				}
+
+				if u.config.DryRun || strings.Contains(err.Error(), "DRY-RUN") {
+					u.logger.Printf("Dry run or simulated reboot: Simulating post-reboot state by setting idle status for %s.", u.config.Component)
+					if idleErr := u.status.SetIdleAndClearVersion(u.ctx); idleErr != nil {
+						u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
+					}
+				}
+			}
+		} else {
+			u.logger.Printf("Unknown component %s, cannot determine reboot strategy. Setting to idle.", u.config.Component)
+			if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+				u.logger.Printf("Failed to set idle status for unknown component: %v", err)
+			}
+		}
+
+		return
 	}
 }
 

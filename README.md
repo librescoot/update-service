@@ -22,6 +22,7 @@ The Update Service is responsible for:
 - **Controlled Reboots**: Schedules reboots based on component-specific rules and vehicle state (e.g., MDB reboots only in stand-by).
 - **Dry-Run Mode**: Allows testing update logic without performing actual reboots.
 - **Redis-Based State and Communication**: Uses Redis for status tracking and inter-service communication.
+- **Flexible Update Sources**: Supports updates from local files or remote URLs (both full and delta updates).
 
 ## Installation
 
@@ -130,10 +131,18 @@ Many previous Redis key configurations are now handled internally based on the s
 
 ### Redis Commands
 
-The update service listens for commands on the `scooter:update` list. Commands can be sent using Redis LPUSH:
+The update service listens for commands on the `scooter:update` list. Commands can be sent using Redis LPUSH.
 
 **Available Commands:**
+
+#### Standard Commands
 - `check-now` - Immediately trigger an update check, bypassing the configured check interval
+
+#### Custom Update Sources
+- `update-from-file:/path/to/file.mender` - Update from a local Mender file
+- `update-from-file:/path/to/file.mender:sha256:checksum` - Update from local file with checksum verification
+- `update-from-url:https://example.com/file.mender` - Update from a remote URL
+- `update-from-url:https://example.com/file.mender:sha256:checksum` - Update from URL with checksum verification
 
 **Examples:**
 ```bash
@@ -141,22 +150,58 @@ The update service listens for commands on the `scooter:update` list. Commands c
 redis-cli LPUSH scooter:update check-now
 
 # This triggers update checks for all running update-service instances (both MDB and DBC)
+
+# Update from a local file (auto-detects checksum if provided)
+redis-cli LPUSH scooter:update:dbc "update-from-file:/data/ota/librescoot-unu-dbc-nightly-20251212T024719.mender"
+
+# Update from a URL with checksum verification
+redis-cli LPUSH scooter:update:dbc "update-from-url:https://github.com/librescoot/librescoot/releases/download/nightly-20251212T024719/librescoot-unu-dbc-nightly-20251212T024719.mender:sha256:abc123..."
+
+# Update specific component only
+redis-cli LPUSH scooter:update:mdb "update-from-file:/data/ota/librescoot-unu-mdb-nightly-20251212T024719.mender"
 ```
+
+**Auto-Detection:**
+- URLs are automatically detected by `http://`, `https://`, or `file://` prefixes
+- All other paths are treated as local file paths
+
+**Update Method Selection:**
+- The service automatically chooses between delta and full updates based on:
+  - The configured update method (`updates.{component}.method` in Redis)
+  - Availability of the base Mender file for the current version
+  - If delta is configured but no base file exists, falls back to full update
+
+**Checksum Format:**
+- Only SHA256 checksums are supported
+- Format: `sha256:hexdigest` (e.g., `sha256:a1b2c3d4...`)
 
 **Note:** The `check-now` command is useful for:
 - Testing update functionality without waiting for the next scheduled check
 - Manually checking for updates after deploying new releases
 - Forcing an update check after changing update settings
 
+**Note:** Custom update sources are useful for:
+- Testing new releases before publishing to GitHub
+- Installing updates from alternative sources
+- Development and debugging scenarios
+- Manual update deployment with specific files
+
 ## Component-Specific Update Constraints
 
 ### DBC Updates
 - DBC updates should not turn off the DBC during the update process.
 - The vehicle must remain capable of locking and becoming un-drivable during DBC updates.
+- Custom update sources work the same way as automatic updates - the service handles power management automatically.
 
 ### MDB Updates
 - MDB updates can generally be installed at any time the vehicle is not in a critical state.
 - MDB reboots should only occur when the scooter is in stand-by mode, managed via the power inhibitor client.
+- Custom update sources respect the same reboot constraints as automatic updates.
+
+**Note:** When using custom update sources with the `delta` update method:
+- The service requires a base Mender file for the current version to exist in the download directory
+- If no base file is found, the update automatically falls back to full update mode
+- The service automatically detects the current version from Redis (`version:{component}`)
 
 ## Architecture
 
