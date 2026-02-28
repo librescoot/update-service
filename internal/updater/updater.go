@@ -478,6 +478,14 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		u.logger.Printf("Failed to set update method: %v", err)
 	}
 
+	// For DBC updates, notify vehicle-service to keep dashboard power on
+	if u.config.Component == "dbc" {
+		u.logger.Printf("Starting DBC file update - sending start-dbc command")
+		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+			u.logger.Printf("Failed to send start-dbc command: %v", err)
+		}
+	}
+
 	u.logger.Printf("File ready for installation: %s", source)
 
 	if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
