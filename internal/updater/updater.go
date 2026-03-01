@@ -40,6 +40,9 @@ type Updater struct {
 
 	// Prevent concurrent update checks
 	updateCheckMu sync.Mutex
+
+	// Track active update goroutines for clean shutdown
+	wg sync.WaitGroup
 }
 
 // New creates a new component-aware updater
@@ -149,6 +152,7 @@ func (u *Updater) Stop() {
 func (u *Updater) Close() {
 	u.logger.Printf("Shutting down updater for component %s", u.config.Component)
 	u.Stop()
+	u.wg.Wait()
 }
 
 // getUpdateMethod returns the current update method (thread-safe)
@@ -374,19 +378,27 @@ func (u *Updater) handleCommand(command string) {
 	switch {
 	case command == "check-now":
 		u.logger.Printf("Received check-now command, triggering immediate update check")
-		go u.checkForUpdates()
+		u.wg.Add(1)
+		go func() {
+			defer u.wg.Done()
+			u.checkForUpdates()
+		}()
 
 	case strings.HasPrefix(command, "update-from-file:"):
 		filePath := strings.TrimPrefix(command, "update-from-file:")
 		u.logger.Printf("Received update-from-file command: %s", filePath)
+		u.wg.Add(1)
 		go func() {
+			defer u.wg.Done()
 			u.handleUpdateFromFile(filePath)
 		}()
 
 	case strings.HasPrefix(command, "update-from-url:"):
 		url := strings.TrimPrefix(command, "update-from-url:")
 		u.logger.Printf("Received update-from-url command: %s", url)
+		u.wg.Add(1)
 		go func() {
+			defer u.wg.Done()
 			u.handleUpdateFromURL(url)
 		}()
 
@@ -826,7 +838,11 @@ func (u *Updater) checkForUpdates() {
 	// If delta updates are configured and we have a current version
 	if updateMethod == "delta" && currentVersion != "" {
 		// Attempt delta update
-		go u.performDeltaUpdate(releases, currentVersion, variantID)
+		u.wg.Add(1)
+		go func() {
+			defer u.wg.Done()
+			u.performDeltaUpdate(releases, currentVersion, variantID)
+		}()
 		return
 	}
 
@@ -870,7 +886,11 @@ func (u *Updater) checkForUpdates() {
 	u.logger.Printf("Update needed for %s: %s (using full update)", u.config.Component, release.TagName)
 
 	// Start the update process
-	go u.performUpdate(release, assetURL)
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		u.performUpdate(release, assetURL)
+	}()
 }
 
 // inferChannelFromVersion attempts to infer the channel from the version string
