@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/librescoot/update-service/internal/boot"
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/inhibitor"
 	"github.com/librescoot/update-service/internal/power"
@@ -28,6 +29,11 @@ var (
 	downloadDir       = flag.String("download-dir", "", "Download directory for OTA files (default: /data/ota/{component})")
 	dryRun            = flag.Bool("dry-run", false, "If true, don't actually reboot, just notify")
 	showVersion       = flag.Bool("version", false, "Print version and exit")
+	bootUpdate        = flag.Bool("boot-update", false, "Enable boot partition updates")
+	bootMountPoint    = flag.String("boot-mount", "/uboot", "Boot partition mount point")
+	bootDevice        = flag.String("boot-device", "", "U-Boot device path (auto-detected from mount if empty)")
+	bootDTB           = flag.String("boot-dtb", "", "DTB filename (default: librescoot-{component}.dtb)")
+	bootUBootSeek     = flag.Int64("boot-uboot-seek", 2, "512-byte blocks to seek before writing U-Boot")
 )
 
 func main() {
@@ -111,6 +117,11 @@ func main() {
 		effectiveChannel,
 		dlDir,
 		*dryRun,
+		*bootUpdate,
+		*bootMountPoint,
+		*bootDevice,
+		*bootDTB,
+		*bootUBootSeek,
 	)
 
 	// Save CLI values if they were explicitly set
@@ -163,8 +174,23 @@ func main() {
 	}
 	defer powerClient.Close()
 
+	// Initialize boot updater if enabled
+	var bootUpdater *boot.BootUpdater
+	if cfg.BootEnabled {
+		if cfg.BootDevice == "" {
+			detected, err := boot.DetectBootDevice(cfg.BootMountPoint)
+			if err != nil {
+				logger.Fatalf("Failed to detect boot device from %s: %v", cfg.BootMountPoint, err)
+			}
+			cfg.BootDevice = detected
+			logger.Printf("Auto-detected boot device: %s", cfg.BootDevice)
+		}
+		bootUpdater = boot.New(cfg.BootMountPoint, cfg.BootDevice, cfg.BootDTBFile, cfg.BootUBootSeek, logger)
+		logger.Printf("Boot updater enabled: device=%s, dtb=%s, seek=%d", cfg.BootDevice, cfg.BootDTBFile, cfg.BootUBootSeek)
+	}
+
 	// Initialize updater
-	updater := updater.New(ctx, cfg, redisClient, inhibitorClient, powerClient, logger)
+	updater := updater.New(ctx, cfg, redisClient, inhibitorClient, powerClient, bootUpdater, logger)
 	defer updater.Close()
 
 	// Check if there's a pending update that needs to be committed on startup

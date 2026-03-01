@@ -13,7 +13,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment="GOMEMLIMIT=100MiB"
-ExecStart=/usr/bin/update-service --component=mdb
+ExecStart=/usr/bin/update-service --component=mdb --boot-update
 Restart=always
 RestartSec=10
 User=root
@@ -24,8 +24,9 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=update-service-mdb
 
-# Create data directory if it doesn't exist
+# Create data directories if they don't exist
 ExecStartPre=/bin/mkdir -p /data/ota/mdb
+ExecStartPre=/bin/mkdir -p /data/ota/mdb-boot
 
 [Install]
 WantedBy=multi-user.target

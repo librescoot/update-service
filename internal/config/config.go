@@ -39,6 +39,13 @@ type Config struct {
 
 	// Operational modes
 	DryRun bool // If true, don't actually reboot, just notify
+
+	// Boot partition update configuration (CLI-only)
+	BootEnabled    bool   // Enable boot partition updates
+	BootMountPoint string // Boot partition mount point (default: /uboot)
+	BootDevice     string // U-Boot device path (auto-detected from mount if empty)
+	BootDTBFile    string // DTB filename (default: librescoot-{component}.dtb)
+	BootUBootSeek  int64  // 512-byte blocks to seek before writing U-Boot (default: 2)
 }
 
 // New creates a new Config with the given parameters
@@ -50,7 +57,15 @@ func New(
 	channel string,
 	downloadDir string,
 	dryRun bool,
+	bootEnabled bool,
+	bootMountPoint string,
+	bootDevice string,
+	bootDTBFile string,
+	bootUBootSeek int64,
 ) *Config {
+	if bootDTBFile == "" {
+		bootDTBFile = "librescoot-" + component + ".dtb"
+	}
 	return &Config{
 		RedisAddr:         redisAddr,
 		GitHubReleasesURL: githubReleasesURL,
@@ -63,6 +78,12 @@ func New(
 		UpdateRetryInterval:    15 * time.Minute,
 		// Operational modes
 		DryRun: dryRun,
+		// Boot partition update
+		BootEnabled:    bootEnabled,
+		BootMountPoint: bootMountPoint,
+		BootDevice:     bootDevice,
+		BootDTBFile:    bootDTBFile,
+		BootUBootSeek:  bootUBootSeek,
 	}
 }
 

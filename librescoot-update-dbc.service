@@ -8,7 +8,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment="GOMEMLIMIT=100MiB"
-ExecStart=/usr/bin/update-service --component=dbc --redis-addr=192.168.7.1:6379
+ExecStart=/usr/bin/update-service --component=dbc --redis-addr=192.168.7.1:6379 --boot-update
 Restart=always
 RestartSec=10
 User=root
@@ -19,8 +19,9 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=update-service-dbc
 
-# Create data directory if it doesn't exist
+# Create data directories if they don't exist
 ExecStartPre=/bin/mkdir -p /data/ota/dbc
+ExecStartPre=/bin/mkdir -p /data/ota/dbc-boot
 
 [Install]
 WantedBy=multi-user.target
