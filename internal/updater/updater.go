@@ -149,6 +149,9 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 		}
 	}
 
+	// Check if local boot assets need to be applied (runs once, synchronously)
+	u.performLocalBootUpdate()
+
 	// Initialize Redis keys if they don't exist
 	if err := u.initializeRedisKeys(); err != nil {
 		u.logger.Printf("Warning: Failed to initialize Redis keys: %v", err)
@@ -2225,6 +2228,84 @@ func extractBootTarball(tarPath string) (string, error) {
 	return extractDir, nil
 }
 
+// performLocalBootUpdate checks for boot assets baked into the rootfs and applies
+// them if they differ from what's currently on the boot partition.
+func (u *Updater) performLocalBootUpdate() {
+	if u.bootUpdater == nil {
+		return
+	}
+
+	localVersion, err := u.bootUpdater.CheckLocalAssets()
+	if err != nil {
+		u.logger.Printf("[boot-local] failed to check local boot assets: %v", err)
+		return
+	}
+	if localVersion == "" {
+		u.logger.Printf("[boot-local] no local boot assets found")
+		return
+	}
+
+	installedVersion, err := u.bootUpdater.GetInstalledVersion()
+	if err != nil {
+		u.logger.Printf("[boot-local] failed to read installed version: %v", err)
+		return
+	}
+	if installedVersion == localVersion {
+		u.logger.Printf("[boot-local] boot already at %s", localVersion)
+		return
+	}
+
+	u.logger.Printf("[boot-local] local boot assets differ (installed=%s, local=%s), applying", installedVersion, localVersion)
+
+	bootComp := bootComponent(u.config.Component)
+
+	if err := u.bootStatus.SetStatus(u.ctx, status.StatusInstalling); err != nil {
+		u.logger.Printf("[boot-local] failed to set installing status: %v", err)
+	}
+
+	if err := u.inhibitor.AddInstallInhibit(bootComp); err != nil {
+		u.logger.Printf("[boot-local] failed to add install inhibit: %v", err)
+	}
+
+	if err := u.bootUpdater.Apply(u.ctx, boot.LocalAssetsPath); err != nil {
+		u.logger.Printf("[boot-local] apply failed: %v", err)
+		if err := u.inhibitor.RemoveInstallInhibit(bootComp); err != nil {
+			u.logger.Printf("[boot-local] failed to remove install inhibit: %v", err)
+		}
+		if err := u.bootStatus.SetError(u.ctx, "install-failed", err.Error()); err != nil {
+			u.logger.Printf("[boot-local] failed to set error status: %v", err)
+		}
+		return
+	}
+
+	if err := u.bootUpdater.WriteVersionFile(localVersion); err != nil {
+		u.logger.Printf("[boot-local] failed to write version file: %v", err)
+	}
+
+	if err := u.inhibitor.RemoveInstallInhibit(bootComp); err != nil {
+		u.logger.Printf("[boot-local] failed to remove install inhibit: %v", err)
+	}
+
+	if err := u.bootStatus.SetStatus(u.ctx, status.StatusRebooting); err != nil {
+		u.logger.Printf("[boot-local] failed to set rebooting status: %v", err)
+	}
+
+	u.logger.Printf("[boot-local] boot update applied, triggering reboot")
+	if err := u.TriggerReboot(u.config.Component); err != nil {
+		if !strings.Contains(err.Error(), "DRY-RUN") {
+			u.logger.Printf("[boot-local] reboot trigger failed: %v", err)
+			if err := u.bootStatus.SetError(u.ctx, "reboot-failed", err.Error()); err != nil {
+				u.logger.Printf("[boot-local] failed to set error status: %v", err)
+			}
+		} else {
+			u.logger.Printf("[boot-local] dry-run: simulating post-reboot state")
+			if err := u.bootStatus.SetIdleAndClearVersion(u.ctx); err != nil {
+				u.logger.Printf("[boot-local] failed to set idle status in dry run: %v", err)
+			}
+		}
+	}
+}
+
 // performBootUpdate downloads, extracts, and writes boot assets for the component.
 func (u *Updater) performBootUpdate(release Release, assetURL string) {
 	version := strings.ToLower(release.TagName)
@@ -2234,6 +2315,9 @@ func (u *Updater) performBootUpdate(release Release, assetURL string) {
 	if err != nil {
 		u.logger.Printf("[boot] failed to read installed version: %v", err)
 	}
+	// NOTE: installed version may be either a release tag (from remote update)
+	// or a content hash (from local boot assets). A mismatch here is expected
+	// when the format differs.
 	if installed == version {
 		u.logger.Printf("[boot] already at version %s, no boot update needed", version)
 		return

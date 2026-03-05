@@ -13,6 +13,8 @@ import (
 	"syscall"
 )
 
+const LocalAssetsPath = "/usr/share/boot-assets"
+
 // BootUpdater manages boot partition updates (zImage, DTB, U-Boot).
 type BootUpdater struct {
 	mountPoint  string // e.g. /uboot
@@ -91,6 +93,19 @@ func detectFromReader(r io.Reader, mountPoint string) (string, error) {
 		return "", fmt.Errorf("reading mounts: %w", err)
 	}
 	return "", fmt.Errorf("no device found mounted at %s", mountPoint)
+}
+
+// CheckLocalAssets reads the version file from local boot assets baked into the rootfs.
+// Returns ("", nil) if local assets are not available.
+func (b *BootUpdater) CheckLocalAssets() (string, error) {
+	data, err := os.ReadFile(LocalAssetsPath + "/version")
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read local boot version: %w", err)
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 // GetInstalledVersion reads the version file; returns "" if absent.
