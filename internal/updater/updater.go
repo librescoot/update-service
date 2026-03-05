@@ -1372,6 +1372,16 @@ type deltaDownload struct {
 }
 
 // performDeltaUpdate attempts to apply a chain of delta updates to reach the latest version
+// deltaDownloadRetryInterval is how long to wait between download attempts for a
+// single delta file. Downloads are resumable, so retries cost minimal bandwidth.
+const deltaDownloadRetryInterval = 5 * time.Minute
+
+// deltaDownloadMaxRetryDuration is the maximum total time to keep retrying a
+// delta download before giving up and falling back to a full update. Scooters
+// may have intermittent connectivity; 15 minutes covers most transient outages.
+// Can safely be raised to 24*time.Hour for very patient update behaviour.
+const deltaDownloadMaxRetryDuration = 15 * time.Minute
+
 func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string) {
 	// Step 0: Determine the base version to start from
 	// First, check if we have a mender file for the current running version
@@ -1380,9 +1390,8 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		// No mender file for current version - find the latest mender file we have for this channel
 		_, menderVersion, found := u.mender.FindLatestMenderFile(u.config.Channel)
 		if !found || menderVersion == "" {
-			u.logger.Printf("No mender file found for current version %s and no other mender files available for channel %s", currentVersion, u.config.Channel)
-			u.logger.Printf("Delta updates require a base mender file - would fall back to full update (DISABLED FOR TESTING)")
-			// TODO: Re-enable fallback after testing
+			u.logger.Printf("No local mender file for any version on channel %s, need full update", u.config.Channel)
+			u.fallbackToFullUpdate(releases, variantID, "no local mender file to base delta chain on")
 			return
 		}
 		u.logger.Printf("No mender file for running version %s, using available mender file version %s as base", currentVersion, menderVersion)
@@ -1537,6 +1546,11 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 		if deltaURL == "" {
 			u.logger.Printf("No delta asset found for %s, cannot continue", release.TagName)
+			for j := 0; j < i; j++ {
+				if downloads[j].deltaPath != "" {
+					u.mender.CleanupDeltaFile(downloads[j].deltaPath)
+				}
+			}
 			u.fallbackToFullUpdate(releases, variantID, "no delta asset found")
 			return
 		}
@@ -1544,18 +1558,38 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		downloads[i].release = release
 		downloads[i].deltaURL = deltaURL
 
-		u.logger.Printf("Downloading delta %d/%d: %s", i+1, len(deltaChain), release.TagName)
-		deltaPath, err := u.mender.DownloadDelta(u.ctx, deltaURL, downloadProgressCallback)
-		if err != nil {
-			u.logger.Printf("Failed to download delta %d/%d: %v", i+1, len(deltaChain), err)
-			// Clean up any previously downloaded deltas
-			for j := 0; j < i; j++ {
-				if downloads[j].deltaPath != "" {
-					u.mender.CleanupDeltaFile(downloads[j].deltaPath)
-				}
+		// Download with patient retry — downloads are resumable so each retry
+		// picks up where the previous left off, costing minimal extra bandwidth.
+		downloadDeadline := time.Now().Add(deltaDownloadMaxRetryDuration)
+		var deltaPath string
+		for attempt := 1; ; attempt++ {
+			u.logger.Printf("Downloading delta %d/%d: %s (attempt %d)", i+1, len(deltaChain), release.TagName, attempt)
+			var err error
+			deltaPath, err = u.mender.DownloadDelta(u.ctx, deltaURL, downloadProgressCallback)
+			if err == nil {
+				break
 			}
-			u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("download failed: %v", err))
-			return
+			if time.Now().After(downloadDeadline) {
+				u.logger.Printf("Download failed after %v of retries: %v", deltaDownloadMaxRetryDuration, err)
+				for j := 0; j < i; j++ {
+					if downloads[j].deltaPath != "" {
+						u.mender.CleanupDeltaFile(downloads[j].deltaPath)
+					}
+				}
+				u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("download failed after retries: %v", err))
+				return
+			}
+			remaining := time.Until(downloadDeadline)
+			wait := deltaDownloadRetryInterval
+			if remaining < wait {
+				wait = remaining
+			}
+			u.logger.Printf("Download attempt %d failed, retrying in %v: %v", attempt, wait, err)
+			select {
+			case <-u.ctx.Done():
+				return
+			case <-time.After(wait):
+			}
 		}
 		downloads[i].deltaPath = deltaPath
 		u.logger.Printf("Downloaded delta %d/%d to %s", i+1, len(deltaChain), deltaPath)
@@ -1579,6 +1613,18 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		u.logger.Printf("=== Applying delta %d/%d: %s -> %s ===", deltaNum, len(downloads), workingVersion, targetVersion)
 
 		newMenderPath, err := u.mender.ApplyDownloadedDelta(u.ctx, dl.deltaPath, workingVersion, installProgressCallback)
+		if err != nil {
+			// Apply failed — re-download this delta once and retry in case the file was corrupt.
+			u.logger.Printf("Delta %d/%d apply failed: %v — re-downloading and retrying once", deltaNum, len(downloads), err)
+			if reDlPath, reDlErr := u.mender.DownloadDelta(u.ctx, dl.deltaURL, downloadProgressCallback); reDlErr == nil {
+				newMenderPath, err = u.mender.ApplyDownloadedDelta(u.ctx, reDlPath, workingVersion, installProgressCallback)
+				if err != nil {
+					u.mender.CleanupDeltaFile(reDlPath)
+				}
+			} else {
+				err = fmt.Errorf("re-download failed: %w", reDlErr)
+			}
+		}
 		if err != nil {
 			u.logger.Printf("Delta %d/%d failed: %v", deltaNum, len(downloads), err)
 			// Clean up remaining downloaded deltas
@@ -1770,16 +1816,13 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 }
 
-// fallbackToFullUpdate clears delta error state and falls back to a full update
+// fallbackToFullUpdate logs the delta failure reason and initiates a full update.
 func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, reason string) {
-	u.logger.Printf("Delta update failed (%s), would fall back to full update (DISABLED FOR TESTING)", reason)
+	u.logger.Printf("Delta update failed (%s), falling back to full update", reason)
 
 	if err := u.status.SetError(u.ctx, "delta-failed", reason); err != nil {
 		u.logger.Printf("Failed to set error status: %v", err)
 	}
-
-	// TODO: Re-enable fallback after testing
-	return
 
 	time.Sleep(2 * time.Second)
 	if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
