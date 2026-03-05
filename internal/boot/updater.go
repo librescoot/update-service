@@ -121,8 +121,19 @@ func (b *BootUpdater) GetInstalledVersion() (string, error) {
 }
 
 // WriteVersionFile writes the version string to the version file.
+// Remounts the boot partition read-write if the initial write fails.
 func (b *BootUpdater) WriteVersionFile(version string) error {
-	if err := os.WriteFile(b.versionFile, []byte(version+"\n"), 0644); err != nil {
+	data := []byte(version + "\n")
+	err := os.WriteFile(b.versionFile, data, 0644)
+	if err != nil {
+		remountRO, rerr := b.remountRW()
+		if rerr != nil {
+			return fmt.Errorf("remount rw for version file: %w", rerr)
+		}
+		defer remountRO()
+		err = os.WriteFile(b.versionFile, data, 0644)
+	}
+	if err != nil {
 		return fmt.Errorf("write %s: %w", b.versionFile, err)
 	}
 	return nil
