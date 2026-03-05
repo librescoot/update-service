@@ -2259,6 +2259,16 @@ func (u *Updater) performLocalBootUpdate() {
 
 	bootComp := bootComponent(u.config.Component)
 
+	// For DBC: tell vehicle-service to keep dashboard power on during boot write.
+	// This is critical — there is no A/B redundancy for the boot partition,
+	// so a power cut mid-write could brick the device.
+	if u.config.Component == "dbc" {
+		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+			u.logger.Printf("[boot-local] ABORTING: failed to send start-dbc — cannot guarantee power safety: %v", err)
+			return
+		}
+	}
+
 	if err := u.bootStatus.SetStatus(u.ctx, status.StatusInstalling); err != nil {
 		u.logger.Printf("[boot-local] failed to set installing status: %v", err)
 	}
@@ -2275,6 +2285,11 @@ func (u *Updater) performLocalBootUpdate() {
 		if err := u.bootStatus.SetError(u.ctx, "install-failed", err.Error()); err != nil {
 			u.logger.Printf("[boot-local] failed to set error status: %v", err)
 		}
+		if u.config.Component == "dbc" {
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("[boot-local] failed to send complete-dbc after error: %v", err)
+			}
+		}
 		return
 	}
 
@@ -2284,6 +2299,13 @@ func (u *Updater) performLocalBootUpdate() {
 
 	if err := u.inhibitor.RemoveInstallInhibit(bootComp); err != nil {
 		u.logger.Printf("[boot-local] failed to remove install inhibit: %v", err)
+	}
+
+	// Boot write complete — release vehicle-service power protection
+	if u.config.Component == "dbc" {
+		if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+			u.logger.Printf("[boot-local] failed to send complete-dbc: %v", err)
+		}
 	}
 
 	if err := u.bootStatus.SetStatus(u.ctx, status.StatusRebooting); err != nil {
@@ -2324,6 +2346,15 @@ func (u *Updater) performBootUpdate(release Release, assetURL string) {
 	}
 
 	u.logger.Printf("[boot] starting boot update for %s to %s", bootComp, version)
+
+	// For DBC: tell vehicle-service to keep dashboard power on during boot write.
+	// Critical — no A/B redundancy for boot partition.
+	if u.config.Component == "dbc" {
+		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+			u.logger.Printf("[boot] ABORTING: failed to send start-dbc — cannot guarantee power safety: %v", err)
+			return
+		}
+	}
 
 	if err := u.bootStatus.SetStatusAndVersion(u.ctx, status.StatusDownloading, version); err != nil {
 		u.logger.Printf("[boot] failed to set downloading status: %v", err)
