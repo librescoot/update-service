@@ -1,11 +1,8 @@
 package updater
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -917,20 +914,6 @@ func (u *Updater) checkForUpdates() {
 			u.performDeltaUpdate(releases, currentVersion, variantID)
 		}()
 
-		// Also check for boot update in parallel (uses same releases list)
-		if u.bootUpdater != nil {
-			if bootRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel); found {
-				if bootURL := u.findBootAsset(bootRelease, variantID); bootURL != "" {
-					u.wg.Add(1)
-					go func() {
-						defer u.wg.Done()
-						u.performBootUpdate(bootRelease, bootURL)
-					}()
-				} else {
-					u.logger.Printf("No boot asset found for variant_id %s in release %s", variantID, bootRelease.TagName)
-				}
-			}
-		}
 		return
 	}
 
@@ -973,18 +956,6 @@ func (u *Updater) checkForUpdates() {
 		}()
 	}
 
-	// Check for boot partition update using the same release
-	if u.bootUpdater != nil {
-		if bootURL := u.findBootAsset(release, variantID); bootURL != "" {
-			u.wg.Add(1)
-			go func() {
-				defer u.wg.Done()
-				u.performBootUpdate(release, bootURL)
-			}()
-		} else {
-			u.logger.Printf("No boot asset found for variant_id %s in release %s", variantID, release.TagName)
-		}
-	}
 }
 
 // inferChannelFromVersion attempts to infer the channel from the version string
@@ -2198,79 +2169,6 @@ func bootComponent(component string) string {
 	return component + "-boot"
 }
 
-// findBootAsset finds a boot tarball asset in a release for the specified variantID.
-// Boot assets are identified by "-boot-" in the name and a ".tar.gz" suffix.
-func (u *Updater) findBootAsset(release Release, variantID string) string {
-	for _, asset := range release.Assets {
-		if strings.Contains(asset.Name, variantID) &&
-			strings.Contains(asset.Name, "-boot-") &&
-			strings.HasSuffix(asset.Name, ".tar.gz") {
-			u.logger.Printf("Found boot asset: %s", asset.Name)
-			return asset.BrowserDownloadURL
-		}
-	}
-	return ""
-}
-
-// extractBootTarball extracts a .tar.gz archive to a temporary directory under /data/ota.
-// Returns the path to the extraction directory; caller is responsible for cleanup.
-func extractBootTarball(tarPath string) (string, error) {
-	extractDir, err := os.MkdirTemp("/data/ota", "boot-extract-*")
-	if err != nil {
-		return "", fmt.Errorf("create extract dir: %w", err)
-	}
-
-	f, err := os.Open(tarPath)
-	if err != nil {
-		os.RemoveAll(extractDir)
-		return "", fmt.Errorf("open tarball: %w", err)
-	}
-	defer f.Close()
-
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		os.RemoveAll(extractDir)
-		return "", fmt.Errorf("gzip reader: %w", err)
-	}
-	defer gz.Close()
-
-	tr := tar.NewReader(gz)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			os.RemoveAll(extractDir)
-			return "", fmt.Errorf("read tar: %w", err)
-		}
-
-		// Only extract regular files, skip directories and anything with path separators
-		if hdr.Typeflag != tar.TypeReg {
-			continue
-		}
-		name := filepath.Base(hdr.Name)
-		if name == "" || name == "." {
-			continue
-		}
-
-		dst := filepath.Join(extractDir, name)
-		out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-		if err != nil {
-			os.RemoveAll(extractDir)
-			return "", fmt.Errorf("create %s: %w", dst, err)
-		}
-		if _, err := io.Copy(out, tr); err != nil {
-			out.Close()
-			os.RemoveAll(extractDir)
-			return "", fmt.Errorf("extract %s: %w", dst, err)
-		}
-		out.Close()
-	}
-
-	return extractDir, nil
-}
-
 // performLocalBootUpdate checks for boot assets baked into the rootfs and applies
 // them if they differ from what's currently on the boot partition.
 func (u *Updater) performLocalBootUpdate() {
@@ -2366,146 +2264,6 @@ func (u *Updater) performLocalBootUpdate() {
 			u.logger.Printf("[boot-local] dry-run: simulating post-reboot state")
 			if err := u.bootStatus.SetIdleAndClearVersion(u.ctx); err != nil {
 				u.logger.Printf("[boot-local] failed to set idle status in dry run: %v", err)
-			}
-		}
-	}
-}
-
-// performBootUpdate downloads, extracts, and writes boot assets for the component.
-func (u *Updater) performBootUpdate(release Release, assetURL string) {
-	version := strings.ToLower(release.TagName)
-	bootComp := bootComponent(u.config.Component)
-
-	installed, err := u.bootUpdater.GetInstalledVersion()
-	if err != nil {
-		u.logger.Printf("[boot] failed to read installed version: %v", err)
-	}
-	// NOTE: installed version may be either a release tag (from remote update)
-	// or a content hash (from local boot assets). A mismatch here is expected
-	// when the format differs.
-	if installed == version {
-		u.logger.Printf("[boot] already at version %s, no boot update needed", version)
-		return
-	}
-
-	u.logger.Printf("[boot] starting boot update for %s to %s", bootComp, version)
-
-	// For DBC: tell vehicle-service to keep dashboard power on during boot write.
-	// Critical — no A/B redundancy for boot partition.
-	if u.config.Component == "dbc" {
-		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
-			u.logger.Printf("[boot] ABORTING: failed to send start-dbc — cannot guarantee power safety: %v", err)
-			return
-		}
-	}
-
-	if err := u.bootStatus.SetStatusAndVersion(u.ctx, status.StatusDownloading, version); err != nil {
-		u.logger.Printf("[boot] failed to set downloading status: %v", err)
-	}
-
-	if err := u.inhibitor.AddDownloadInhibit(bootComp); err != nil {
-		u.logger.Printf("[boot] failed to add download inhibit: %v", err)
-	}
-
-	defer func() {
-		if err := u.inhibitor.RemoveDownloadInhibit(bootComp); err != nil {
-			u.logger.Printf("[boot] failed to remove download inhibit: %v", err)
-		}
-		if err := u.inhibitor.RemoveInstallInhibit(bootComp); err != nil {
-			u.logger.Printf("[boot] failed to remove install inhibit: %v", err)
-		}
-		if u.config.Component == "dbc" {
-			u.logger.Printf("[boot] boot update cleanup - sending complete-dbc command")
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("[boot] failed to send complete-dbc command: %v", err)
-			}
-		}
-	}()
-
-	// Download boot tarball reusing mender downloader (handles resumable downloads)
-	progressCb := func(downloaded, total int64) {
-		if err := u.bootStatus.SetDownloadProgress(u.ctx, downloaded, total); err != nil {
-			u.logger.Printf("[boot] failed to update download progress: %v", err)
-		}
-	}
-
-	// Use a per-component boot download dir
-	bootDownloadDir := filepath.Join("/data/ota", bootComp)
-	if err := os.MkdirAll(bootDownloadDir, 0755); err != nil {
-		u.logger.Printf("[boot] failed to create boot download dir: %v", err)
-		if err := u.bootStatus.SetError(u.ctx, "download-failed", err.Error()); err != nil {
-			u.logger.Printf("[boot] failed to set error status: %v", err)
-		}
-		return
-	}
-	bootMender := mender.NewManager(bootDownloadDir, u.logger)
-
-	tarPath, err := bootMender.DownloadAndVerify(u.ctx, assetURL, "", progressCb)
-	if err != nil {
-		u.logger.Printf("[boot] download failed: %v", err)
-		if err := u.bootStatus.SetError(u.ctx, "download-failed", err.Error()); err != nil {
-			u.logger.Printf("[boot] failed to set error status: %v", err)
-		}
-		return
-	}
-
-	if err := u.bootStatus.ClearDownloadProgress(u.ctx); err != nil {
-		u.logger.Printf("[boot] failed to clear download progress: %v", err)
-	}
-
-	extractDir, err := extractBootTarball(tarPath)
-	if err != nil {
-		u.logger.Printf("[boot] extract failed: %v", err)
-		if err := u.bootStatus.SetError(u.ctx, "extract-failed", err.Error()); err != nil {
-			u.logger.Printf("[boot] failed to set error status: %v", err)
-		}
-		return
-	}
-	defer os.RemoveAll(extractDir)
-
-	// Swap to install inhibit before writing
-	if err := u.inhibitor.AddInstallInhibit(bootComp); err != nil {
-		u.logger.Printf("[boot] failed to add install inhibit: %v", err)
-	}
-	if err := u.inhibitor.RemoveDownloadInhibit(bootComp); err != nil {
-		u.logger.Printf("[boot] failed to remove download inhibit: %v", err)
-	}
-
-	if err := u.bootStatus.SetStatus(u.ctx, status.StatusInstalling); err != nil {
-		u.logger.Printf("[boot] failed to set installing status: %v", err)
-	}
-
-	if err := u.bootUpdater.Apply(u.ctx, extractDir); err != nil {
-		u.logger.Printf("[boot] apply failed: %v", err)
-		if err := u.bootStatus.SetError(u.ctx, "install-failed", err.Error()); err != nil {
-			u.logger.Printf("[boot] failed to set error status: %v", err)
-		}
-		return
-	}
-
-	if err := u.bootUpdater.WriteVersionFile(version); err != nil {
-		u.logger.Printf("[boot] failed to write version file: %v", err)
-	}
-
-	if err := u.bootStatus.SetStatus(u.ctx, status.StatusRebooting); err != nil {
-		u.logger.Printf("[boot] failed to set rebooting status: %v", err)
-	}
-
-	if err := u.inhibitor.RemoveInstallInhibit(bootComp); err != nil {
-		u.logger.Printf("[boot] failed to remove install inhibit: %v", err)
-	}
-
-	u.logger.Printf("[boot] boot update complete for %s to %s, triggering reboot", bootComp, version)
-	if err := u.TriggerReboot(u.config.Component); err != nil {
-		if !strings.Contains(err.Error(), "DRY-RUN") {
-			u.logger.Printf("[boot] reboot trigger failed: %v", err)
-			if err := u.bootStatus.SetError(u.ctx, "reboot-failed", err.Error()); err != nil {
-				u.logger.Printf("[boot] failed to set error status: %v", err)
-			}
-		} else {
-			u.logger.Printf("[boot] dry-run: simulating post-reboot state")
-			if err := u.bootStatus.SetIdleAndClearVersion(u.ctx); err != nil {
-				u.logger.Printf("[boot] failed to set idle status in dry run: %v", err)
 			}
 		}
 	}
