@@ -911,7 +911,7 @@ func (u *Updater) checkForUpdates() {
 		u.wg.Add(1)
 		go func() {
 			defer u.wg.Done()
-			u.performDeltaUpdate(releases, currentVersion, variantID)
+			u.performDeltaUpdate(releases, currentVersion, variantID, false)
 		}()
 
 		return
@@ -1353,7 +1353,7 @@ const deltaDownloadRetryInterval = 5 * time.Minute
 // Can safely be raised to 24*time.Hour for very patient update behaviour.
 const deltaDownloadMaxRetryDuration = 15 * time.Minute
 
-func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string) {
+func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string, isRecheck bool) {
 	// Step 0: Determine the base version to start from
 	// First, check if we have a mender file for the current running version
 	baseVersion := currentVersion
@@ -1688,6 +1688,22 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 
 	u.logger.Printf("All deltas applied successfully, final mender file: %s", finalMenderPath)
+
+	// One-time re-check: fetch releases fresh to catch anything published while we were
+	// applying the delta chain. If a newer version exists, restart from the just-assembled
+	// version rather than installing something already stale.
+	// isRecheck guards against looping if nightlies publish faster than deltas apply.
+	if !isRecheck {
+		recheckReleases, err := u.githubAPI.GetReleases()
+		if err != nil {
+			u.logger.Printf("Re-check API call failed: %v (proceeding with install)", err)
+		} else if newerChain, err := u.buildDeltaChain(recheckReleases, workingVersion, u.config.Channel, variantID); err == nil && len(newerChain) > 0 {
+			newerVersion := strings.ToLower(newerChain[len(newerChain)-1].TagName)
+			u.logger.Printf("Newer version %s published while applying delta chain; restarting from assembled %s", newerVersion, workingVersion)
+			u.performDeltaUpdate(recheckReleases, workingVersion, variantID, true)
+			return
+		}
+	}
 
 	// Re-validate vehicle state after long-running delta patch operation
 	// This ensures the 3-minute standby requirement starts fresh from the current state
