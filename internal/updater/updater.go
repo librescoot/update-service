@@ -154,6 +154,10 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 		u.logger.Printf("Warning: Failed to initialize Redis keys: %v", err)
 	}
 
+	// Check if we have a mender file newer than the running version (e.g., from
+	// an interrupted update). If so, install it directly without re-downloading.
+	u.installPendingMenderFile()
+
 	// Check initial vehicle state and set standby timestamp if needed
 	u.checkInitialStandbyState()
 
@@ -196,6 +200,39 @@ func (u *Updater) setUpdateMethod(method string) {
 		u.logger.Printf("Update method for %s changed from %s to %s", u.config.Component, u.updateMethod, method)
 		u.updateMethod = method
 	}
+}
+
+// installPendingMenderFile checks if a mender file newer than the running
+// version exists on disk (e.g., from an interrupted update) and installs it.
+func (u *Updater) installPendingMenderFile() {
+	currentVersion, err := u.getCurrentVersion()
+	if err != nil || currentVersion == "" {
+		return
+	}
+
+	menderPath, menderVersion, found := u.mender.FindLatestMenderFile(u.config.Channel)
+	if !found || menderVersion == "" {
+		return
+	}
+
+	// Compare: if the mender file version matches the running version, nothing to do
+	if strings.ToLower(menderVersion) == strings.ToLower(currentVersion) {
+		return
+	}
+
+	// For nightly/testing, versions are timestamps — newer = lexicographically greater
+	if strings.ToLower(menderVersion) <= strings.ToLower(currentVersion) {
+		return
+	}
+
+	u.logger.Printf("Found pending mender file %s (running %s), installing", menderVersion, currentVersion)
+
+	// Install in background so we don't block startup
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		u.handleUpdateFromFile(menderPath)
+	}()
 }
 
 // recoverFromStuckState recovers from any stuck status on startup.
@@ -1561,24 +1598,29 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	workingVersion := deltaVersions[len(deltaVersions)-1]
 	u.logger.Printf("Delta chain applied successfully: %d deltas, now at %s", len(downloads), workingVersion)
 
-	// Step 4: Check for additional deltas that may have been released during the update
-	u.logger.Printf("Checking for additional deltas released during update...")
+	// Step 4: Check for additional deltas released during the update
+	if u.ctx.Err() != nil {
+		return
+	}
 	freshReleases, err := u.githubAPI.GetReleases()
 	if err != nil {
 		u.logger.Printf("Warning: Failed to check for new releases: %v (proceeding with install)", err)
 	} else {
 		additionalChain, err := u.buildDeltaChain(freshReleases, workingVersion, u.config.Channel, variantID)
 		if err == nil && len(additionalChain) > 0 {
-			u.logger.Printf("Found %d additional deltas released during update!", len(additionalChain))
+			u.logger.Printf("Found %d additional deltas released during update", len(additionalChain))
 
-			// Update target version
 			newLatestVersion := strings.ToLower(additionalChain[len(additionalChain)-1].TagName)
 			if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, newLatestVersion); err != nil {
 				u.logger.Printf("Failed to update target version: %v", err)
 			}
 
-			// Download and apply additional deltas
 			for i, release := range additionalChain {
+				if u.ctx.Err() != nil {
+					u.logger.Printf("Shutdown during additional deltas, will resume next run")
+					return
+				}
+
 				deltaURL := ""
 				for _, asset := range release.Assets {
 					if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
@@ -1593,29 +1635,24 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 				}
 
 				targetVersion := strings.ToLower(release.TagName)
-				u.logger.Printf("=== Applying additional delta %d/%d: %s -> %s ===", i+1, len(additionalChain), workingVersion, targetVersion)
+				u.logger.Printf("Additional delta %d/%d: %s -> %s", i+1, len(additionalChain), workingVersion, targetVersion)
 
-				// Download
 				deltaPath, err := u.mender.DownloadDelta(u.ctx, deltaURL, downloadProgressCallback)
 				if err != nil {
+					if u.ctx.Err() != nil {
+						return
+					}
 					u.logger.Printf("Failed to download additional delta: %v (proceeding with install)", err)
 					break
 				}
 
-				if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
-					u.logger.Printf("Failed to clear download progress: %v", err)
-				}
-
-				// Apply
 				newMenderPath, err := u.mender.ApplyDownloadedDelta(u.ctx, deltaPath, workingVersion, installProgressCallback)
 				if err != nil {
+					if u.ctx.Err() != nil {
+						return
+					}
 					u.logger.Printf("Failed to apply additional delta: %v (proceeding with install)", err)
-					u.mender.CleanupDeltaFile(deltaPath)
 					break
-				}
-
-				if err := u.status.ClearInstallProgress(u.ctx); err != nil {
-					u.logger.Printf("Failed to clear install progress: %v", err)
 				}
 
 				workingVersion = targetVersion
