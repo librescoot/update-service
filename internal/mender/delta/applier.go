@@ -135,23 +135,19 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 		return ctx.Err()
 	}
 
-	// Step 4: Compress payload (the ONE compress, ~3min on ARM)
-	progress(75, "Compressing payload (gzip -3)")
-	if err := ShellGzip(payloadPath, compressedPayload, 3); err != nil {
-		return fmt.Errorf("compress payload: %w", err)
-	}
-
-	// Step 5: Compute rootfs checksum via pipe (no disk write for ~1GB image)
-	progress(82, "Verifying rootfs checksum")
-	rootfsChecksum, err := ComputeRootfsChecksum(ctx, payloadPath)
+	// Step 4: Compress payload + compute rootfs checksum in a single pass.
+	// Reads the ~1GB payload once, simultaneously gzipping and hashing the
+	// rootfs image inside the tar. Saves one full read vs doing them separately.
+	progress(75, "Compressing payload + computing rootfs checksum")
+	rootfsChecksum, err := CompressPayloadAndHash(payloadPath, compressedPayload)
 	if err != nil {
-		return fmt.Errorf("compute rootfs checksum: %w", err)
+		return fmt.Errorf("compress payload: %w", err)
 	}
 
 	// Delete decompressed payload (free ~1GB)
 	os.Remove(payloadPath)
 
-	// Step 6: Verify against metadata
+	// Step 5: Verify against metadata
 	if lastMetadata != nil && lastMetadata.NewPayloadChecksum != "" {
 		if rootfsChecksum != lastMetadata.NewPayloadChecksum {
 			return fmt.Errorf("rootfs checksum mismatch: got %s, want %s",
@@ -160,20 +156,20 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 		a.logger.Printf("Rootfs checksum verified: %s", rootfsChecksum)
 	}
 
-	// Step 7: Update header.tar.gz
+	// Step 6: Update header.tar.gz
 	progress(87, "Updating header metadata")
 	headerPath := filepath.Join(outputDir, "header.tar.gz")
 	if err := UpdateHeaderChecksum(headerPath, work, rootfsChecksum); err != nil {
 		return fmt.Errorf("update header: %w", err)
 	}
 
-	// Step 8: Regenerate manifest
+	// Step 7: Regenerate manifest
 	progress(92, "Generating manifest")
 	if err := GenerateManifest(outputDir); err != nil {
 		return fmt.Errorf("generate manifest: %w", err)
 	}
 
-	// Step 9: Repack
+	// Step 8: Repack
 	progress(95, "Creating output mender file")
 	if err := RepackMender(outputDir, newMenderPath); err != nil {
 		return fmt.Errorf("repack mender: %w", err)

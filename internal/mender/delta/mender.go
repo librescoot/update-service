@@ -3,7 +3,6 @@ package delta
 import (
 	"archive/tar"
 	"compress/gzip"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -199,31 +199,98 @@ func headerSortKey(name string) string {
 	}
 }
 
-// ComputeRootfsChecksum streams the rootfs image out of a payload tar via pipe.
-// No disk write for the ~1GB image — just pipes through sha256.
-func ComputeRootfsChecksum(ctx context.Context, payloadTarPath string) (string, error) {
-	cmd := exec.CommandContext(ctx, "tar", "-xf", payloadTarPath, "-O")
-	stdout, err := cmd.StdoutPipe()
+// CompressPayloadAndHash compresses a payload tar with gzip while computing
+// the rootfs checksum (SHA256 of the first file inside the tar) in a single
+// pass. Returns the rootfs checksum. This avoids reading the ~1GB payload
+// twice (once for gzip, once for checksum).
+func CompressPayloadAndHash(payloadTarPath, compressedPath string) (rootfsChecksum string, err error) {
+	inFile, err := os.Open(payloadTarPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("open payload: %w", err)
 	}
-	cmd.Stderr = os.Stderr
+	defer inFile.Close()
 
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("tar extract: %w", err)
+	outFile, err := os.Create(compressedPath)
+	if err != nil {
+		return "", fmt.Errorf("create compressed: %w", err)
+	}
+	defer outFile.Close()
+
+	// Use system gzip via pipe for ARM performance
+	gzipCmd := exec.Command("gzip", "-3", "-c")
+	gzipCmd.Stdout = outFile
+	gzipIn, err := gzipCmd.StdinPipe()
+	if err != nil {
+		return "", fmt.Errorf("gzip stdin pipe: %w", err)
 	}
 
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, stdout); err != nil {
-		cmd.Wait()
-		return "", fmt.Errorf("sha256 copy: %w", err)
+	if err := gzipCmd.Start(); err != nil {
+		return "", fmt.Errorf("start gzip: %w", err)
 	}
 
-	if err := cmd.Wait(); err != nil {
-		return "", fmt.Errorf("tar extract failed: %w", err)
+	// Read the tar header (first 512 bytes) to get the inner file size
+	const tarBlock = 512
+	header := make([]byte, tarBlock)
+	if _, err := io.ReadFull(inFile, header); err != nil {
+		gzipIn.Close()
+		gzipCmd.Wait()
+		return "", fmt.Errorf("read tar header: %w", err)
 	}
 
-	return hex.EncodeToString(hasher.Sum(nil)), nil
+	// Write header to gzip
+	if _, err := gzipIn.Write(header); err != nil {
+		gzipIn.Close()
+		gzipCmd.Wait()
+		return "", fmt.Errorf("write header to gzip: %w", err)
+	}
+
+	// Parse inner file size from UStar header (bytes 124-136, null-padded octal)
+	sizeField := header[124:136]
+	// Trim null bytes and spaces
+	sizeStr := strings.TrimRight(string(sizeField), "\x00 ")
+	innerSize, _ := strconv.ParseInt(sizeStr, 8, 64)
+
+	// Stream remaining data through gzip while hashing the inner file content
+	innerHasher := sha256.New()
+	innerRemaining := innerSize
+	buf := make([]byte, 64*1024)
+
+	for {
+		n, readErr := inFile.Read(buf)
+		if n > 0 {
+			// Write to gzip
+			if _, err := gzipIn.Write(buf[:n]); err != nil {
+				gzipIn.Close()
+				gzipCmd.Wait()
+				return "", fmt.Errorf("write to gzip: %w", err)
+			}
+
+			// Hash the inner file portion
+			if innerRemaining > 0 {
+				usable := int64(n)
+				if usable > innerRemaining {
+					usable = innerRemaining
+				}
+				innerHasher.Write(buf[:usable])
+				innerRemaining -= usable
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			gzipIn.Close()
+			gzipCmd.Wait()
+			return "", fmt.Errorf("read payload: %w", readErr)
+		}
+	}
+
+	gzipIn.Close()
+	if err := gzipCmd.Wait(); err != nil {
+		return "", fmt.Errorf("gzip failed: %w", err)
+	}
+
+	return hex.EncodeToString(innerHasher.Sum(nil)), nil
 }
 
 // GenerateManifest creates the manifest file with SHA256 checksums of all files.
