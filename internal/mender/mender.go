@@ -169,7 +169,7 @@ func (m *Manager) FindMenderFileForVersion(version string) (string, bool) {
 				m.logger.Printf("Mender file %s exists in glob but cannot be accessed: %v", file, err)
 				continue
 			}
-			m.logger.Printf("Found mender file for version %s: %s", version, file)
+			m.logger.Printf("Using mender file for %s: %s", version, filepath.Base(file))
 			return file, true
 		}
 	}

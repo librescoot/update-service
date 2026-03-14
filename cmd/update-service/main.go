@@ -183,10 +183,9 @@ func main() {
 				logger.Fatalf("Failed to detect boot device from %s: %v", cfg.BootMountPoint, err)
 			}
 			cfg.BootDevice = detected
-			logger.Printf("Auto-detected boot device: %s", cfg.BootDevice)
 		}
 		bootUpdater = boot.New(cfg.BootMountPoint, cfg.BootDevice, cfg.BootDTBFile, cfg.BootUBootSeek, logger)
-		logger.Printf("Boot updater enabled: device=%s, dtb=%s, seek=%d", cfg.BootDevice, cfg.BootDTBFile, cfg.BootUBootSeek)
+		logger.Printf("Boot updater: device=%s, dtb=%s", cfg.BootDevice, cfg.BootDTBFile)
 	}
 
 	// Initialize updater

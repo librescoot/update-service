@@ -447,7 +447,7 @@ func (u *Updater) listenForCommands() {
 func (u *Updater) handleCommand(command string) {
 	switch {
 	case command == "check-now":
-		u.logger.Printf("Received check-now command, triggering immediate update check")
+		u.logger.Printf("Manual update check triggered")
 		u.wg.Add(1)
 		go func() {
 			defer u.wg.Done()
@@ -1139,10 +1139,6 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 		version = strings.ToLower(release.TagName)
 	}
 
-	// Step 0: Check and commit any pending Mender update
-	if errCommit := u.mender.Commit(); errCommit != nil {
-		u.logger.Printf("Pending update commit failed (proceeding anyway): %v", errCommit)
-	}
 
 	// Step 1: Set downloading status, update method, and add download inhibitor
 	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, version); err != nil {
@@ -1411,10 +1407,6 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	u.logger.Printf("Delta chain for %s: %s -> [%s] (%d deltas, %d bytes vs %d full)",
 		u.config.Component, baseVersion, strings.Join(deltaVersionList, ", "), len(deltaChain), totalDeltaSize, fullUpdateSize)
 
-	// Step 0: Check and commit any pending Mender update
-	if err := u.mender.Commit(); err != nil {
-		u.logger.Printf("Pending update commit failed (proceeding anyway): %v", err)
-	}
 
 	// Set status
 	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, latestVersion); err != nil {

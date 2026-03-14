@@ -113,16 +113,14 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 						deltaNum, relPath, sha256hex, change.NewMeta.DecompressedSHA256)
 				}
 
-				a.logger.Printf("[Delta %d/%d] %s checksum verified", deltaNum, n, relPath)
-
-				// Rotate: delete old, rename new → current
+					// Rotate: delete old, rename new → current
 				os.Remove(payloadPath)
 				if err := os.Rename(nextPayload, payloadPath); err != nil {
 					return fmt.Errorf("rename payload: %w", err)
 				}
 
 				pctMid := pctStart + (pctEnd-pctStart)*2/3
-				progress(pctMid, fmt.Sprintf("[Delta %d/%d] patch: %s - done", deltaNum, n, relPath))
+				progress(pctMid, fmt.Sprintf("[Delta %d/%d] patch: %s - verified", deltaNum, n, relPath))
 
 			case "deleted":
 				os.Remove(outputFilePath)
