@@ -157,7 +157,7 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 			return fmt.Errorf("rootfs checksum mismatch: got %s, want %s",
 				rootfsChecksum, lastMetadata.NewPayloadChecksum)
 		}
-		a.logger.Printf("Rootfs checksum verified: %s", rootfsChecksum[:16]+"...")
+		a.logger.Printf("Rootfs checksum verified: %s", rootfsChecksum)
 	}
 
 	// Step 7: Update header.tar.gz
