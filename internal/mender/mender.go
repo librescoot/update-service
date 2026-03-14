@@ -301,11 +301,11 @@ func (m *Manager) ApplyDownloadedDelta(ctx context.Context, deltaPath, currentVe
 	newMenderName := deltaBaseName[:len(deltaBaseName)-6] + ".mender" // Replace .delta with .mender
 	newMenderPath := filepath.Join(m.downloader.downloadDir, newMenderName)
 
-	// Apply the delta
-	m.logger.Printf("Applying delta %s to %s -> %s", deltaPath, oldMenderPath, newMenderPath)
 	err := m.deltaApplier.ApplyDelta(ctx, oldMenderPath, deltaPath, newMenderPath, deltaProgressCallback)
 	if err != nil {
-		m.deltaApplier.CleanupDeltaFile(deltaPath)
+		if ctx.Err() == nil {
+			m.deltaApplier.CleanupDeltaFile(deltaPath)
+		}
 		return "", fmt.Errorf("failed to apply delta update: %w", err)
 	}
 
