@@ -280,7 +280,6 @@ func (m *Manager) ApplyDeltaUpdate(ctx context.Context, deltaURL, currentVersion
 // DownloadDelta downloads a delta file without applying it
 // Returns the path to the downloaded delta file
 func (m *Manager) DownloadDelta(ctx context.Context, deltaURL string, progressCallback ProgressCallback) (string, error) {
-	m.logger.Printf("Downloading delta file from %s", deltaURL)
 	deltaPath, err := m.downloader.Download(ctx, deltaURL, progressCallback)
 	if err != nil {
 		return "", fmt.Errorf("failed to download delta file: %w", err)
@@ -317,6 +316,61 @@ func (m *Manager) ApplyDownloadedDelta(ctx context.Context, deltaPath, currentVe
 
 	// Clean up the old mender file after successful delta application
 	m.logger.Printf("Removing old mender file after successful delta application: %s", oldMenderPath)
+	if err := os.Remove(oldMenderPath); err != nil {
+		m.logger.Printf("Warning: failed to remove old mender file %s: %v", oldMenderPath, err)
+	}
+
+	return newMenderPath, nil
+}
+
+// ApplyDownloadedDeltaChain applies multiple pre-downloaded deltas in a single
+// unpack/repack cycle, avoiding intermediate compress+repack overhead.
+// Returns the path to the final mender file.
+func (m *Manager) ApplyDownloadedDeltaChain(ctx context.Context, deltaPaths []string, deltaVersions []string, currentVersion string, deltaProgressCallback DeltaProgressCallback) (string, error) {
+	if len(deltaPaths) == 0 {
+		return "", fmt.Errorf("no delta paths provided")
+	}
+	if len(deltaPaths) != len(deltaVersions) {
+		return "", fmt.Errorf("deltaPaths and deltaVersions length mismatch")
+	}
+
+	// Single delta: use existing method
+	if len(deltaPaths) == 1 {
+		return m.ApplyDownloadedDelta(ctx, deltaPaths[0], currentVersion, deltaProgressCallback)
+	}
+
+	// Find the base mender file
+	oldMenderPath, exists := m.FindMenderFileForVersion(currentVersion)
+	if !exists {
+		return "", fmt.Errorf("no mender file found for current version %s, cannot apply delta chain", currentVersion)
+	}
+
+	// Output is named after the final delta
+	finalDeltaBase := filepath.Base(deltaPaths[len(deltaPaths)-1])
+	newMenderName := finalDeltaBase[:len(finalDeltaBase)-6] + ".mender"
+	newMenderPath := filepath.Join(m.downloader.downloadDir, newMenderName)
+
+	err := m.deltaApplier.ApplyDeltaChain(ctx, oldMenderPath, deltaPaths, newMenderPath, deltaProgressCallback)
+	if err != nil {
+		// Don't clean up delta files on context cancellation — they're
+		// valid downloads that can be reused on the next attempt.
+		if ctx.Err() == nil {
+			for _, dp := range deltaPaths {
+				m.deltaApplier.CleanupDeltaFile(dp)
+			}
+		}
+		return "", fmt.Errorf("failed to apply delta chain: %w", err)
+	}
+
+	// Clean up all delta files
+	for _, dp := range deltaPaths {
+		if err := m.deltaApplier.CleanupDeltaFile(dp); err != nil {
+			m.logger.Printf("Warning: failed to cleanup delta file: %v", err)
+		}
+	}
+
+	// Remove old mender file
+	m.logger.Printf("Removing old mender file after successful chain application: %s", oldMenderPath)
 	if err := os.Remove(oldMenderPath); err != nil {
 		m.logger.Printf("Warning: failed to remove old mender file %s: %v", oldMenderPath, err)
 	}

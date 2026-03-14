@@ -455,7 +455,11 @@ func (u *Updater) handleCommand(command string) {
 		}()
 
 	case strings.HasPrefix(command, "update-from-file:"):
-		filePath := strings.TrimPrefix(command, "update-from-file:")
+		filePath := strings.TrimSpace(strings.TrimPrefix(command, "update-from-file:"))
+		if filePath == "" {
+			u.logger.Printf("Received invalid update-from-file command with empty path")
+			return
+		}
 		u.logger.Printf("Received update-from-file command: %s", filePath)
 		u.wg.Add(1)
 		go func() {
@@ -560,36 +564,6 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		u.logger.Printf("Failed to set update method: %v", err)
 	}
 
-	// For DBC updates, notify vehicle-service to keep dashboard power on
-	if u.config.Component == "dbc" {
-		u.logger.Printf("Starting DBC file update - sending start-dbc command")
-		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
-			u.logger.Printf("Failed to send start-dbc command: %v", err)
-		}
-	}
-
-	u.logger.Printf("File ready for installation: %s", source)
-
-	if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to add download inhibit: %v", err)
-	}
-
-	defer func() {
-		if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
-			u.logger.Printf("Failed to remove download inhibit: %v", err)
-		}
-		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
-			u.logger.Printf("Failed to remove install inhibit: %v", err)
-		}
-
-		if u.config.Component == "dbc" {
-			u.logger.Printf("File update cleanup - sending complete-dbc command")
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("Failed to send complete-dbc command: %v", err)
-			}
-		}
-	}()
-
 	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
 		u.logger.Printf("Failed to set installing status: %v", err)
 		return
@@ -598,53 +572,51 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 	if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
 		u.logger.Printf("Failed to add install inhibit: %v", err)
 	}
+	defer func() {
+		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove install inhibit: %v", err)
+		}
+	}()
 
-	if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to remove download inhibit: %v", err)
+	if u.config.Component == "dbc" {
+		u.logger.Printf("Starting DBC file update - sending start-dbc command")
+		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+			u.logger.Printf("Failed to send start-dbc command: %v", err)
+		}
+		defer func() {
+			u.logger.Printf("DBC file update cleanup - sending complete-dbc command")
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
+			}
+		}()
 	}
 
 	if err := u.mender.Install(source); err != nil {
-		u.logger.Printf("Failed to install update: %v", err)
-		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update: %v", err)); err != nil {
+		u.logger.Printf("Failed to install update from file %s: %v", source, err)
+		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update from file %s: %v", source, err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
 	}
 
-	u.logger.Printf("Successfully installed update from file")
+	u.logger.Printf("Successfully installed update from file: %s", source)
 
 	if err := u.status.SetStatus(u.ctx, status.StatusRebooting); err != nil {
 		u.logger.Printf("Failed to set rebooting status: %v", err)
 	}
 
-	if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to remove install inhibit: %v", err)
-	}
-
-	u.logger.Printf("Update installation complete, system will reboot to apply changes")
-
-	if u.config.Component == "mdb" || u.config.Component == "dbc" {
-		u.logger.Printf("%s update installed, triggering reboot", strings.ToUpper(u.config.Component))
-		err := u.TriggerReboot(u.config.Component)
-		if err != nil {
-			u.logger.Printf("Failed to trigger %s reboot: %v", u.config.Component, err)
-			if !strings.Contains(err.Error(), "DRY-RUN") {
-				if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
-					u.logger.Printf("Additionally failed to set error status after %s reboot trigger failure: %v", u.config.Component, statusErr)
-				}
+	if err := u.TriggerReboot(u.config.Component); err != nil {
+		u.logger.Printf("Failed to trigger %s reboot after file update: %v", u.config.Component, err)
+		if !strings.Contains(err.Error(), "DRY-RUN") {
+			if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
+				u.logger.Printf("Additionally failed to set error status after reboot trigger failure: %v", statusErr)
 			}
-
-			if u.config.DryRun || strings.Contains(err.Error(), "DRY-RUN") {
-				u.logger.Printf("Dry run or simulated reboot: Simulating post-reboot state by setting idle status for %s.", u.config.Component)
-				if idleErr := u.status.SetIdleAndClearVersion(u.ctx); idleErr != nil {
-					u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
-				}
-			}
+			return
 		}
-	} else {
-		u.logger.Printf("Unknown component %s, cannot determine reboot strategy. Setting to idle.", u.config.Component)
-		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
-			u.logger.Printf("Failed to set idle status for unknown component: %v", err)
+
+		u.logger.Printf("Dry run: setting idle status for %s after file update", u.config.Component)
+		if idleErr := u.status.SetIdleAndClearVersion(u.ctx); idleErr != nil {
+			u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
 		}
 	}
 }
@@ -1432,11 +1404,12 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 
 	// Log the delta chain
-	u.logger.Printf("Built delta chain with %d updates: %s -> %s", len(deltaChain), baseVersion, latestVersion)
+	deltaVersionList := make([]string, len(deltaChain))
 	for i, release := range deltaChain {
-		u.logger.Printf("  Delta %d/%d: %s", i+1, len(deltaChain), release.TagName)
+		deltaVersionList[i] = release.TagName
 	}
-	u.logger.Printf("Starting multi-delta update process for %s: %s -> %s (%d deltas)", u.config.Component, baseVersion, latestVersion, len(deltaChain))
+	u.logger.Printf("Delta chain for %s: %s -> [%s] (%d deltas, %d bytes vs %d full)",
+		u.config.Component, baseVersion, strings.Join(deltaVersionList, ", "), len(deltaChain), totalDeltaSize, fullUpdateSize)
 
 	// Step 0: Check and commit any pending Mender update
 	if err := u.mender.Commit(); err != nil {
@@ -1503,7 +1476,6 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 
 	// Step 2: Download all deltas upfront
-	u.logger.Printf("=== Downloading all %d deltas ===", len(deltaChain))
 	downloads := make([]deltaDownload, len(deltaChain))
 
 	for i, release := range deltaChain {
@@ -1534,7 +1506,9 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		downloadDeadline := time.Now().Add(deltaDownloadMaxRetryDuration)
 		var deltaPath string
 		for attempt := 1; ; attempt++ {
-			u.logger.Printf("Downloading delta %d/%d: %s (attempt %d)", i+1, len(deltaChain), release.TagName, attempt)
+			if attempt > 1 {
+				u.logger.Printf("Downloading delta %d/%d: %s (retry %d)", i+1, len(deltaChain), release.TagName, attempt)
+			}
 			var err error
 			deltaPath, err = u.mender.DownloadDelta(u.ctx, deltaURL, downloadProgressCallback)
 			if err == nil {
@@ -1555,7 +1529,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			if remaining < wait {
 				wait = remaining
 			}
-			u.logger.Printf("Download attempt %d failed, retrying in %v: %v", attempt, wait, err)
+			u.logger.Printf("Download attempt failed, retrying in %v: %v", wait, err)
 			select {
 			case <-u.ctx.Done():
 				return
@@ -1563,7 +1537,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			}
 		}
 		downloads[i].deltaPath = deltaPath
-		u.logger.Printf("Downloaded delta %d/%d to %s", i+1, len(deltaChain), deltaPath)
+		u.logger.Printf("Downloaded delta %d/%d: %s", i+1, len(deltaChain), release.TagName)
 
 		// Clear download progress between deltas
 		if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
@@ -1571,55 +1545,29 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		}
 	}
 
-	u.logger.Printf("=== All deltas downloaded, applying sequentially ===")
+	u.logger.Printf("All %d deltas downloaded, applying chain", len(downloads))
 
-	// Step 3: Apply all deltas sequentially
-	var finalMenderPath string
-	workingVersion := baseVersion
-
+	// Step 3: Apply all deltas in a single unpack/repack cycle
+	deltaPaths := make([]string, len(downloads))
+	deltaVersions := make([]string, len(downloads))
 	for i, dl := range downloads {
-		deltaNum := i + 1
-		targetVersion := strings.ToLower(dl.release.TagName)
-
-		u.logger.Printf("=== Applying delta %d/%d: %s -> %s ===", deltaNum, len(downloads), workingVersion, targetVersion)
-
-		newMenderPath, err := u.mender.ApplyDownloadedDelta(u.ctx, dl.deltaPath, workingVersion, installProgressCallback)
-		if err != nil {
-			// Apply failed — re-download this delta once and retry in case the file was corrupt.
-			u.logger.Printf("Delta %d/%d apply failed: %v — re-downloading and retrying once", deltaNum, len(downloads), err)
-			if reDlPath, reDlErr := u.mender.DownloadDelta(u.ctx, dl.deltaURL, downloadProgressCallback); reDlErr == nil {
-				newMenderPath, err = u.mender.ApplyDownloadedDelta(u.ctx, reDlPath, workingVersion, installProgressCallback)
-				if err != nil {
-					u.mender.CleanupDeltaFile(reDlPath)
-				}
-			} else {
-				err = fmt.Errorf("re-download failed: %w", reDlErr)
-			}
-		}
-		if err != nil {
-			u.logger.Printf("Delta %d/%d failed: %v", deltaNum, len(downloads), err)
-			// Clean up remaining downloaded deltas
-			for j := i + 1; j < len(downloads); j++ {
-				if downloads[j].deltaPath != "" {
-					u.mender.CleanupDeltaFile(downloads[j].deltaPath)
-				}
-			}
-			u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("apply failed: %v", err))
-			return
-		}
-
-		u.logger.Printf("Delta %d/%d applied successfully: %s", deltaNum, len(downloads), newMenderPath)
-
-		// Clear progress
-		if err := u.status.ClearInstallProgress(u.ctx); err != nil {
-			u.logger.Printf("Failed to clear install progress: %v", err)
-		}
-
-		workingVersion = targetVersion
-		finalMenderPath = newMenderPath
+		deltaPaths[i] = dl.deltaPath
+		deltaVersions[i] = strings.ToLower(dl.release.TagName)
 	}
 
-	u.logger.Printf("All %d deltas applied successfully", len(downloads))
+	finalMenderPath, err := u.mender.ApplyDownloadedDeltaChain(u.ctx, deltaPaths, deltaVersions, baseVersion, installProgressCallback)
+	if err != nil {
+		if u.ctx.Err() != nil {
+			u.logger.Printf("Delta chain interrupted (shutdown), will retry next run")
+			return
+		}
+		u.logger.Printf("Delta chain apply failed: %v", err)
+		u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("chain apply failed: %v", err))
+		return
+	}
+
+	workingVersion := deltaVersions[len(deltaVersions)-1]
+	u.logger.Printf("Delta chain applied successfully: %d deltas, now at %s", len(downloads), workingVersion)
 
 	// Step 4: Check for additional deltas that may have been released during the update
 	u.logger.Printf("Checking for additional deltas released during update...")

@@ -203,12 +203,14 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		d.logger.Printf("Starting download attempt %d/%d", i+1, maxRetries)
+		if i > 0 {
+			d.logger.Printf("Download attempt %d/%d", i+1, maxRetries)
+		}
 		resp, err = client.Do(req)
 		if err == nil {
 			break
 		}
-		d.logger.Printf("Error downloading file (attempt %d/%d): %v", i+1, maxRetries, err)
+		d.logger.Printf("Download attempt %d/%d failed: %v", i+1, maxRetries, err)
 		if i < maxRetries-1 {
 			sleepTime := time.Duration(1<<uint(i)) * time.Second
 			d.logger.Printf("Waiting %v before retry...", sleepTime)
@@ -242,11 +244,10 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 	var file *os.File
 	if fileSize > 0 && resp.StatusCode == http.StatusPartialContent {
 		file, err = os.OpenFile(downloadTempPath, os.O_APPEND|os.O_WRONLY, 0644)
-		d.logger.Printf("Opened file for append at offset %d", fileSize)
+		d.logger.Printf("Resuming download at offset %d", fileSize)
 	} else {
 		file, err = os.Create(downloadTempPath)
 		fileSize = 0
-		d.logger.Printf("Created new file for download")
 	}
 	if err != nil {
 		return "", fmt.Errorf("error opening file: %w", err)
@@ -314,7 +315,6 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 					if err := os.Rename(downloadTempPath, finalPath); err != nil {
 						return "", fmt.Errorf("error renaming temporary file: %w", err)
 					}
-					d.logger.Printf("Renamed temporary file %s to %s", downloadTempPath, finalPath)
 
 					return finalPath, nil
 				}
