@@ -40,12 +40,26 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 	compressedPayload := filepath.Join(dataDir, "0000.tar.gz")
 	payloadPath := filepath.Join(work, "payload")
 
+	// Estimate decompressed size (~3.5x compression ratio for rootfs)
+	compressedInfo, _ := os.Stat(compressedPayload)
+	var estimatedDecompressed int64
+	if compressedInfo != nil {
+		estimatedDecompressed = compressedInfo.Size() * 7 / 2
+	}
+
 	// Step 2: Decompress payload, delete compressed
 	progress(5, "Decompressing payload")
-	if err := ShellGunzip(compressedPayload, payloadPath); err != nil {
+	if err := ShellGunzipWithProgress(compressedPayload, payloadPath, estimatedDecompressed, 5, 8, progress); err != nil {
 		return fmt.Errorf("decompress payload: %w", err)
 	}
 	os.Remove(compressedPayload)
+
+	// Get actual decompressed size for xdelta progress
+	payloadInfo, _ := os.Stat(payloadPath)
+	var payloadSize int64
+	if payloadInfo != nil {
+		payloadSize = payloadInfo.Size()
+	}
 
 	var lastMetadata *DeltaMetadata
 
@@ -97,11 +111,13 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 			case "modified":
 				patchPath := filepath.Join(deltaDir, "patches", change.Patch)
 
-				// Apply xdelta with simultaneous SHA256
+				// Apply xdelta with simultaneous SHA256 and progress
 				nextPayload := filepath.Join(work, "payload.next")
-				progress(pctStart+2, fmt.Sprintf("[Delta %d/%d] patch: %s - applying xdelta", deltaNum, n, relPath))
+				xdeltaPctStart := pctStart + 2
+				xdeltaPctEnd := pctStart + (pctEnd-pctStart)*2/3
+				progress(xdeltaPctStart, fmt.Sprintf("[Delta %d/%d] patch: %s - applying xdelta", deltaNum, n, relPath))
 
-				sha256hex, err := ApplyXdelta(ctx, payloadPath, patchPath, nextPayload)
+				sha256hex, err := ApplyXdelta(ctx, payloadPath, patchPath, nextPayload, payloadSize, xdeltaPctStart, xdeltaPctEnd, progress)
 				if err != nil {
 					return fmt.Errorf("xdelta delta %d %s: %w", deltaNum, relPath, err)
 				}
@@ -139,7 +155,7 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 	// Reads the ~1GB payload once, simultaneously gzipping and hashing the
 	// rootfs image inside the tar. Saves one full read vs doing them separately.
 	progress(75, "Compressing payload + computing rootfs checksum")
-	rootfsChecksum, err := CompressPayloadAndHash(payloadPath, compressedPayload)
+	rootfsChecksum, err := CompressPayloadAndHash(payloadPath, compressedPayload, 75, 90, progress)
 	if err != nil {
 		return fmt.Errorf("compress payload: %w", err)
 	}

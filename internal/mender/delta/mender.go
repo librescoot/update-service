@@ -203,12 +203,16 @@ func headerSortKey(name string) string {
 // the rootfs checksum (SHA256 of the first file inside the tar) in a single
 // pass. Returns the rootfs checksum. This avoids reading the ~1GB payload
 // twice (once for gzip, once for checksum).
-func CompressPayloadAndHash(payloadTarPath, compressedPath string) (rootfsChecksum string, err error) {
+func CompressPayloadAndHash(payloadTarPath, compressedPath string, pctStart, pctEnd int, progress ProgressCallback) (rootfsChecksum string, err error) {
 	inFile, err := os.Open(payloadTarPath)
 	if err != nil {
 		return "", fmt.Errorf("open payload: %w", err)
 	}
 	defer inFile.Close()
+
+	// Get input size for progress reporting
+	inInfo, _ := inFile.Stat()
+	inputSize := inInfo.Size()
 
 	outFile, err := os.Create(compressedPath)
 	if err != nil {
@@ -228,10 +232,16 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string) (rootfsChecks
 		return "", fmt.Errorf("start gzip: %w", err)
 	}
 
+	// Wrap input with progress tracking
+	var inReader io.Reader = inFile
+	if inputSize > 0 && progress != nil {
+		inReader = newProgressReader(inFile, inputSize, pctStart, pctEnd, "compressing + checksumming", progress)
+	}
+
 	// Read the tar header (first 512 bytes) to get the inner file size
 	const tarBlock = 512
 	header := make([]byte, tarBlock)
-	if _, err := io.ReadFull(inFile, header); err != nil {
+	if _, err := io.ReadFull(inReader, header); err != nil {
 		gzipIn.Close()
 		gzipCmd.Wait()
 		return "", fmt.Errorf("read tar header: %w", err)
@@ -256,7 +266,7 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string) (rootfsChecks
 	buf := make([]byte, 64*1024)
 
 	for {
-		n, readErr := inFile.Read(buf)
+		n, readErr := inReader.Read(buf)
 		if n > 0 {
 			// Write to gzip
 			if _, err := gzipIn.Write(buf[:n]); err != nil {

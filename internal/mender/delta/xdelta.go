@@ -12,7 +12,8 @@ import (
 
 // ApplyXdelta applies an xdelta3 patch, writing the result to outputFile.
 // Returns the SHA256 of the output computed during the write (no separate pass).
-func ApplyXdelta(ctx context.Context, sourceFile, patchFile, outputFile string) (string, error) {
+// expectedSize is the approximate output size for progress reporting (0 to skip).
+func ApplyXdelta(ctx context.Context, sourceFile, patchFile, outputFile string, expectedSize int64, pctStart, pctEnd int, progress ProgressCallback) (string, error) {
 	cmd := exec.CommandContext(ctx, "nice", "-n", "10", "xdelta3", "-d", "-c", "-s", sourceFile, patchFile)
 
 	stdout, err := cmd.StdoutPipe()
@@ -33,7 +34,13 @@ func ApplyXdelta(ctx context.Context, sourceFile, patchFile, outputFile string) 
 		return "", fmt.Errorf("xdelta3 start: %w", err)
 	}
 
-	_, copyErr := io.Copy(io.MultiWriter(outFile, hasher), stdout)
+	// Wrap stdout with progress reporting
+	var reader io.Reader = stdout
+	if expectedSize > 0 && progress != nil {
+		reader = newProgressReader(stdout, expectedSize, pctStart, pctEnd, "applying xdelta", progress)
+	}
+
+	_, copyErr := io.Copy(io.MultiWriter(outFile, hasher), reader)
 	outFile.Close()
 
 	if waitErr := cmd.Wait(); waitErr != nil {
