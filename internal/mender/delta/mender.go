@@ -304,22 +304,46 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, pctStart, pct
 }
 
 // GenerateManifest creates the manifest file with SHA256 checksums of all files.
-func GenerateManifest(outputDir string) error {
+// Progress is reported based on bytes hashed vs total bytes.
+func GenerateManifest(outputDir string, pctStart, pctEnd int, progress ProgressCallback) error {
 	manifestPath := filepath.Join(outputDir, "manifest")
 
-	var entries []string
+	// Collect files and total size for progress
+	type fileEntry struct {
+		path string
+		rel  string
+		size int64
+	}
+	var files []fileEntry
+	var totalSize int64
 	filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || info.Name() == "manifest" {
 			return err
 		}
 		rel, _ := filepath.Rel(outputDir, path)
-		checksum, err := fileSHA256(path)
+		files = append(files, fileEntry{path, rel, info.Size()})
+		totalSize += info.Size()
+		return nil
+	})
+
+	var entries []string
+	var processed int64
+	lastPct := -1
+	for _, f := range files {
+		checksum, err := fileSHA256(f.path)
 		if err != nil {
 			return err
 		}
-		entries = append(entries, fmt.Sprintf("%s  %s\n", checksum, rel))
-		return nil
-	})
+		entries = append(entries, fmt.Sprintf("%s  %s\n", checksum, f.rel))
+		processed += f.size
+		if progress != nil && totalSize > 0 {
+			pct := pctStart + int(float64(processed)/float64(totalSize)*float64(pctEnd-pctStart))
+			if pct != lastPct {
+				progress(pct, "finalizing")
+				lastPct = pct
+			}
+		}
+	}
 
 	sort.Strings(entries)
 	return os.WriteFile(manifestPath, []byte(strings.Join(entries, "")), 0644)

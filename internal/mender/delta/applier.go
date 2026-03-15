@@ -25,7 +25,7 @@ const (
 	durDecompress = 110
 	durXdelta     = 198 // per delta
 	durCompress   = 400
-	durFinalize   = 30
+	durFinalize   = 48
 )
 
 // ApplyChain applies a chain of delta patches: unpack once → apply all → repack once.
@@ -179,13 +179,13 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 		a.logger.Printf("Rootfs checksum verified: %s", rootfsChecksum)
 	}
 
-	// Finalize (fast — no smooth progress)
+	// Finalize: header update (fast), manifest (slow — hashes all files), repack (fast)
 	headerPath := filepath.Join(outputDir, "header.tar.gz")
 	if err := UpdateHeaderChecksum(headerPath, work, rootfsChecksum); err != nil {
 		return fmt.Errorf("update header: %w", err)
 	}
 
-	if err := GenerateManifest(outputDir); err != nil {
+	if err := GenerateManifest(outputDir, pctAfterCompress, 99, progress); err != nil {
 		return fmt.Errorf("generate manifest: %w", err)
 	}
 
