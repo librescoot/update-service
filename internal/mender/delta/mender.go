@@ -203,16 +203,12 @@ func headerSortKey(name string) string {
 // the rootfs checksum (SHA256 of the first file inside the tar) in a single
 // pass. Returns the rootfs checksum. This avoids reading the ~1GB payload
 // twice (once for gzip, once for checksum).
-func CompressPayloadAndHash(payloadTarPath, compressedPath string, pctStart, pctEnd int, progress ProgressCallback) (rootfsChecksum string, err error) {
+func CompressPayloadAndHash(payloadTarPath, compressedPath string, tracker *progressTracker) (rootfsChecksum string, err error) {
 	inFile, err := os.Open(payloadTarPath)
 	if err != nil {
 		return "", fmt.Errorf("open payload: %w", err)
 	}
 	defer inFile.Close()
-
-	// Get input size for progress reporting
-	inInfo, _ := inFile.Stat()
-	inputSize := inInfo.Size()
 
 	outFile, err := os.Create(compressedPath)
 	if err != nil {
@@ -220,7 +216,6 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, pctStart, pct
 	}
 	defer outFile.Close()
 
-	// Use system gzip via pipe for ARM performance
 	gzipCmd := exec.Command("gzip", "-3", "-c")
 	gzipCmd.Stdout = outFile
 	gzipIn, err := gzipCmd.StdinPipe()
@@ -232,11 +227,8 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, pctStart, pct
 		return "", fmt.Errorf("start gzip: %w", err)
 	}
 
-	// Wrap input with progress tracking
-	var inReader io.Reader = inFile
-	if inputSize > 0 && progress != nil {
-		inReader = newProgressReader(inFile, inputSize, pctStart, pctEnd, "compressing + checksumming", progress)
-	}
+	// Wrap input with byte tracking
+	inReader := tracker.reader(inFile, "compressing")
 
 	// Read the tar header (first 512 bytes) to get the inner file size
 	const tarBlock = 512
@@ -305,45 +297,24 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, pctStart, pct
 
 // GenerateManifest creates the manifest file with SHA256 checksums of all files.
 // Progress is reported based on bytes hashed vs total bytes.
-func GenerateManifest(outputDir string, pctStart, pctEnd int, progress ProgressCallback) error {
+func GenerateManifest(outputDir string, tracker *progressTracker) error {
 	manifestPath := filepath.Join(outputDir, "manifest")
 
-	// Collect files and total size for progress
-	type fileEntry struct {
-		path string
-		rel  string
-		size int64
-	}
-	var files []fileEntry
-	var totalSize int64
+	var entries []string
 	filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || info.Name() == "manifest" {
 			return err
 		}
 		rel, _ := filepath.Rel(outputDir, path)
-		files = append(files, fileEntry{path, rel, info.Size()})
-		totalSize += info.Size()
-		return nil
-	})
-
-	var entries []string
-	var processed int64
-	lastPct := -1
-	for _, f := range files {
-		checksum, err := fileSHA256(f.path)
+		checksum, err := fileSHA256(path)
 		if err != nil {
 			return err
 		}
-		entries = append(entries, fmt.Sprintf("%s  %s\n", checksum, f.rel))
-		processed += f.size
-		if progress != nil && totalSize > 0 {
-			pct := pctStart + int(float64(processed)/float64(totalSize)*float64(pctEnd-pctStart))
-			if pct != lastPct {
-				progress(pct, "finalizing")
-				lastPct = pct
-			}
-		}
-	}
+		entries = append(entries, fmt.Sprintf("%s  %s\n", checksum, rel))
+		// Track bytes hashed
+		tracker.add(info.Size(), "finalizing")
+		return nil
+	})
 
 	sort.Strings(entries)
 	return os.WriteFile(manifestPath, []byte(strings.Join(entries, "")), 0644)

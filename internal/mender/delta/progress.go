@@ -1,49 +1,53 @@
 package delta
 
-import (
-	"io"
-)
+import "io"
 
-// progressReader wraps an io.Reader and reports progress based on bytes read.
-// Only fires the callback when the integer percentage actually changes.
-type progressReader struct {
-	r        io.Reader
-	total    int64
-	read     int64
-	pctStart int
-	pctEnd   int
-	lastPct  int
-	callback ProgressCallback
-	label    string
+// progressTracker tracks total bytes processed across all phases
+// and reports percentage based on estimated total work.
+type progressTracker struct {
+	processed int64
+	total     int64
+	lastPct   int
+	callback  ProgressCallback
 }
 
-func newProgressReader(r io.Reader, total int64, pctStart, pctEnd int, label string, cb ProgressCallback) *progressReader {
-	return &progressReader{
-		r:        r,
-		total:    total,
-		pctStart: pctStart,
-		pctEnd:   pctEnd,
+func newProgressTracker(totalBytes int64, cb ProgressCallback) *progressTracker {
+	return &progressTracker{
+		total:    totalBytes,
 		lastPct:  -1,
 		callback: cb,
-		label:    label,
 	}
 }
 
-func (pr *progressReader) Read(p []byte) (int, error) {
-	n, err := pr.r.Read(p)
-	pr.read += int64(n)
-
-	if pr.callback != nil && pr.total > 0 {
-		frac := float64(pr.read) / float64(pr.total)
-		if frac > 1 {
-			frac = 1
-		}
-		pct := pr.pctStart + int(frac*float64(pr.pctEnd-pr.pctStart))
-		if pct != pr.lastPct {
-			pr.callback(pct, pr.label)
-			pr.lastPct = pct
-		}
+func (pt *progressTracker) add(n int64, label string) {
+	pt.processed += n
+	if pt.callback == nil || pt.total <= 0 {
+		return
 	}
+	pct := int(pt.processed * 99 / pt.total)
+	if pct > 99 {
+		pct = 99
+	}
+	if pct != pt.lastPct {
+		pt.lastPct = pct
+		pt.callback(pct, label)
+	}
+}
 
+func (pt *progressTracker) reader(r io.Reader, label string) io.Reader {
+	return &trackingReader{r: r, tracker: pt, label: label}
+}
+
+type trackingReader struct {
+	r       io.Reader
+	tracker *progressTracker
+	label   string
+}
+
+func (tr *trackingReader) Read(p []byte) (int, error) {
+	n, err := tr.r.Read(p)
+	if n > 0 {
+		tr.tracker.add(int64(n), tr.label)
+	}
 	return n, err
 }

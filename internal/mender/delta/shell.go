@@ -8,7 +8,6 @@ import (
 )
 
 // ShellGzip compresses a file using system gzip command
-// This is significantly faster than Go's compress/gzip on ARM hardware
 func ShellGzip(inputFile, outputFile string, level int) error {
 	outFile, err := os.Create(outputFile)
 	if err != nil {
@@ -29,12 +28,11 @@ func ShellGzip(inputFile, outputFile string, level int) error {
 
 // ShellGunzip decompresses a file using system gunzip command
 func ShellGunzip(inputFile, outputFile string) error {
-	return ShellGunzipWithProgress(inputFile, outputFile, 0, 0, 0, nil)
+	return ShellGunzipTracked(inputFile, outputFile, nil)
 }
 
-// ShellGunzipWithProgress decompresses with progress reporting based on output bytes.
-// expectedOutput is the approximate decompressed size (0 to skip progress).
-func ShellGunzipWithProgress(inputFile, outputFile string, expectedOutput int64, pctStart, pctEnd int, progress ProgressCallback) error {
+// ShellGunzipTracked decompresses with byte tracking through the shared tracker.
+func ShellGunzipTracked(inputFile, outputFile string, tracker *progressTracker) error {
 	outFile, err := os.Create(outputFile)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
@@ -44,7 +42,7 @@ func ShellGunzipWithProgress(inputFile, outputFile string, expectedOutput int64,
 	cmd := exec.Command("gunzip", "-c", inputFile)
 	cmd.Stderr = os.Stderr
 
-	if expectedOutput > 0 && progress != nil {
+	if tracker != nil {
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			return fmt.Errorf("gunzip stdout pipe: %w", err)
@@ -52,8 +50,7 @@ func ShellGunzipWithProgress(inputFile, outputFile string, expectedOutput int64,
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("gunzip start: %w", err)
 		}
-		pr := newProgressReader(stdout, expectedOutput, pctStart, pctEnd, "decompressing", progress)
-		if _, err := copyFromReader(outFile, pr); err != nil {
+		if _, err := io.Copy(outFile, tracker.reader(stdout, "decompressing")); err != nil {
 			cmd.Wait()
 			return fmt.Errorf("gunzip copy: %w", err)
 		}
@@ -68,27 +65,6 @@ func ShellGunzipWithProgress(inputFile, outputFile string, expectedOutput int64,
 	}
 
 	return nil
-}
-
-func copyFromReader(dst *os.File, src *progressReader) (int64, error) {
-	buf := make([]byte, 64*1024)
-	var total int64
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			nw, werr := dst.Write(buf[:n])
-			total += int64(nw)
-			if werr != nil {
-				return total, werr
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				return total, nil
-			}
-			return total, err
-		}
-	}
 }
 
 // ShellTarExtract extracts a tar archive using system tar command
@@ -122,8 +98,6 @@ func ShellSHA256(file string) (string, error) {
 		return "", fmt.Errorf("sha256sum failed: %w", err)
 	}
 
-	// sha256sum output format: "checksum  filename"
-	// We just want the checksum part
 	checksum := string(output)
 	if len(checksum) < 64 {
 		return "", fmt.Errorf("invalid sha256sum output: %s", checksum)

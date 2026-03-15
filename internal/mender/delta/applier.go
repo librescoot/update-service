@@ -8,40 +8,13 @@ import (
 	"path/filepath"
 )
 
-// Approximate durations on ARM (measured on i.MX6UL with MDB ~142MB mender):
-//   Extract mender:  13s
-//   Decompress:     110s
-//   xdelta per hop: 198s
-//   Compress:       400s
-//   Finalize:        30s
-//
-// Progress is allocated proportionally so each % point ≈ same wall time.
-// Only the slow I/O phases (decompress, xdelta, compress) drive smooth
-// progress via progressReader. Fast phases (extract, finalize) just log
-// milestones without emitting progress.
-
-const (
-	durExtract    = 13
-	durDecompress = 110
-	durXdelta     = 198 // per delta
-	durCompress   = 400
-	durFinalize   = 48
-)
-
 // ApplyChain applies a chain of delta patches: unpack once → apply all → repack once.
+// Progress is based on total bytes processed across all I/O phases.
 func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPaths []string, newMenderPath string, progress ProgressCallback) error {
 	n := len(deltaPaths)
 	if n == 0 {
 		return fmt.Errorf("no deltas provided")
 	}
-
-	// Calculate proportional progress ranges
-	totalDur := durExtract + durDecompress + durXdelta*n + durCompress + durFinalize
-	pctAfterExtract := 1 + (durExtract*98)/totalDur
-	pctAfterDecompress := pctAfterExtract + (durDecompress*98)/totalDur
-	pctAfterDeltas := pctAfterDecompress + (durXdelta*n*98)/totalDur
-	pctAfterCompress := pctAfterDeltas + (durCompress*98)/totalDur
-	// finalize fills up to 100%
 
 	workDir, err := os.MkdirTemp(a.tempDir, "delta-chain-*")
 	if err != nil {
@@ -58,9 +31,8 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 		}
 	}
 
-	// Extract old.mender (fast — no smooth progress needed)
+	// Extract old.mender (fast, no tracking)
 	a.logger.Printf("Extracting old mender (chain of %d deltas)", n)
-	progress(1, "extracting")
 	if err := UnpackMender(oldMenderPath, outputDir); err != nil {
 		return fmt.Errorf("unpack old mender: %w", err)
 	}
@@ -68,37 +40,36 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 	compressedPayload := filepath.Join(dataDir, "0000.tar.gz")
 	payloadPath := filepath.Join(work, "payload")
 
-	// Estimate decompressed size (~3.5x ratio)
+	// Estimate total bytes of work:
+	//   decompress output ≈ compressedSize * 3.5
+	//   xdelta output per hop ≈ same as decompressed
+	//   compress input = decompressed size
+	//   manifest = hash all output files ≈ compressedSize
 	compressedInfo, _ := os.Stat(compressedPayload)
-	var estimatedDecompressed int64
+	compressedSize := int64(0)
 	if compressedInfo != nil {
-		estimatedDecompressed = compressedInfo.Size() * 7 / 2
+		compressedSize = compressedInfo.Size()
 	}
+	estimatedPayload := compressedSize * 7 / 2
+	totalWork := estimatedPayload*(int64(n)+2) + compressedSize
 
-	// Decompress payload (slow — smooth progress)
-	if err := ShellGunzipWithProgress(compressedPayload, payloadPath, estimatedDecompressed, pctAfterExtract, pctAfterDecompress, progress); err != nil {
+	tracker := newProgressTracker(totalWork, progress)
+
+	// Decompress payload (slow — tracked)
+	if err := ShellGunzipTracked(compressedPayload, payloadPath, tracker); err != nil {
 		return fmt.Errorf("decompress payload: %w", err)
 	}
 	os.Remove(compressedPayload)
 
-	payloadInfo, _ := os.Stat(payloadPath)
-	var payloadSize int64
-	if payloadInfo != nil {
-		payloadSize = payloadInfo.Size()
-	}
-
 	var lastMetadata *DeltaMetadata
 
-	// Apply each delta (slow — smooth progress per hop)
+	// Apply each delta (slow — tracked)
 	for i, deltaPath := range deltaPaths {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
 		deltaNum := i + 1
-		hopStart := pctAfterDecompress + (i*(pctAfterDeltas-pctAfterDecompress))/n
-		hopEnd := pctAfterDecompress + (deltaNum*(pctAfterDeltas-pctAfterDecompress))/n
-
 		a.logger.Printf("[Delta %d/%d] applying", deltaNum, n)
 
 		deltaDir := filepath.Join(workDir, fmt.Sprintf("delta_%d", i))
@@ -125,8 +96,7 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 
 			switch change.Type {
 			case "new":
-				srcPath := filepath.Join(deltaDir, "new_files", relPath)
-				if err := copyFile(srcPath, outputFilePath); err != nil {
+				if err := copyFile(filepath.Join(deltaDir, "new_files", relPath), outputFilePath); err != nil {
 					return fmt.Errorf("copy new file %s: %w", relPath, err)
 				}
 
@@ -134,8 +104,7 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 				patchPath := filepath.Join(deltaDir, "patches", change.Patch)
 				nextPayload := filepath.Join(work, "payload.next")
 
-				// xdelta drives smooth progress for this hop's range
-				sha256hex, err := ApplyXdelta(ctx, payloadPath, patchPath, nextPayload, payloadSize, hopStart, hopEnd, progress)
+				sha256hex, err := ApplyXdelta(ctx, payloadPath, patchPath, nextPayload, tracker)
 				if err != nil {
 					return fmt.Errorf("xdelta delta %d %s: %w", deltaNum, relPath, err)
 				}
@@ -157,15 +126,15 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 		}
 
 		os.RemoveAll(deltaDir)
-		a.logger.Printf("[Delta %d/%d] applied and verified", deltaNum, n)
+		a.logger.Printf("[Delta %d/%d] verified", deltaNum, n)
 	}
 
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
-	// Compress + rootfs checksum (slow — smooth progress)
-	rootfsChecksum, err := CompressPayloadAndHash(payloadPath, compressedPayload, pctAfterDeltas, pctAfterCompress, progress)
+	// Compress + rootfs checksum (slow — tracked)
+	rootfsChecksum, err := CompressPayloadAndHash(payloadPath, compressedPayload, tracker)
 	if err != nil {
 		return fmt.Errorf("compress payload: %w", err)
 	}
@@ -179,13 +148,13 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 		a.logger.Printf("Rootfs checksum verified: %s", rootfsChecksum)
 	}
 
-	// Finalize: header update (fast), manifest (slow — hashes all files), repack (fast)
+	// Finalize (manifest is slow for large payload — tracked)
 	headerPath := filepath.Join(outputDir, "header.tar.gz")
 	if err := UpdateHeaderChecksum(headerPath, work, rootfsChecksum); err != nil {
 		return fmt.Errorf("update header: %w", err)
 	}
 
-	if err := GenerateManifest(outputDir, pctAfterCompress, 99, progress); err != nil {
+	if err := GenerateManifest(outputDir, tracker); err != nil {
 		return fmt.Errorf("generate manifest: %w", err)
 	}
 
