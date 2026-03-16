@@ -128,6 +128,11 @@ func (u *Updater) CheckAndCommitPendingUpdate() (needsReboot bool, err error) {
 // Start starts the updater. The menderNeedsReboot parameter indicates if
 // CheckAndCommitPendingUpdate detected that mender has an update waiting for reboot.
 func (u *Updater) Start(menderNeedsReboot bool) error {
+	// Clean up stale temp files from previous runs (killed mid-update etc.)
+	if err := u.cleanupDeltaTempDirs(); err != nil {
+		u.logger.Printf("Warning: Failed to cleanup stale temp dirs: %v", err)
+	}
+
 	// Recover from any stuck status on startup
 	if err := u.recoverFromStuckState(menderNeedsReboot); err != nil {
 		u.logger.Printf("Warning: Failed to recover from stuck state: %v", err)
@@ -258,12 +263,6 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 			if filePath, exists := u.mender.FindMenderFileForVersion(targetVersion); exists {
 				u.logger.Printf("Found complete file %s, next check will resume install", filePath)
 			}
-		}
-
-		// Clean up stale temporary directories from interrupted delta applications
-		// The mender-apply-delta.py script creates temp dirs in /data/ota/tmp/
-		if err := u.cleanupDeltaTempDirs(); err != nil {
-			u.logger.Printf("Warning: Failed to cleanup delta temp dirs: %v", err)
 		}
 
 		u.logger.Printf("Clearing downloading status")
