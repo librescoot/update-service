@@ -81,8 +81,8 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 	// Initialize update method from Redis
 	updateMethod, err := redisClient.GetUpdateMethod(cfg.Component)
 	if err != nil {
-		logger.Printf("Failed to get initial update method for %s: %v (defaulting to full)", cfg.Component, err)
-		updateMethod = "full"
+		logger.Printf("Failed to get initial update method for %s: %v (defaulting to delta)", cfg.Component, err)
+		updateMethod = "delta"
 	}
 	u.updateMethod = updateMethod
 
