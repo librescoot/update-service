@@ -1575,6 +1575,22 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 	u.logger.Printf("All %d deltas downloaded, applying chain", len(downloads))
 
+	// Transition to installing status before delta application so the UI
+	// can display granular install progress (it only shows the progress bar
+	// when status == "installing").
+	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
+		u.logger.Printf("Failed to set installing status: %v", err)
+		return
+	}
+
+	// Swap inhibitors: install inhibit replaces download inhibit
+	if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
+		u.logger.Printf("Failed to add install inhibit: %v", err)
+	}
+	if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
+		u.logger.Printf("Failed to remove download inhibit: %v", err)
+	}
+
 	// Step 3: Apply all deltas in a single unpack/repack cycle
 	deltaPaths := make([]string, len(downloads))
 	deltaVersions := make([]string, len(downloads))
@@ -1610,7 +1626,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			u.logger.Printf("Found %d additional deltas released during update", len(additionalChain))
 
 			newLatestVersion := strings.ToLower(additionalChain[len(additionalChain)-1].TagName)
-			if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, newLatestVersion); err != nil {
+			if err := u.status.SetUpdateVersion(u.ctx, newLatestVersion); err != nil {
 				u.logger.Printf("Failed to update target version: %v", err)
 			}
 
@@ -1693,21 +1709,6 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			u.logger.Printf("Failed to set idle status in dry run: %v", err)
 		}
 		return
-	}
-
-	// Step 3: Set installing status and add install inhibitor
-	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
-		u.logger.Printf("Failed to set installing status: %v", err)
-		return
-	}
-
-	// Add install inhibit before removing download inhibit
-	if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to add install inhibit: %v", err)
-	}
-
-	if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to remove download inhibit: %v", err)
 	}
 
 	// Step 4: Install the update
