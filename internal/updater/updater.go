@@ -665,6 +665,33 @@ func (u *Updater) handleUpdateFromURL(url string) {
 		u.logger.Printf("Checksum provided: %s", checksum)
 	}
 
+	// For DBC updates, notify vehicle-service to keep dashboard power on
+	if u.config.Component == "dbc" {
+		u.logger.Printf("Starting DBC URL update - sending start-dbc command")
+		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+			u.logger.Printf("Failed to send start-dbc command: %v", err)
+		}
+		defer func() {
+			u.logger.Printf("DBC URL update finished - sending complete-dbc command")
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
+			}
+		}()
+	}
+
+	// Add download inhibit
+	if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
+		u.logger.Printf("Failed to add download inhibit: %v", err)
+	}
+	defer func() {
+		if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove download inhibit: %v", err)
+		}
+		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove install inhibit: %v", err)
+		}
+	}()
+
 	u.logger.Printf("Processing update from URL: %s", source)
 
 	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, "unknown"); err != nil {
