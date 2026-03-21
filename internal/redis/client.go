@@ -130,25 +130,6 @@ func (c *Client) GetVariantID(component string) (string, error) {
 	return variantID, nil
 }
 
-// GetStandbyTimerStart gets the standby timer start timestamp from ota:standby-timer-start
-// Returns zero time if not set
-func (c *Client) GetStandbyTimerStart() (time.Time, error) {
-	// Get standby timer start from ota hash (Unix timestamp as string)
-	timestampStr, err := c.client.HGet("ota", "standby-timer-start")
-	if err != nil {
-		// Not set, return zero time
-		return time.Time{}, nil
-	}
-
-	// Parse Unix timestamp (seconds since epoch)
-	var seconds int64
-	if _, err := fmt.Sscanf(timestampStr, "%d", &seconds); err != nil {
-		return time.Time{}, fmt.Errorf("failed to parse standby timer timestamp '%s': %w", timestampStr, err)
-	}
-
-	return time.Unix(seconds, 0), nil
-}
-
 // GetVehicleStateWithTimestamp gets vehicle state and last state change timestamp
 func (c *Client) GetVehicleStateWithTimestamp(vehicleHashKey string) (string, time.Time, error) {
 	// Use the raw client for HMGET since redis-ipc doesn't have a direct equivalent

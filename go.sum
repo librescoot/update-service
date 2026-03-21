@@ -12,8 +12,8 @@ github.com/klauspost/cpuid/v2 v2.0.9 h1:lgaqFMSdTdQYdZ04uHyN2d/eKdOMyi2YLSvlQIBF
 github.com/klauspost/cpuid/v2 v2.0.9/go.mod h1:FInQzS24/EEf25PyTYn52gqo7WaD8xa0213Md/qVLRg=
 github.com/librescoot/librescoot-mender-status v0.1.0 h1:nQNlwwka1gDYGCCVAvLxCj2UsHC/C41RNem5ZpJS1hQ=
 github.com/librescoot/librescoot-mender-status v0.1.0/go.mod h1:BadhSjAJaipOAOST6Q1O5ViJbZlcaWxOZi8deTVxHjQ=
-github.com/librescoot/redis-ipc v0.10.3 h1:VAcw2ATlR3E7ntkFVmov3xaakXxomNQk95ch2UQQDPE=
-github.com/librescoot/redis-ipc v0.10.3/go.mod h1:4mRG3+cC+llhsjwyRvNT5bF+bsn0ueaKFf70eqq0IzQ=
+github.com/librescoot/redis-ipc v0.11.2-0.20260321193940-bee25582a43a h1:36h84yijjevZaAscPPWTPECyKJFFaLEHfL4zR9bMaX0=
+github.com/librescoot/redis-ipc v0.11.2-0.20260321193940-bee25582a43a/go.mod h1:uvlJaUd1WzRMjZy7dYCHJ6qphCDeYD5orGK9CLudv1Q=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/redis/go-redis/v9 v9.18.0 h1:pMkxYPkEbMPwRdenAzUNyFNrDgHx9U+DrBabWNfSRQs=

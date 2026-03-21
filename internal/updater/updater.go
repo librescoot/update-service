@@ -433,15 +433,14 @@ func (u *Updater) monitorVehicleState() {
 	watcher := u.redis.NewVehicleWatcher(config.VehicleHashKey)
 	watcher.OnField("state", func(state string) error {
 		if state == "stand-by" {
-			// Only set if not already tracking standby
 			if u.getStandbyStartTime().IsZero() {
-				standbyTimerStart, err := u.redis.GetStandbyTimerStart()
-				if err == nil && !standbyTimerStart.IsZero() {
-					u.setStandbyStartTime(standbyTimerStart)
-					u.logger.Printf("Vehicle entered 'stand-by' at %s", standbyTimerStart.Format(time.RFC3339))
+				_, stateTs, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+				if err == nil && !stateTs.IsZero() {
+					u.setStandbyStartTime(stateTs)
+					u.logger.Printf("Vehicle entered 'stand-by' at %s", stateTs.Format(time.RFC3339))
 				} else {
 					u.setStandbyStartTime(time.Now())
-					u.logger.Printf("Vehicle entered 'stand-by' (no timer-start, using current time)")
+					u.logger.Printf("Vehicle entered 'stand-by' (no timestamp, using current time)")
 				}
 			}
 		} else {
@@ -466,23 +465,19 @@ func (u *Updater) monitorVehicleState() {
 
 // checkInitialStandbyState checks the initial vehicle state on startup and sets standby timestamp
 func (u *Updater) checkInitialStandbyState() {
-	currentState, _, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+	currentState, stateTs, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
 	if err != nil {
 		u.logger.Printf("Vehicle state: unknown (%v)", err)
 		return
 	}
 
 	if currentState == "stand-by" {
-		// Use ota:standby-timer-start as the authoritative source (set by vehicle-service on standby entry)
-		standbyTimerStart, err := u.redis.GetStandbyTimerStart()
-		if err == nil && !standbyTimerStart.IsZero() {
-			u.setStandbyStartTime(standbyTimerStart)
-			elapsed := time.Since(standbyTimerStart)
-			u.logger.Printf("Vehicle in 'stand-by' since %s (%v ago)", standbyTimerStart.Format(time.RFC3339), elapsed)
+		if !stateTs.IsZero() {
+			u.setStandbyStartTime(stateTs)
+			u.logger.Printf("Vehicle in 'stand-by' since %s (%v ago)", stateTs.Format(time.RFC3339), time.Since(stateTs))
 		} else {
-			// Fallback to current time if standby-timer-start is not set
 			u.setStandbyStartTime(time.Now())
-			u.logger.Printf("Vehicle in 'stand-by' (no timer-start timestamp, using current time)")
+			u.logger.Printf("Vehicle in 'stand-by' (no timestamp, using current time)")
 		}
 	} else {
 		u.logger.Printf("Vehicle state: %s (will wait for stand-by before reboot)", currentState)
@@ -490,11 +485,10 @@ func (u *Updater) checkInitialStandbyState() {
 }
 
 // revalidateStandbyState re-validates the vehicle state after long-running operations
-// Uses ota:standby-timer-start as the authoritative source (set by vehicle-service on standby entry).
-// If vehicle stayed in standby, the timer-start will be unchanged and we preserve the original time.
-// If vehicle left and re-entered standby, vehicle-service will have updated timer-start.
+// If vehicle stayed in standby, state:timestamp will be unchanged and we preserve the original time.
+// If vehicle left and re-entered standby, state:timestamp will reflect the new entry time.
 func (u *Updater) revalidateStandbyState() {
-	currentState, _, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+	currentState, stateTs, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
 	if err != nil {
 		u.logger.Printf("Failed to get vehicle state after long-running operation: %v (clearing standby timestamp)", err)
 		u.setStandbyStartTime(time.Time{})
@@ -502,19 +496,17 @@ func (u *Updater) revalidateStandbyState() {
 	}
 
 	if currentState == "stand-by" {
-		standbyTimerStart, err := u.redis.GetStandbyTimerStart()
-		if err == nil && !standbyTimerStart.IsZero() {
-			elapsed := time.Since(standbyTimerStart)
+		if !stateTs.IsZero() {
 			prev := u.getStandbyStartTime()
-			if standbyTimerStart.Equal(prev) {
-				u.logger.Printf("Vehicle still in 'stand-by' since %s (%v elapsed) - keeping original timestamp", standbyTimerStart.Format(time.RFC3339), elapsed)
+			if stateTs.Equal(prev) {
+				u.logger.Printf("Vehicle still in 'stand-by' since %s (%v elapsed)", stateTs.Format(time.RFC3339), time.Since(stateTs))
 			} else {
-				u.setStandbyStartTime(standbyTimerStart)
-				u.logger.Printf("Vehicle re-entered 'stand-by' at %s (%v ago)", standbyTimerStart.Format(time.RFC3339), elapsed)
+				u.setStandbyStartTime(stateTs)
+				u.logger.Printf("Vehicle re-entered 'stand-by' at %s (%v ago)", stateTs.Format(time.RFC3339), time.Since(stateTs))
 			}
 		} else {
 			u.setStandbyStartTime(time.Now())
-			u.logger.Printf("Vehicle in 'stand-by' after operation (no timer-start) - using current time")
+			u.logger.Printf("Vehicle in 'stand-by' after operation (no timestamp) - using current time")
 		}
 	} else {
 		u.logger.Printf("Vehicle not in 'stand-by' after operation (current: %s) - clearing standby timestamp", currentState)
