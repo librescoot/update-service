@@ -35,6 +35,7 @@ type Updater struct {
 	logger           *log.Logger
 	ctx              context.Context
 	cancel           context.CancelFunc
+	standbyMu        sync.RWMutex
 	standbyStartTime time.Time // Tracks when vehicle entered standby state
 
 	// Update method configuration
@@ -165,6 +166,9 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 
 	// Check initial vehicle state and set standby timestamp if needed
 	u.checkInitialStandbyState()
+
+	// Keep standby timer in sync with live vehicle state changes
+	go u.monitorVehicleState()
 
 	// Start monitoring for settings changes
 	go u.monitorSettingsChanges()
@@ -411,6 +415,55 @@ func (u *Updater) initializeRedisKeys() error {
 	return nil
 }
 
+func (u *Updater) getStandbyStartTime() time.Time {
+	u.standbyMu.RLock()
+	defer u.standbyMu.RUnlock()
+	return u.standbyStartTime
+}
+
+func (u *Updater) setStandbyStartTime(t time.Time) {
+	u.standbyMu.Lock()
+	defer u.standbyMu.Unlock()
+	u.standbyStartTime = t
+}
+
+// monitorVehicleState keeps standbyStartTime in sync with the actual vehicle state.
+// This runs for the lifetime of the service so TriggerReboot always has current data.
+func (u *Updater) monitorVehicleState() {
+	watcher := u.redis.NewVehicleWatcher(config.VehicleHashKey)
+	watcher.OnField("state", func(state string) error {
+		if state == "stand-by" {
+			// Only set if not already tracking standby
+			if u.getStandbyStartTime().IsZero() {
+				standbyTimerStart, err := u.redis.GetStandbyTimerStart()
+				if err == nil && !standbyTimerStart.IsZero() {
+					u.setStandbyStartTime(standbyTimerStart)
+					u.logger.Printf("Vehicle entered 'stand-by' at %s", standbyTimerStart.Format(time.RFC3339))
+				} else {
+					u.setStandbyStartTime(time.Now())
+					u.logger.Printf("Vehicle entered 'stand-by' (no timer-start, using current time)")
+				}
+			}
+		} else {
+			prev := u.getStandbyStartTime()
+			if !prev.IsZero() {
+				u.logger.Printf("Vehicle left 'stand-by' (now: %s). Clearing standby timer.", state)
+				u.setStandbyStartTime(time.Time{})
+			}
+		}
+		return nil
+	})
+
+	if err := watcher.StartWithSync(); err != nil {
+		u.logger.Printf("Failed to start vehicle state watcher: %v (standby tracking may be stale)", err)
+		return
+	}
+
+	// Block until context is cancelled
+	<-u.ctx.Done()
+	watcher.Stop()
+}
+
 // checkInitialStandbyState checks the initial vehicle state on startup and sets standby timestamp
 func (u *Updater) checkInitialStandbyState() {
 	currentState, _, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
@@ -423,12 +476,12 @@ func (u *Updater) checkInitialStandbyState() {
 		// Use ota:standby-timer-start as the authoritative source (set by vehicle-service on standby entry)
 		standbyTimerStart, err := u.redis.GetStandbyTimerStart()
 		if err == nil && !standbyTimerStart.IsZero() {
-			u.standbyStartTime = standbyTimerStart
+			u.setStandbyStartTime(standbyTimerStart)
 			elapsed := time.Since(standbyTimerStart)
 			u.logger.Printf("Vehicle in 'stand-by' since %s (%v ago)", standbyTimerStart.Format(time.RFC3339), elapsed)
 		} else {
 			// Fallback to current time if standby-timer-start is not set
-			u.standbyStartTime = time.Now()
+			u.setStandbyStartTime(time.Now())
 			u.logger.Printf("Vehicle in 'stand-by' (no timer-start timestamp, using current time)")
 		}
 	} else {
@@ -444,29 +497,28 @@ func (u *Updater) revalidateStandbyState() {
 	currentState, _, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
 	if err != nil {
 		u.logger.Printf("Failed to get vehicle state after long-running operation: %v (clearing standby timestamp)", err)
-		u.standbyStartTime = time.Time{} // Clear on error to be safe
+		u.setStandbyStartTime(time.Time{})
 		return
 	}
 
 	if currentState == "stand-by" {
-		// Use ota:standby-timer-start as the authoritative source
 		standbyTimerStart, err := u.redis.GetStandbyTimerStart()
 		if err == nil && !standbyTimerStart.IsZero() {
 			elapsed := time.Since(standbyTimerStart)
-			if standbyTimerStart.Equal(u.standbyStartTime) {
+			prev := u.getStandbyStartTime()
+			if standbyTimerStart.Equal(prev) {
 				u.logger.Printf("Vehicle still in 'stand-by' since %s (%v elapsed) - keeping original timestamp", standbyTimerStart.Format(time.RFC3339), elapsed)
 			} else {
-				u.standbyStartTime = standbyTimerStart
+				u.setStandbyStartTime(standbyTimerStart)
 				u.logger.Printf("Vehicle re-entered 'stand-by' at %s (%v ago)", standbyTimerStart.Format(time.RFC3339), elapsed)
 			}
 		} else {
-			// No standby-timer-start but vehicle is in standby - use current time
-			u.standbyStartTime = time.Now()
+			u.setStandbyStartTime(time.Now())
 			u.logger.Printf("Vehicle in 'stand-by' after operation (no timer-start) - using current time")
 		}
 	} else {
 		u.logger.Printf("Vehicle not in 'stand-by' after operation (current: %s) - clearing standby timestamp", currentState)
-		u.standbyStartTime = time.Time{}
+		u.setStandbyStartTime(time.Time{})
 	}
 }
 
@@ -1845,26 +1897,26 @@ func (u *Updater) TriggerReboot(component string) error {
 		u.logger.Printf("Preparing to reboot MDB. Waiting for vehicle to be in 'stand-by' state for at least %v.", requiredStandbyDuration)
 
 		// Check if we already have a valid standby timestamp
-		if !u.standbyStartTime.IsZero() {
-			durationInStandby := time.Since(u.standbyStartTime)
+		standbyStart := u.getStandbyStartTime()
+		if !standbyStart.IsZero() {
+			durationInStandby := time.Since(standbyStart)
 			if durationInStandby >= requiredStandbyDuration {
-				// Verify vehicle is still in standby before rebooting
-				currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
-				if err != nil {
-					u.logger.Printf("Failed to verify vehicle state before reboot: %v. Proceeding anyway.", err)
-				} else if currentState != "stand-by" {
-					u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Restarting wait process.", currentState)
-					u.standbyStartTime = time.Time{}
+				// Re-check current state from Redis before firing (belt-and-suspenders
+				// in case the watcher missed a transition)
+				currentState, _ := u.redis.GetVehicleState(config.VehicleHashKey)
+				if currentState != "stand-by" {
+					u.logger.Printf("Vehicle state is '%s' (standby timer stale). Waiting for stand-by.", currentState)
+					u.setStandbyStartTime(time.Time{})
 					return u.waitForStandbyWithSubscription(requiredStandbyDuration)
 				}
-				u.logger.Printf("Vehicle in 'stand-by' for %v (since %s). Proceeding with MDB reboot immediately.", durationInStandby, u.standbyStartTime.Format(time.RFC3339))
+				u.logger.Printf("Vehicle in 'stand-by' for %v (since %s). Proceeding with MDB reboot immediately.", durationInStandby, standbyStart.Format(time.RFC3339))
 				u.logger.Printf("Triggering MDB reboot via Redis command")
 				return u.redis.TriggerReboot()
 			}
 
 			// Calculate exact remaining time plus safety buffer
 			remainingTime := requiredStandbyDuration - durationInStandby + safetyBuffer
-			u.logger.Printf("Vehicle in 'stand-by' for %v (since %s). Sleeping for %v then rebooting.", durationInStandby, u.standbyStartTime.Format(time.RFC3339), remainingTime)
+			u.logger.Printf("Vehicle in 'stand-by' for %v (since %s). Sleeping for %v then rebooting.", durationInStandby, standbyStart.Format(time.RFC3339), remainingTime)
 
 			// Sleep for the exact remaining time plus buffer
 			select {
@@ -1880,8 +1932,8 @@ func (u *Updater) TriggerReboot(component string) error {
 					return u.waitForStandbyWithSubscription(requiredStandbyDuration)
 				}
 
-				totalDuration := time.Since(u.standbyStartTime)
-				u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", totalDuration, u.standbyStartTime.Format(time.RFC3339))
+				totalDuration := time.Since(standbyStart)
+				u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", totalDuration, standbyStart.Format(time.RFC3339))
 				u.logger.Printf("Triggering MDB reboot via Redis command")
 				return u.redis.TriggerReboot()
 			}
@@ -1966,12 +2018,13 @@ func (u *Updater) waitForStandbyTimer(waitDuration time.Duration) error {
 		return u.ctx.Err()
 	case <-timer.C:
 		// Timer expired, check if still in standby and >= 3m total
-		if u.standbyStartTime.IsZero() {
+		standbyStart := u.getStandbyStartTime()
+		if standbyStart.IsZero() {
 			u.logger.Printf("Timer expired but no standby timestamp. Restarting wait.")
 			return u.waitForStandbyWithSubscription(3 * time.Minute)
 		}
 
-		totalDuration := time.Since(u.standbyStartTime)
+		totalDuration := time.Since(standbyStart)
 		if totalDuration >= 3*time.Minute {
 			// Double-check vehicle is still in standby
 			currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
@@ -1982,7 +2035,7 @@ func (u *Updater) waitForStandbyTimer(waitDuration time.Duration) error {
 				return u.waitForStandbyWithSubscription(3 * time.Minute)
 			}
 
-			u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", totalDuration, u.standbyStartTime.Format(time.RFC3339))
+			u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", totalDuration, standbyStart.Format(time.RFC3339))
 			u.logger.Printf("Triggering MDB reboot via Redis command")
 			return u.redis.TriggerReboot()
 		} else {
@@ -2012,31 +2065,30 @@ func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration)
 		}
 
 		if currentState == "stand-by" {
-			// Use ota:standby-timer-start as the authoritative source (set by vehicle-service on standby entry)
 			standbyTimerStart, err := u.redis.GetStandbyTimerStart()
 			if err == nil && !standbyTimerStart.IsZero() {
-				u.standbyStartTime = standbyTimerStart
+				u.setStandbyStartTime(standbyTimerStart)
 			} else {
-				u.standbyStartTime = time.Now()
+				u.setStandbyStartTime(time.Now())
 			}
-			u.logger.Printf("Vehicle entered 'stand-by' state at %s. Monitoring for %v.", u.standbyStartTime.Format(time.RFC3339), requiredDuration)
+			standbyStart := u.getStandbyStartTime()
+			u.logger.Printf("Vehicle entered 'stand-by' state at %s. Monitoring for %v.", standbyStart.Format(time.RFC3339), requiredDuration)
 
-			// Check if already waited long enough
-			durationInStandby := time.Since(u.standbyStartTime)
+			durationInStandby := time.Since(standbyStart)
 			if durationInStandby >= requiredDuration {
 				u.logger.Printf("Vehicle has been in 'stand-by' for %v. Proceeding with MDB reboot.", durationInStandby)
 				u.logger.Printf("Triggering MDB reboot via Redis command")
 				once.Do(func() { standbyMet <- u.redis.TriggerReboot() })
 			} else {
-				// Start precise timer for remaining duration
 				remainingTime := requiredDuration - durationInStandby
 				u.logger.Printf("Vehicle in 'stand-by' for %v. Starting precise timer for %v.", durationInStandby, remainingTime)
 				once.Do(func() { standbyMet <- u.waitForStandbyTimer(remainingTime) })
 			}
 		} else {
-			if !u.standbyStartTime.IsZero() {
+			prev := u.getStandbyStartTime()
+			if !prev.IsZero() {
 				u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Resetting standby timer.", currentState)
-				u.standbyStartTime = time.Time{}
+				u.setStandbyStartTime(time.Time{})
 			} else {
 				u.logger.Printf("Vehicle not in 'stand-by' (current: %s). Waiting.", currentState)
 			}
