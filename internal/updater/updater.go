@@ -1848,6 +1848,15 @@ func (u *Updater) TriggerReboot(component string) error {
 		if !u.standbyStartTime.IsZero() {
 			durationInStandby := time.Since(u.standbyStartTime)
 			if durationInStandby >= requiredStandbyDuration {
+				// Verify vehicle is still in standby before rebooting
+				currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+				if err != nil {
+					u.logger.Printf("Failed to verify vehicle state before reboot: %v. Proceeding anyway.", err)
+				} else if currentState != "stand-by" {
+					u.logger.Printf("Vehicle left 'stand-by' state (current: %s). Restarting wait process.", currentState)
+					u.standbyStartTime = time.Time{}
+					return u.waitForStandbyWithSubscription(requiredStandbyDuration)
+				}
 				u.logger.Printf("Vehicle in 'stand-by' for %v (since %s). Proceeding with MDB reboot immediately.", durationInStandby, u.standbyStartTime.Format(time.RFC3339))
 				u.logger.Printf("Triggering MDB reboot via Redis command")
 				return u.redis.TriggerReboot()
