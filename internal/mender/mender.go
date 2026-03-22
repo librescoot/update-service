@@ -52,9 +52,10 @@ func (m *Manager) DownloadAndVerify(ctx context.Context, url, checksum string, p
 	return filePath, nil
 }
 
-// Install installs the update from the given file path
-func (m *Manager) Install(filePath string) error {
-	return m.installer.Install(filePath)
+// Install installs the update from the given file path.
+// If progressCb is non-nil, it receives progress updates (0-100) parsed from mender-update stderr.
+func (m *Manager) Install(filePath string, progressCb InstallProgressCallback) error {
+	return m.installer.Install(filePath, progressCb)
 }
 
 // Commit commits the installed update

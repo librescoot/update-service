@@ -86,15 +86,23 @@ func (r *Reporter) GetStatus(ctx context.Context) (Status, error) {
 	return Status(result), nil
 }
 
-// SetStatusAndVersion atomically sets both status and update version
+// SetStatusAndVersion atomically sets both status and update version.
+// When transitioning to downloading, resets both progress values to 0.
 func (r *Reporter) SetStatusAndVersion(ctx context.Context, status Status, version string) error {
 	statusKey := fmt.Sprintf("status:%s", r.component)
 	versionKey := fmt.Sprintf("update-version:%s", r.component)
 
-	err := r.pub.SetMany(map[string]any{
+	fields := map[string]any{
 		statusKey:  string(status),
 		versionKey: version,
-	})
+	}
+
+	if status == StatusDownloading {
+		fields[fmt.Sprintf("download-progress:%s", r.component)] = 0
+		fields[fmt.Sprintf("install-progress:%s", r.component)] = 0
+	}
+
+	err := r.pub.SetMany(fields)
 	if err != nil {
 		return fmt.Errorf("failed to set status and version for component %s: %w", r.component, err)
 	}
@@ -250,13 +258,15 @@ func (r *Reporter) ClearUpdateMethod(ctx context.Context) error {
 // Initialize sets initial values for OTA keys on service startup
 func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
 	statusKey := fmt.Sprintf("status:%s", r.component)
-	progressKey := fmt.Sprintf("download-progress:%s", r.component)
+	downloadProgressKey := fmt.Sprintf("download-progress:%s", r.component)
+	installProgressKey := fmt.Sprintf("install-progress:%s", r.component)
 	methodKey := fmt.Sprintf("update-method:%s", r.component)
 
 	err := r.pub.SetMany(map[string]any{
-		statusKey:   string(StatusIdle),
-		progressKey: 0,
-		methodKey:   updateMethod,
+		statusKey:           string(StatusIdle),
+		downloadProgressKey: 0,
+		installProgressKey:  0,
+		methodKey:           updateMethod,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize OTA keys for component %s: %w", r.component, err)

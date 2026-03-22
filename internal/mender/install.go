@@ -1,14 +1,19 @@
 package mender
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"log"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	menderstatus "github.com/librescoot/librescoot-mender-status/mender"
 )
+
+// InstallProgressCallback is called with progress (0-100) during mender-update install
+type InstallProgressCallback func(percent int)
 
 // UpdateState represents the state of a mender update
 type UpdateState int
@@ -39,17 +44,55 @@ func (i *Installer) NeedsCommit() (bool, error) {
 	return true, nil
 }
 
-// Install installs the update from the given file path
-func (i *Installer) Install(filePath string) error {
+// Install installs the update from the given file path.
+// If progressCb is non-nil, it receives progress updates (0-100) parsed from
+// mender-update's stderr output (format: "\r<percent>%").
+func (i *Installer) Install(filePath string, progressCb InstallProgressCallback) error {
 	i.logger.Printf("Installing update from %s", filePath)
 	cmd := exec.Command("mender-update", "install", filePath)
-	var stdout, stderr bytes.Buffer
+	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("error running mender-update install: %w, stderr: %s", err, stderr.String())
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start mender-update install: %w", err)
+	}
+
+	// Read stderr, splitting on \r to parse progress lines like "\r45%"
+	var stderrBuf bytes.Buffer
+	scanner := bufio.NewScanner(stderrPipe)
+	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		// Split on \r or \n
+		for i := 0; i < len(data); i++ {
+			if data[i] == '\r' || data[i] == '\n' {
+				return i + 1, data[:i], nil
+			}
+		}
+		if atEOF && len(data) > 0 {
+			return len(data), data, nil
+		}
+		return 0, nil, nil
+	})
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		stderrBuf.WriteString(line)
+		stderrBuf.WriteByte('\n')
+
+		if progressCb != nil && strings.HasSuffix(line, "%") {
+			numStr := strings.TrimSuffix(line, "%")
+			if pct, err := strconv.Atoi(numStr); err == nil && pct >= 0 && pct <= 100 {
+				progressCb(pct)
+			}
+		}
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("error running mender-update install: %w, stderr: %s", err, stderrBuf.String())
 	}
 
 	i.logger.Printf("mender-update install output: %s", stdout.String())

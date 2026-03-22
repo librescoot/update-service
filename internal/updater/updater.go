@@ -49,6 +49,18 @@ type Updater struct {
 	wg sync.WaitGroup
 }
 
+// menderInstallProgressCb returns a callback that reports mender-update install
+// progress (parsed from stderr) to the status reporter as 0-100%.
+// Used for full (non-delta) updates where mender install is the entire install phase.
+func (u *Updater) menderInstallProgressCb() mender.InstallProgressCallback {
+	return func(percent int) {
+		if err := u.status.SetInstallProgress(u.ctx, percent); err != nil {
+			u.logger.Printf("Failed to set install progress: %v", err)
+		}
+	}
+}
+
+
 // New creates a new component-aware updater
 func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inhibitorClient *inhibitor.Client, powerClient *power.Client, bootUpdater *boot.BootUpdater, logger *log.Logger) *Updater {
 	updaterCtx, cancel := context.WithCancel(ctx)
@@ -671,7 +683,7 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		}()
 	}
 
-	if err := u.mender.Install(source); err != nil {
+	if err := u.mender.Install(source, u.menderInstallProgressCb()); err != nil {
 		u.logger.Printf("Failed to install update from file %s: %v", source, err)
 		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update from file %s: %v", source, err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
@@ -803,7 +815,7 @@ func (u *Updater) handleUpdateFromURL(url string) {
 			u.logger.Printf("Failed to remove download inhibit: %v", err)
 		}
 
-		if err := u.mender.Install(filePath); err != nil {
+		if err := u.mender.Install(filePath, u.menderInstallProgressCb()); err != nil {
 			u.logger.Printf("Failed to install update: %v", err)
 
 			errStr := err.Error()
@@ -1336,7 +1348,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	}
 
 	// Step 4: Install the update
-	if err := u.mender.Install(filePath); err != nil {
+	if err := u.mender.Install(filePath, u.menderInstallProgressCb()); err != nil {
 		u.logger.Printf("Failed to install update: %v", err)
 
 		// Check if this is a corruption error (gzip decompression, checksum failure, etc.)
@@ -1568,9 +1580,11 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		}
 	}
 
+	// Delta application is still "downloading" from the user's perspective —
+	// report progress as download progress.
 	installProgressCallback := func(percent int) {
-		if err := u.status.SetInstallProgress(u.ctx, percent); err != nil {
-			u.logger.Printf("Failed to set install progress: %v", err)
+		if err := u.status.SetDownloadProgress(u.ctx, int64(percent), 100); err != nil {
+			u.logger.Printf("Failed to set download progress: %v", err)
 		}
 	}
 
@@ -1645,14 +1659,6 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 
 	u.logger.Printf("All %d deltas downloaded, applying chain", len(downloads))
-
-	// Transition to installing status before delta application so the UI
-	// can display granular install progress (it only shows the progress bar
-	// when status == "installing").
-	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
-		u.logger.Printf("Failed to set installing status: %v", err)
-		return
-	}
 
 	// Swap inhibitors: install inhibit replaces download inhibit
 	if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
@@ -1783,7 +1789,10 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 
 	// Step 4: Install the update
-	if err := u.mender.Install(finalMenderPath); err != nil {
+	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
+		u.logger.Printf("Failed to set installing status: %v", err)
+	}
+	if err := u.mender.Install(finalMenderPath, u.menderInstallProgressCb()); err != nil {
 		u.logger.Printf("Failed to install delta-generated update: %v", err)
 
 		// Check if this is a corruption error (gzip decompression, checksum failure, etc.)
