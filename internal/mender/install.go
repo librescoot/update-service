@@ -80,15 +80,22 @@ func (i *Installer) Install(filePath string, progressCb InstallProgressCallback)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		stderrBuf.WriteString(line)
-		stderrBuf.WriteByte('\n')
+		if line == "" {
+			continue
+		}
 
-		if progressCb != nil && strings.HasSuffix(line, "%") {
+		if strings.HasSuffix(line, "%") {
 			numStr := strings.TrimSuffix(line, "%")
 			if pct, err := strconv.Atoi(numStr); err == nil && pct >= 0 && pct <= 100 {
-				progressCb(pct)
+				if progressCb != nil {
+					progressCb(pct)
+				}
+				continue
 			}
 		}
+
+		stderrBuf.WriteString(line)
+		stderrBuf.WriteByte('\n')
 	}
 
 	if err := cmd.Wait(); err != nil {

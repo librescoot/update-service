@@ -1660,6 +1660,11 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 	u.logger.Printf("All %d deltas downloaded, applying chain", len(downloads))
 
+	// Clear stale download-bytes/download-total from last delta download
+	if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
+		u.logger.Printf("Failed to clear download progress: %v", err)
+	}
+
 	// Swap inhibitors: install inhibit replaces download inhibit
 	if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
 		u.logger.Printf("Failed to add install inhibit: %v", err)
