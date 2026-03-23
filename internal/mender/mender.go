@@ -118,6 +118,50 @@ func (m *Manager) cleanupOldFiles(currentURL string) error {
 	return nil
 }
 
+// extractVersion extracts the version string (e.g. "nightly-20251226T091616") from a
+// mender filename like "librescoot-unu-mdb-nightly-20251226T091616.mender".
+// The version is the channel-timestamp suffix, which sorts lexicographically by time.
+func extractVersion(filename string) string {
+	basename := strings.TrimSuffix(filepath.Base(filename), ".mender")
+	// The component prefix ends at the 3rd hyphen: librescoot-unu-mdb-
+	// Everything after that is the version: channel-timestamp
+	parts := strings.SplitN(basename, "-", 4)
+	if len(parts) < 4 {
+		return ""
+	}
+	return parts[3]
+}
+
+// CleanupStaleMenderFiles removes all but the newest .mender file in the download directory.
+// This is intended to be called on startup to reclaim disk space from old downloads.
+func (m *Manager) CleanupStaleMenderFiles() {
+	pattern := filepath.Join(m.downloader.downloadDir, "*.mender")
+	files, err := filepath.Glob(pattern)
+	if err != nil || len(files) <= 1 {
+		return
+	}
+
+	// Find the newest file by version embedded in filename
+	var newestFile string
+	var newestVersion string
+	for _, file := range files {
+		version := extractVersion(file)
+		if version > newestVersion {
+			newestVersion = version
+			newestFile = file
+		}
+	}
+
+	for _, file := range files {
+		if file != newestFile {
+			m.logger.Printf("Removing stale mender file: %s", file)
+			if err := os.Remove(file); err != nil {
+				m.logger.Printf("Warning: failed to remove stale mender file %s: %v", file, err)
+			}
+		}
+	}
+}
+
 // CleanupFile removes a downloaded file
 func (m *Manager) CleanupFile(filePath string) error {
 	// Only clean up files within our download directory
@@ -192,9 +236,9 @@ func (m *Manager) FindLatestMenderFile(channel string) (path string, version str
 		return "", "", false
 	}
 
-	// Filter to files matching the channel and find the newest by modification time
+	// Filter to files matching the channel and find the newest by version
 	var newestFile string
-	var newestTime int64
+	var newestVersion string
 	channelPrefix := channel + "-"
 
 	for _, file := range files {
@@ -204,12 +248,9 @@ func (m *Manager) FindLatestMenderFile(channel string) (path string, version str
 			continue
 		}
 
-		info, err := os.Stat(file)
-		if err != nil {
-			continue
-		}
-		if info.ModTime().UnixNano() > newestTime {
-			newestTime = info.ModTime().UnixNano()
+		ver := extractVersion(file)
+		if ver > newestVersion {
+			newestVersion = ver
 			newestFile = file
 		}
 	}

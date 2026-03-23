@@ -146,6 +146,9 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 		u.logger.Printf("Warning: Failed to cleanup stale temp dirs: %v", err)
 	}
 
+	// Remove old .mender files, keeping only the newest one
+	u.mender.CleanupStaleMenderFiles()
+
 	// Recover from any stuck status on startup
 	if err := u.recoverFromStuckState(menderNeedsReboot); err != nil {
 		u.logger.Printf("Warning: Failed to recover from stuck state: %v", err)
