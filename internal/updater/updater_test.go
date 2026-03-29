@@ -155,10 +155,10 @@ func TestRecoveryLogic(t *testing.T) {
 			expectedAction:    "clear",
 		},
 		{
-			name:              "installing with mender reboot - set rebooting",
+			name:              "installing with mender reboot - set pending-reboot",
 			currentStatus:     "installing",
 			menderNeedsReboot: true,
-			expectedAction:    "set_rebooting",
+			expectedAction:    "set_pending_reboot",
 		},
 		{
 			name:              "installing without mender reboot - clear",
@@ -167,8 +167,14 @@ func TestRecoveryLogic(t *testing.T) {
 			expectedAction:    "clear",
 		},
 		{
-			name:              "rebooting - clear",
-			currentStatus:     "rebooting",
+			name:              "preparing - clear",
+			currentStatus:     "preparing",
+			menderNeedsReboot: false,
+			expectedAction:    "clear",
+		},
+		{
+			name:              "pending-reboot - clear",
+			currentStatus:     "pending-reboot",
 			menderNeedsReboot: false,
 			expectedAction:    "clear",
 		},
@@ -199,14 +205,14 @@ func determineRecoveryAction(currentStatus string, menderNeedsReboot bool) strin
 	}
 
 	switch currentStatus {
-	case "downloading":
+	case "downloading", "preparing":
 		return "clear"
 	case "installing":
 		if menderNeedsReboot {
-			return "set_rebooting"
+			return "set_pending_reboot"
 		}
 		return "clear"
-	case "rebooting":
+	case "pending-reboot":
 		return "clear"
 	case "error":
 		return "clear"
@@ -217,7 +223,7 @@ func determineRecoveryAction(currentStatus string, menderNeedsReboot bool) strin
 
 // TestCheckForUpdatesDefersNonIdle tests that checkForUpdates should defer for all non-idle states
 func TestCheckForUpdatesDefersNonIdle(t *testing.T) {
-	nonIdleStates := []string{"downloading", "installing", "rebooting", "error"}
+	nonIdleStates := []string{"downloading", "preparing", "installing", "pending-reboot", "error"}
 
 	for _, state := range nonIdleStates {
 		t.Run(state, func(t *testing.T) {

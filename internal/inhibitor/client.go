@@ -120,13 +120,13 @@ func (c *Client) RemoveInhibit(id string) error {
 }
 
 // AddDownloadInhibit adds a download inhibit that delays power state changes
-// for up to 5 minutes while an update is downloading
+// for up to 15 seconds while an update is downloading
 func (c *Client) AddDownloadInhibit(componentID string) error {
 	id := fmt.Sprintf("download:%s", componentID)
 	who := "update-service"
 	what := "power-state-change"
 	why := fmt.Sprintf("downloading update for %s", componentID)
-	return c.AddInhibit(id, who, what, why, TypeDelay, 5*time.Minute)
+	return c.AddInhibit(id, who, what, why, TypeDelay, 15*time.Second)
 }
 
 // RemoveDownloadInhibit removes a download inhibit
@@ -135,14 +135,30 @@ func (c *Client) RemoveDownloadInhibit(componentID string) error {
 	return c.RemoveInhibit(id)
 }
 
-// AddInstallInhibit adds an install inhibit that blocks power state changes
-// completely while an update is being installed
+// AddPreparingInhibit adds a preparing inhibit that delays power state changes
+// for up to 30 seconds while delta application is in progress
+func (c *Client) AddPreparingInhibit(componentID string) error {
+	id := fmt.Sprintf("preparing:%s", componentID)
+	who := "update-service"
+	what := "power-state-change"
+	why := fmt.Sprintf("preparing update for %s", componentID)
+	return c.AddInhibit(id, who, what, why, TypeDelay, 30*time.Second)
+}
+
+// RemovePreparingInhibit removes a preparing inhibit
+func (c *Client) RemovePreparingInhibit(componentID string) error {
+	id := fmt.Sprintf("preparing:%s", componentID)
+	return c.RemoveInhibit(id)
+}
+
+// AddInstallInhibit adds an install inhibit that delays power state changes
+// for up to 60 seconds while an update is being installed
 func (c *Client) AddInstallInhibit(componentID string) error {
 	id := fmt.Sprintf("install:%s", componentID)
 	who := "update-service"
 	what := "power-state-change"
 	why := fmt.Sprintf("installing update for %s", componentID)
-	return c.AddInhibit(id, who, what, why, TypeBlock, 0) // 0 duration means indefinite
+	return c.AddInhibit(id, who, what, why, TypeDelay, 60*time.Second)
 }
 
 // RemoveInstallInhibit removes an install inhibit
