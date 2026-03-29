@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 )
@@ -140,13 +141,16 @@ func (b *BootUpdater) WriteVersionFile(version string) error {
 }
 
 // Apply extracts tarball contents and writes all boot assets with verification.
-// Order: zImage → DTB → sync → U-Boot (write to hardware last).
+// Order: zImage, DTB, sync, U-Boot (write to hardware last).
 func (b *BootUpdater) Apply(ctx context.Context, extractDir string) error {
 	remountRO, err := b.remountRW()
 	if err != nil {
 		return fmt.Errorf("remount rw: %w", err)
 	}
 	defer remountRO()
+
+	// Clean up stale .tmp files from a previous interrupted attempt
+	b.cleanStaleTmpFiles()
 
 	zImageSrc := extractDir + "/zImage"
 	zImageDst := b.mountPoint + "/zImage"
@@ -189,7 +193,31 @@ func (b *BootUpdater) remountRW() (func(), error) {
 	}, nil
 }
 
-// writeFileVerified copies src → dst, syncs, reads back and compares sha256.
+// cleanStaleTmpFiles removes any .tmp files left behind by a previous
+// interrupted writeFileVerified call.
+func (b *BootUpdater) cleanStaleTmpFiles() {
+	entries, err := os.ReadDir(b.mountPoint)
+	if err != nil {
+		b.logger.Printf("[boot] warning: cannot read %s for tmp cleanup: %v", b.mountPoint, err)
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			path := b.mountPoint + "/" + e.Name()
+			b.logger.Printf("[boot] removing stale tmp file: %s", path)
+			if err := os.Remove(path); err != nil {
+				b.logger.Printf("[boot] warning: failed to remove %s: %v", path, err)
+			}
+		}
+	}
+}
+
+// writeFileVerified copies src to dst using write-then-rename for atomicity.
+// On power loss before rename: old file intact, temp file may be partial.
+// On power loss after rename: new file in place.
 func writeFileVerified(dst, src string) error {
 	srcData, err := os.ReadFile(src)
 	if err != nil {
@@ -197,20 +225,33 @@ func writeFileVerified(dst, src string) error {
 	}
 
 	expectedHash := sha256sum(srcData)
+	tmpPath := dst + ".tmp"
 
-	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
-		return fmt.Errorf("open dst %s: %w", dst, err)
+		return fmt.Errorf("open tmp %s: %w", tmpPath, err)
 	}
 	if _, err := f.Write(srcData); err != nil {
 		f.Close()
-		return fmt.Errorf("write dst %s: %w", dst, err)
+		os.Remove(tmpPath)
+		return fmt.Errorf("write tmp %s: %w", tmpPath, err)
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
-		return fmt.Errorf("sync dst %s: %w", dst, err)
+		os.Remove(tmpPath)
+		return fmt.Errorf("sync tmp %s: %w", tmpPath, err)
 	}
 	f.Close()
+
+	if err := os.Rename(tmpPath, dst); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename %s -> %s: %w", tmpPath, dst, err)
+	}
+
+	// Sync parent directory to persist the rename
+	if err := syncDir(filepath.Dir(dst)); err != nil {
+		return fmt.Errorf("sync dir for %s: %w", dst, err)
+	}
 
 	// Read back and verify
 	dstData, err := os.ReadFile(dst)
@@ -222,6 +263,16 @@ func writeFileVerified(dst, src string) error {
 		return fmt.Errorf("verify %s: sha256 mismatch (expected %s, got %s)", dst, expectedHash, actualHash)
 	}
 	return nil
+}
+
+// syncDir opens a directory and fsyncs it to persist metadata changes (renames).
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // writeUBoot unlocks force_ro, seeks to ubootSeek*512 bytes, writes imx data,
