@@ -166,3 +166,20 @@ func (c *Client) RemoveInstallInhibit(componentID string) error {
 	id := fmt.Sprintf("install:%s", componentID)
 	return c.RemoveInhibit(id)
 }
+
+// AddBootInhibit adds a block inhibitor for boot partition updates.
+// Boot updates write to raw devices without A/B redundancy, so power
+// loss mid-write can brick the device. This must be a hard block.
+func (c *Client) AddBootInhibit(componentID string) error {
+	id := fmt.Sprintf("boot:%s", componentID)
+	who := "update-service"
+	what := "power-state-change"
+	why := fmt.Sprintf("writing boot partition for %s (no A/B redundancy)", componentID)
+	return c.AddInhibit(id, who, what, why, TypeBlock, 0)
+}
+
+// RemoveBootInhibit removes a boot update inhibitor
+func (c *Client) RemoveBootInhibit(componentID string) error {
+	id := fmt.Sprintf("boot:%s", componentID)
+	return c.RemoveInhibit(id)
+}

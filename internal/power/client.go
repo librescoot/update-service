@@ -143,6 +143,20 @@ func (c *Client) RemoveInstallInhibit(componentID string) error {
 	return c.RemoveInhibit(id)
 }
 
+// AddBootInhibit adds a block inhibitor for boot partition updates.
+// Boot updates write to raw devices without A/B redundancy, so power
+// loss mid-write can brick the device. This must be a hard block.
+func (c *Client) AddBootInhibit(componentID string) error {
+	id := fmt.Sprintf("boot:%s", componentID)
+	return c.AddInhibit(id, InhibitTypeInstalling, 0) // 0 = indefinite block
+}
+
+// RemoveBootInhibit removes a boot update inhibitor
+func (c *Client) RemoveBootInhibit(componentID string) error {
+	id := fmt.Sprintf("boot:%s", componentID)
+	return c.RemoveInhibit(id)
+}
+
 // Governor represents a CPU governor type
 type Governor string
 
