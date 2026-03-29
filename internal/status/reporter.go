@@ -12,11 +12,12 @@ import (
 type Status string
 
 const (
-	StatusIdle        Status = "idle"
-	StatusDownloading Status = "downloading"
-	StatusInstalling  Status = "installing"
-	StatusRebooting   Status = "rebooting"
-	StatusError       Status = "error"
+	StatusIdle          Status = "idle"
+	StatusDownloading   Status = "downloading"
+	StatusPreparing     Status = "preparing"
+	StatusInstalling    Status = "installing"
+	StatusPendingReboot Status = "pending-reboot"
+	StatusError         Status = "error"
 )
 
 // Reporter handles Redis status reporting for OTA updates using HashPublisher

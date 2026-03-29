@@ -275,7 +275,7 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 	u.logger.Printf("Found %s status for %s on startup", currentStatus, u.config.Component)
 
 	switch currentStatus {
-	case status.StatusDownloading:
+	case status.StatusDownloading, status.StatusPreparing:
 		// Check if file exists for logging purposes
 		targetVersion, _ := u.redis.GetTargetVersion(u.config.Component)
 		if targetVersion != "" {
@@ -284,17 +284,17 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 			}
 		}
 
-		u.logger.Printf("Clearing downloading status")
+		u.logger.Printf("Clearing %s status", currentStatus)
 		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
-			return fmt.Errorf("failed to clear downloading status: %w", err)
+			return fmt.Errorf("failed to clear %s status: %w", currentStatus, err)
 		}
 
 	case status.StatusInstalling:
 		if menderNeedsReboot {
-			// Mender install completed but needs reboot - transition to rebooting
-			u.logger.Printf("Mender install complete, setting status to rebooting")
-			if err := u.status.SetStatus(u.ctx, status.StatusRebooting); err != nil {
-				return fmt.Errorf("failed to set rebooting status: %w", err)
+			// Mender install completed but needs reboot
+			u.logger.Printf("Mender install complete, setting status to pending-reboot")
+			if err := u.status.SetStatus(u.ctx, status.StatusPendingReboot); err != nil {
+				return fmt.Errorf("failed to set pending-reboot status: %w", err)
 			}
 		} else {
 			// Mender install failed or was interrupted
@@ -304,11 +304,11 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 			}
 		}
 
-	case status.StatusRebooting:
-		// Reboot happened - commit was already attempted by CheckAndCommitPendingUpdate
-		u.logger.Printf("Clearing rebooting status (reboot completed)")
+	case status.StatusPendingReboot:
+		// Reboot happened, commit was already attempted by CheckAndCommitPendingUpdate
+		u.logger.Printf("Clearing pending-reboot status (reboot completed)")
 		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
-			return fmt.Errorf("failed to clear rebooting status: %w", err)
+			return fmt.Errorf("failed to clear pending-reboot status: %w", err)
 		}
 
 		// For DBC component, notify vehicle-service that update is complete
@@ -338,7 +338,7 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 }
 
 // recoverBootStatus resets a stuck boot update status on startup.
-// If boot status is "rebooting" on startup, the reboot already happened — clear to idle.
+// If boot status is "pending-reboot" on startup, the reboot already happened, clear to idle.
 func (u *Updater) recoverBootStatus() error {
 	bootComp := bootComponent(u.config.Component)
 	currentStatus, err := u.bootStatus.GetStatus(u.ctx)
@@ -353,8 +353,8 @@ func (u *Updater) recoverBootStatus() error {
 	u.logger.Printf("Found %s status for %s-boot on startup", currentStatus, u.config.Component)
 
 	switch currentStatus {
-	case status.StatusRebooting:
-		u.logger.Printf("Clearing %s-boot rebooting status (reboot completed)", u.config.Component)
+	case status.StatusPendingReboot:
+		u.logger.Printf("Clearing %s-boot pending-reboot status (reboot completed)", u.config.Component)
 		if u.config.Component == "dbc" {
 			u.logger.Printf("Sending complete-dbc command after boot reboot")
 			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
@@ -362,9 +362,9 @@ func (u *Updater) recoverBootStatus() error {
 			}
 		}
 		if err := u.bootStatus.SetIdleAndClearVersion(u.ctx); err != nil {
-			return fmt.Errorf("failed to clear rebooting status: %w", err)
+			return fmt.Errorf("failed to clear pending-reboot status: %w", err)
 		}
-	case status.StatusDownloading, status.StatusInstalling, status.StatusError:
+	case status.StatusDownloading, status.StatusPreparing, status.StatusInstalling, status.StatusError:
 		u.logger.Printf("Clearing %s-boot %s status", bootComp, currentStatus)
 		if err := u.bootStatus.SetIdleAndClearVersion(u.ctx); err != nil {
 			return fmt.Errorf("failed to clear %s status: %w", currentStatus, err)
@@ -664,14 +664,16 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		return
 	}
 
-	if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to add install inhibit: %v", err)
-	}
-	defer func() {
-		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
-			u.logger.Printf("Failed to remove install inhibit: %v", err)
+	if u.config.Component == "mdb" {
+		if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to add install inhibit: %v", err)
 		}
-	}()
+		defer func() {
+			if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove install inhibit: %v", err)
+			}
+		}()
+	}
 
 	if u.config.Component == "dbc" {
 		u.logger.Printf("Starting DBC file update - sending start-dbc command")
@@ -696,8 +698,8 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 
 	u.logger.Printf("Successfully installed update from file: %s", source)
 
-	if err := u.status.SetStatus(u.ctx, status.StatusRebooting); err != nil {
-		u.logger.Printf("Failed to set rebooting status: %v", err)
+	if err := u.status.SetStatus(u.ctx, status.StatusPendingReboot); err != nil {
+		u.logger.Printf("Failed to set pending-reboot status: %v", err)
 	}
 
 	if err := u.TriggerReboot(u.config.Component); err != nil {
@@ -738,18 +740,20 @@ func (u *Updater) handleUpdateFromURL(url string) {
 		}()
 	}
 
-	// Add download inhibit
-	if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to add download inhibit: %v", err)
+	// Add download inhibit (MDB only, vehicle-service handles DBC power)
+	if u.config.Component == "mdb" {
+		if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to add download inhibit: %v", err)
+		}
+		defer func() {
+			if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove download inhibit: %v", err)
+			}
+			if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove install inhibit: %v", err)
+			}
+		}()
 	}
-	defer func() {
-		if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
-			u.logger.Printf("Failed to remove download inhibit: %v", err)
-		}
-		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
-			u.logger.Printf("Failed to remove install inhibit: %v", err)
-		}
-	}()
 
 	u.logger.Printf("Processing update from URL: %s", source)
 
@@ -810,12 +814,13 @@ func (u *Updater) handleUpdateFromURL(url string) {
 			return
 		}
 
-		if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
-			u.logger.Printf("Failed to add install inhibit: %v", err)
-		}
-
-		if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
-			u.logger.Printf("Failed to remove download inhibit: %v", err)
+		if u.config.Component == "mdb" {
+			if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to add install inhibit: %v", err)
+			}
+			if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove download inhibit: %v", err)
+			}
 		}
 
 		if err := u.mender.Install(filePath, u.menderInstallProgressCb()); err != nil {
@@ -844,12 +849,14 @@ func (u *Updater) handleUpdateFromURL(url string) {
 
 		u.logger.Printf("Successfully installed update")
 
-		if err := u.status.SetStatus(u.ctx, status.StatusRebooting); err != nil {
-			u.logger.Printf("Failed to set rebooting status: %v", err)
+		if err := u.status.SetStatus(u.ctx, status.StatusPendingReboot); err != nil {
+			u.logger.Printf("Failed to set pending-reboot status: %v", err)
 		}
 
-		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
-			u.logger.Printf("Failed to remove install inhibit: %v", err)
+		if u.config.Component == "mdb" {
+			if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove install inhibit: %v", err)
+			}
 		}
 
 		u.logger.Printf("Update installation complete, system will reboot to apply changes")
@@ -1281,8 +1288,10 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 		}
 	}
 
-	if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to add download inhibit: %v", err)
+	if u.config.Component == "mdb" {
+		if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to add download inhibit: %v", err)
+		}
 	}
 
 	// Request ondemand CPU governor for optimal download performance
@@ -1291,12 +1300,13 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	}
 
 	defer func() {
-		// Always clean up inhibitors on exit
-		if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
-			u.logger.Printf("Failed to remove download inhibit: %v", err)
-		}
-		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
-			u.logger.Printf("Failed to remove install inhibit: %v", err)
+		if u.config.Component == "mdb" {
+			if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove download inhibit: %v", err)
+			}
+			if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove install inhibit: %v", err)
+			}
 		}
 
 		// For DBC updates, notify vehicle-service that update is complete
@@ -1335,19 +1345,19 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	// This ensures the 3-minute standby requirement starts fresh from the current state
 	u.revalidateStandbyState()
 
-	// Step 3: Set installing status and add install inhibitor
+	// Step 3: Set installing status and swap inhibitors
 	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
 		u.logger.Printf("Failed to set installing status: %v", err)
 		return
 	}
 
-	// Add install inhibit before removing download inhibit to prevent a window where no inhibit is active
-	if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to add install inhibit: %v", err)
-	}
-
-	if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to remove download inhibit: %v", err)
+	if u.config.Component == "mdb" {
+		if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to add install inhibit: %v", err)
+		}
+		if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove download inhibit: %v", err)
+		}
 	}
 
 	// Step 4: Install the update
@@ -1378,14 +1388,15 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 
 	u.logger.Printf("Successfully installed update")
 
-	// Step 5: Set rebooting status and prepare for reboot
-	if err := u.status.SetStatus(u.ctx, status.StatusRebooting); err != nil {
-		u.logger.Printf("Failed to set rebooting status: %v", err)
+	// Step 5: Set pending-reboot status and prepare for reboot
+	if err := u.status.SetStatus(u.ctx, status.StatusPendingReboot); err != nil {
+		u.logger.Printf("Failed to set pending-reboot status: %v", err)
 	}
 
-	// Remove install inhibitor before reboot
-	if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to remove install inhibit: %v", err)
+	if u.config.Component == "mdb" {
+		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove install inhibit: %v", err)
+		}
 	}
 
 	// Step 6: Trigger reboot (component will reboot automatically or system will reboot)
@@ -1394,7 +1405,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	// Trigger reboot
 	if u.config.Component == "mdb" || u.config.Component == "dbc" {
 		u.logger.Printf("%s update installed, triggering reboot", strings.ToUpper(u.config.Component))
-		err := u.TriggerReboot(u.config.Component) // Call the method on *Updater
+		err := u.TriggerReboot(u.config.Component)
 		if err != nil {
 			u.logger.Printf("Failed to trigger %s reboot: %v", u.config.Component, err)
 			// If reboot trigger fails (and not due to dry run), set status to error
@@ -1415,7 +1426,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 			}
 		}
 		// If TriggerReboot was successful (and not a dry run), the system/component will reboot/restart.
-		// Status remains 'rebooting'.
+		// Status remains 'pending-reboot'.
 	} else {
 		u.logger.Printf("Unknown component %s, cannot determine reboot strategy. Setting to idle.", u.config.Component)
 		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
@@ -1548,9 +1559,11 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		}
 	}
 
-	// Add power inhibit
-	if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to add download inhibit: %v", err)
+	// Add power inhibit (MDB only, vehicle-service handles DBC power)
+	if u.config.Component == "mdb" {
+		if err := u.inhibitor.AddDownloadInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to add download inhibit: %v", err)
+		}
 	}
 
 	// Request ondemand CPU governor
@@ -1559,12 +1572,16 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 
 	defer func() {
-		// Always clean up inhibitors on exit
-		if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
-			u.logger.Printf("Failed to remove download inhibit: %v", err)
-		}
-		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
-			u.logger.Printf("Failed to remove install inhibit: %v", err)
+		if u.config.Component == "mdb" {
+			if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove download inhibit: %v", err)
+			}
+			if err := u.inhibitor.RemovePreparingInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove preparing inhibit: %v", err)
+			}
+			if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove install inhibit: %v", err)
+			}
 		}
 
 		// For DBC updates, notify vehicle-service that update is complete
@@ -1583,11 +1600,10 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		}
 	}
 
-	// Delta application is still "downloading" from the user's perspective —
-	// report progress as download progress.
+	// Delta application progress reported as install progress
 	installProgressCallback := func(percent int) {
-		if err := u.status.SetDownloadProgress(u.ctx, int64(percent), 100); err != nil {
-			u.logger.Printf("Failed to set download progress: %v", err)
+		if err := u.status.SetInstallProgress(u.ctx, percent); err != nil {
+			u.logger.Printf("Failed to set install progress: %v", err)
 		}
 	}
 
@@ -1668,12 +1684,19 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		u.logger.Printf("Failed to clear download progress: %v", err)
 	}
 
-	// Swap inhibitors: install inhibit replaces download inhibit
-	if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to add install inhibit: %v", err)
+	// Transition to preparing: delta application is CPU-bound work
+	if err := u.status.SetStatus(u.ctx, status.StatusPreparing); err != nil {
+		u.logger.Printf("Failed to set preparing status: %v", err)
 	}
-	if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to remove download inhibit: %v", err)
+
+	// Swap inhibitors: preparing inhibit replaces download inhibit
+	if u.config.Component == "mdb" {
+		if err := u.inhibitor.AddPreparingInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to add preparing inhibit: %v", err)
+		}
+		if err := u.inhibitor.RemoveDownloadInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove download inhibit: %v", err)
+		}
 	}
 
 	// Step 3: Apply all deltas in a single unpack/repack cycle
@@ -1796,9 +1819,17 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		return
 	}
 
-	// Step 4: Install the update
+	// Step 4: Install the update, swap from preparing to install inhibitor
 	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
 		u.logger.Printf("Failed to set installing status: %v", err)
+	}
+	if u.config.Component == "mdb" {
+		if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to add install inhibit: %v", err)
+		}
+		if err := u.inhibitor.RemovePreparingInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove preparing inhibit: %v", err)
+		}
 	}
 	if err := u.mender.Install(finalMenderPath, u.menderInstallProgressCb()); err != nil {
 		u.logger.Printf("Failed to install delta-generated update: %v", err)
@@ -1827,14 +1858,15 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 	u.logger.Printf("Successfully installed delta update")
 
-	// Step 5: Set rebooting status and prepare for reboot
-	if err := u.status.SetStatus(u.ctx, status.StatusRebooting); err != nil {
-		u.logger.Printf("Failed to set rebooting status: %v", err)
+	// Step 5: Set pending-reboot status and prepare for reboot
+	if err := u.status.SetStatus(u.ctx, status.StatusPendingReboot); err != nil {
+		u.logger.Printf("Failed to set pending-reboot status: %v", err)
 	}
 
-	// Remove install inhibitor before reboot
-	if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
-		u.logger.Printf("Failed to remove install inhibit: %v", err)
+	if u.config.Component == "mdb" {
+		if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove install inhibit: %v", err)
+		}
 	}
 
 	// Step 6: Trigger reboot
@@ -1955,7 +1987,7 @@ func (u *Updater) TriggerReboot(component string) error {
 	case "dbc":
 		u.logger.Printf("DBC update installed. Will apply on next power cycle.")
 		// For DBC, we don't actively reboot - it will apply the update on next power-on
-		// Status remains "rebooting" and will be cleared on next service startup
+		// Status remains "pending-reboot" and will be cleared on next service startup
 		return nil
 
 	default:
@@ -2169,8 +2201,8 @@ func (u *Updater) performLocalBootUpdate() {
 		}
 	}
 
-	if err := u.bootStatus.SetStatus(u.ctx, status.StatusRebooting); err != nil {
-		u.logger.Printf("[boot-local] failed to set rebooting status: %v", err)
+	if err := u.bootStatus.SetStatus(u.ctx, status.StatusPendingReboot); err != nil {
+		u.logger.Printf("[boot-local] failed to set pending-reboot status: %v", err)
 	}
 
 	u.logger.Printf("[boot-local] boot update applied, triggering reboot")

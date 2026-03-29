@@ -22,8 +22,8 @@ const (
 type InhibitType string
 
 const (
-	InhibitTypeDownloading InhibitType = "downloading" // Delay power state changes for up to 5 minutes
-	InhibitTypeInstalling  InhibitType = "installing"  // Defer power state changes completely
+	InhibitTypeDownloading InhibitType = "downloading" // Delay power state changes during download
+	InhibitTypeInstalling  InhibitType = "installing"  // Delay power state changes during install
 )
 
 // Client represents a Redis client for interacting with the power manager
@@ -105,10 +105,10 @@ func (c *Client) RemoveInhibit(id string) error {
 }
 
 // AddDownloadInhibit adds a download inhibit that delays power state changes
-// for up to 5 minutes while an update is downloading
+// for up to 15 seconds while an update is downloading
 func (c *Client) AddDownloadInhibit(componentID string) error {
 	id := fmt.Sprintf("download:%s", componentID)
-	return c.AddInhibit(id, InhibitTypeDownloading, 5*time.Minute)
+	return c.AddInhibit(id, InhibitTypeDownloading, 15*time.Second)
 }
 
 // RemoveDownloadInhibit removes a download inhibit
@@ -117,11 +117,24 @@ func (c *Client) RemoveDownloadInhibit(componentID string) error {
 	return c.RemoveInhibit(id)
 }
 
-// AddInstallInhibit adds an install inhibit that defers power state changes
-// completely while an update is being installed
+// AddPreparingInhibit adds a preparing inhibit that delays power state changes
+// for up to 30 seconds while delta application is in progress
+func (c *Client) AddPreparingInhibit(componentID string) error {
+	id := fmt.Sprintf("preparing:%s", componentID)
+	return c.AddInhibit(id, InhibitTypeDownloading, 30*time.Second)
+}
+
+// RemovePreparingInhibit removes a preparing inhibit
+func (c *Client) RemovePreparingInhibit(componentID string) error {
+	id := fmt.Sprintf("preparing:%s", componentID)
+	return c.RemoveInhibit(id)
+}
+
+// AddInstallInhibit adds an install inhibit that delays power state changes
+// for up to 60 seconds while an update is being installed
 func (c *Client) AddInstallInhibit(componentID string) error {
 	id := fmt.Sprintf("install:%s", componentID)
-	return c.AddInhibit(id, InhibitTypeInstalling, 0) // 0 duration means indefinite
+	return c.AddInhibit(id, InhibitTypeInstalling, 60*time.Second)
 }
 
 // RemoveInstallInhibit removes an install inhibit
