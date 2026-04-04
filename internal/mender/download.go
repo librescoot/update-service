@@ -257,8 +257,12 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 	// Increase buffer size to 1MB for faster downloads
 	buffer := make([]byte, 1024*1024)
 	totalRead := fileSize
-	lastProgressReport := time.Now()
 	start := time.Now()
+	lastCallbackTime := time.Time{} // zero — fires on first data
+	lastLogTime := time.Time{}
+
+	const callbackInterval = 250 * time.Millisecond
+	const logInterval = 5 * time.Second
 
 	for {
 		select {
@@ -273,33 +277,29 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 				}
 				totalRead += int64(n)
 
-				if time.Since(lastProgressReport) > 5*time.Second {
+				// Report progress via callback (debounced to 250ms)
+				if progressCallback != nil && time.Since(lastCallbackTime) >= callbackInterval {
+					progressCallback(totalRead, totalSize)
+					lastCallbackTime = time.Now()
+				}
+
+				// Log progress (debounced to 5s)
+				if time.Since(lastLogTime) >= logInterval {
 					elapsed := time.Since(start)
 					speed := float64(totalRead) / elapsed.Seconds() / 1024 / 1024 // MB/s
-
-					// Calculate progress percentage
-					var percentage float64
 					if totalSize > 0 {
-						percentage = float64(totalRead) / float64(totalSize) * 100
+						percentage := float64(totalRead) / float64(totalSize) * 100
 						d.logger.Printf("Downloaded %d / %d bytes (%.1f%%, %.2f MB/s)", totalRead, totalSize, percentage, speed)
 					} else {
 						d.logger.Printf("Downloaded %d bytes (size unknown, %.2f MB/s)", totalRead, speed)
 					}
-
-					lastProgressReport = time.Now()
-
-					// Report progress via callback
-					if progressCallback != nil {
-						progressCallback(totalRead, totalSize)
-					}
+					lastLogTime = time.Now()
 				}
 			}
 			if err != nil {
 				if err == io.EOF {
 					elapsed := time.Since(start)
 					speed := float64(totalRead) / elapsed.Seconds() / 1024 / 1024 // MB/s
-
-					// Log completion with percentage if total size was known
 					if totalSize > 0 && totalRead == totalSize {
 						d.logger.Printf("Download complete, %d / %d bytes (100%%, average speed: %.2f MB/s)", totalRead, totalSize, speed)
 					} else {

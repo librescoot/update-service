@@ -285,7 +285,7 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 		}
 
 		u.logger.Printf("Clearing %s status", currentStatus)
-		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+		if err := u.status.SetIdle(u.ctx); err != nil {
 			return fmt.Errorf("failed to clear %s status: %w", currentStatus, err)
 		}
 
@@ -293,13 +293,13 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 		if menderNeedsReboot {
 			// Mender install completed but needs reboot
 			u.logger.Printf("Mender install complete, setting status to pending-reboot")
-			if err := u.status.SetStatus(u.ctx, status.StatusPendingReboot); err != nil {
+			if err := u.status.SetPendingReboot(u.ctx); err != nil {
 				return fmt.Errorf("failed to set pending-reboot status: %w", err)
 			}
 		} else {
 			// Mender install failed or was interrupted
 			u.logger.Printf("Clearing installing status (mender has no pending update)")
-			if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+			if err := u.status.SetIdle(u.ctx); err != nil {
 				return fmt.Errorf("failed to clear installing status: %w", err)
 			}
 		}
@@ -307,7 +307,7 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 	case status.StatusPendingReboot:
 		// Reboot happened, commit was already attempted by CheckAndCommitPendingUpdate
 		u.logger.Printf("Clearing pending-reboot status (reboot completed)")
-		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+		if err := u.status.SetIdle(u.ctx); err != nil {
 			return fmt.Errorf("failed to clear pending-reboot status: %w", err)
 		}
 
@@ -322,7 +322,7 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 
 	case status.StatusError:
 		u.logger.Printf("Clearing error status to allow retry")
-		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+		if err := u.status.SetIdle(u.ctx); err != nil {
 			return fmt.Errorf("failed to clear error status: %w", err)
 		}
 	}
@@ -361,12 +361,12 @@ func (u *Updater) recoverBootStatus() error {
 				u.logger.Printf("Failed to send complete-dbc command: %v", err)
 			}
 		}
-		if err := u.bootStatus.SetIdleAndClearVersion(u.ctx); err != nil {
+		if err := u.bootStatus.SetIdle(u.ctx); err != nil {
 			return fmt.Errorf("failed to clear pending-reboot status: %w", err)
 		}
 	case status.StatusDownloading, status.StatusPreparing, status.StatusInstalling, status.StatusError:
 		u.logger.Printf("Clearing %s-boot %s status", bootComp, currentStatus)
-		if err := u.bootStatus.SetIdleAndClearVersion(u.ctx); err != nil {
+		if err := u.bootStatus.SetIdle(u.ctx); err != nil {
 			return fmt.Errorf("failed to clear %s status: %w", currentStatus, err)
 		}
 	}
@@ -649,17 +649,12 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 
 	u.logger.Printf("Detected version from filename: %s", version)
 
-	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, version); err != nil {
+	if err := u.status.SetDownloading(u.ctx, version, "full"); err != nil {
 		u.logger.Printf("Failed to set downloading status: %v", err)
 		return
 	}
 
-	u.logger.Printf("Setting update method to full for file update")
-	if err := u.status.SetUpdateMethod(u.ctx, "full"); err != nil {
-		u.logger.Printf("Failed to set update method: %v", err)
-	}
-
-	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
+	if err := u.status.SetInstalling(u.ctx); err != nil {
 		u.logger.Printf("Failed to set installing status: %v", err)
 		return
 	}
@@ -698,7 +693,7 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 
 	u.logger.Printf("Successfully installed update from file: %s", source)
 
-	if err := u.status.SetStatus(u.ctx, status.StatusPendingReboot); err != nil {
+	if err := u.status.SetPendingReboot(u.ctx); err != nil {
 		u.logger.Printf("Failed to set pending-reboot status: %v", err)
 	}
 
@@ -712,7 +707,7 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		}
 
 		u.logger.Printf("Dry run: setting idle status for %s after file update", u.config.Component)
-		if idleErr := u.status.SetIdleAndClearVersion(u.ctx); idleErr != nil {
+		if idleErr := u.status.SetIdle(u.ctx); idleErr != nil {
 			u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
 		}
 	}
@@ -757,15 +752,10 @@ func (u *Updater) handleUpdateFromURL(url string) {
 
 	u.logger.Printf("Processing update from URL: %s", source)
 
-	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, "unknown"); err != nil {
+	updateMethod := u.getUpdateMethod()
+	if err := u.status.SetDownloading(u.ctx, "unknown", updateMethod); err != nil {
 		u.logger.Printf("Failed to set downloading status: %v", err)
 		return
-	}
-
-	u.logger.Printf("Setting update method based on configuration")
-	updateMethod := u.getUpdateMethod()
-	if err := u.status.SetUpdateMethod(u.ctx, updateMethod); err != nil {
-		u.logger.Printf("Failed to set update method: %v", err)
 	}
 
 	for i := 0; i < 5; i++ {
@@ -803,13 +793,9 @@ func (u *Updater) handleUpdateFromURL(url string) {
 
 		u.logger.Printf("Successfully downloaded update to: %s", filePath)
 
-		if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
-			u.logger.Printf("Failed to clear download progress: %v", err)
-		}
-
 		u.revalidateStandbyState()
 
-		if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
+		if err := u.status.SetInstalling(u.ctx); err != nil {
 			u.logger.Printf("Failed to set installing status: %v", err)
 			return
 		}
@@ -849,7 +835,7 @@ func (u *Updater) handleUpdateFromURL(url string) {
 
 		u.logger.Printf("Successfully installed update")
 
-		if err := u.status.SetStatus(u.ctx, status.StatusPendingReboot); err != nil {
+		if err := u.status.SetPendingReboot(u.ctx); err != nil {
 			u.logger.Printf("Failed to set pending-reboot status: %v", err)
 		}
 
@@ -874,14 +860,14 @@ func (u *Updater) handleUpdateFromURL(url string) {
 
 				if u.config.DryRun || strings.Contains(err.Error(), "DRY-RUN") {
 					u.logger.Printf("Dry run or simulated reboot: Simulating post-reboot state by setting idle status for %s.", u.config.Component)
-					if idleErr := u.status.SetIdleAndClearVersion(u.ctx); idleErr != nil {
+					if idleErr := u.status.SetIdle(u.ctx); idleErr != nil {
 						u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
 					}
 				}
 			}
 		} else {
 			u.logger.Printf("Unknown component %s, cannot determine reboot strategy. Setting to idle.", u.config.Component)
-			if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+			if err := u.status.SetIdle(u.ctx); err != nil {
 				u.logger.Printf("Failed to set idle status for unknown component: %v", err)
 			}
 		}
@@ -1270,14 +1256,9 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 
 
 	// Step 1: Set downloading status, update method, and add download inhibitor
-	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, version); err != nil {
+	if err := u.status.SetDownloading(u.ctx, version, "full"); err != nil {
 		u.logger.Printf("Failed to set downloading status: %v", err)
 		return
-	}
-
-	// Set update method to full
-	if err := u.status.SetUpdateMethod(u.ctx, "full"); err != nil {
-		u.logger.Printf("Failed to set update method: %v", err)
 	}
 
 	// For DBC updates, notify vehicle-service to keep dashboard power on
@@ -1334,11 +1315,6 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 		return
 	}
 
-	// Clear download progress after successful download
-	if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
-		u.logger.Printf("Failed to clear download progress: %v", err)
-	}
-
 	u.logger.Printf("Successfully downloaded update to: %s", filePath)
 
 	// Re-validate vehicle state after long-running download operation
@@ -1346,7 +1322,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	u.revalidateStandbyState()
 
 	// Step 3: Set installing status and swap inhibitors
-	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
+	if err := u.status.SetInstalling(u.ctx); err != nil {
 		u.logger.Printf("Failed to set installing status: %v", err)
 		return
 	}
@@ -1389,7 +1365,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 	u.logger.Printf("Successfully installed update")
 
 	// Step 5: Set pending-reboot status and prepare for reboot
-	if err := u.status.SetStatus(u.ctx, status.StatusPendingReboot); err != nil {
+	if err := u.status.SetPendingReboot(u.ctx); err != nil {
 		u.logger.Printf("Failed to set pending-reboot status: %v", err)
 	}
 
@@ -1420,7 +1396,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 			// If it was a dry run (error contains "DRY-RUN" or DryRun flag is true), simulate post-reboot.
 			if u.config.DryRun || strings.Contains(err.Error(), "DRY-RUN") {
 				u.logger.Printf("Dry run or simulated reboot: Simulating post-reboot state by setting idle status for %s.", u.config.Component)
-				if idleErr := u.status.SetIdleAndClearVersion(u.ctx); idleErr != nil {
+				if idleErr := u.status.SetIdle(u.ctx); idleErr != nil {
 					u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
 				}
 			}
@@ -1429,7 +1405,7 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 		// Status remains 'pending-reboot'.
 	} else {
 		u.logger.Printf("Unknown component %s, cannot determine reboot strategy. Setting to idle.", u.config.Component)
-		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+		if err := u.status.SetIdle(u.ctx); err != nil {
 			u.logger.Printf("Failed to set idle status for unknown component: %v", err)
 		}
 	}
@@ -1542,13 +1518,8 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 
 	// Set status
-	if err := u.status.SetStatusAndVersion(u.ctx, status.StatusDownloading, latestVersion); err != nil {
+	if err := u.status.SetDownloading(u.ctx, latestVersion, "delta"); err != nil {
 		u.logger.Printf("Failed to set downloading status: %v", err)
-	}
-
-	// Set update method
-	if err := u.status.SetUpdateMethod(u.ctx, "delta"); err != nil {
-		u.logger.Printf("Failed to set update method: %v", err)
 	}
 
 	// For DBC updates, notify vehicle-service to keep dashboard power on
@@ -1671,21 +1642,16 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		downloads[i].deltaPath = deltaPath
 		u.logger.Printf("Downloaded delta %d/%d: %s", i+1, len(deltaChain), release.TagName)
 
-		// Clear download progress between deltas
-		if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
-			u.logger.Printf("Failed to clear download progress: %v", err)
+		// Reset download progress between deltas (so next delta starts at 0%)
+		if err := u.status.ResetDownloadProgress(u.ctx); err != nil {
+			u.logger.Printf("Failed to reset download progress: %v", err)
 		}
 	}
 
 	u.logger.Printf("All %d deltas downloaded, applying chain", len(downloads))
 
-	// Clear stale download-bytes/download-total from last delta download
-	if err := u.status.ClearDownloadProgress(u.ctx); err != nil {
-		u.logger.Printf("Failed to clear download progress: %v", err)
-	}
-
 	// Transition to preparing: delta application is CPU-bound work
-	if err := u.status.SetStatus(u.ctx, status.StatusPreparing); err != nil {
+	if err := u.status.SetPreparing(u.ctx); err != nil {
 		u.logger.Printf("Failed to set preparing status: %v", err)
 	}
 
@@ -1813,14 +1779,14 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	if u.config.DryRun {
 		u.logger.Printf("DRY-RUN: Multi-delta update complete. Final mender file ready at: %s", finalMenderPath)
 		u.logger.Printf("DRY-RUN: Skipping mender-update install and reboot")
-		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+		if err := u.status.SetIdle(u.ctx); err != nil {
 			u.logger.Printf("Failed to set idle status in dry run: %v", err)
 		}
 		return
 	}
 
 	// Step 4: Install the update, swap from preparing to install inhibitor
-	if err := u.status.SetStatus(u.ctx, status.StatusInstalling); err != nil {
+	if err := u.status.SetInstalling(u.ctx); err != nil {
 		u.logger.Printf("Failed to set installing status: %v", err)
 	}
 	if u.config.Component == "mdb" {
@@ -1859,7 +1825,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	u.logger.Printf("Successfully installed delta update")
 
 	// Step 5: Set pending-reboot status and prepare for reboot
-	if err := u.status.SetStatus(u.ctx, status.StatusPendingReboot); err != nil {
+	if err := u.status.SetPendingReboot(u.ctx); err != nil {
 		u.logger.Printf("Failed to set pending-reboot status: %v", err)
 	}
 
@@ -1887,14 +1853,14 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			// If it was a dry run, simulate post-reboot
 			if u.config.DryRun || strings.Contains(err.Error(), "DRY-RUN") {
 				u.logger.Printf("Dry run or simulated reboot: Simulating post-reboot state by setting idle status for %s.", u.config.Component)
-				if idleErr := u.status.SetIdleAndClearVersion(u.ctx); idleErr != nil {
+				if idleErr := u.status.SetIdle(u.ctx); idleErr != nil {
 					u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
 				}
 			}
 		}
 	} else {
 		u.logger.Printf("Unknown component %s, cannot determine reboot strategy. Setting to idle.", u.config.Component)
-		if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+		if err := u.status.SetIdle(u.ctx); err != nil {
 			u.logger.Printf("Failed to set idle status for unknown component: %v", err)
 		}
 	}
@@ -1909,7 +1875,7 @@ func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, reason str
 	}
 
 	time.Sleep(2 * time.Second)
-	if err := u.status.SetIdleAndClearVersion(u.ctx); err != nil {
+	if err := u.status.SetIdle(u.ctx); err != nil {
 		u.logger.Printf("Failed to clear status before fallback: %v", err)
 	}
 
@@ -2162,7 +2128,7 @@ func (u *Updater) performLocalBootUpdate() {
 		}
 	}
 
-	if err := u.bootStatus.SetStatus(u.ctx, status.StatusInstalling); err != nil {
+	if err := u.bootStatus.SetInstalling(u.ctx); err != nil {
 		u.logger.Printf("[boot-local] failed to set installing status: %v", err)
 	}
 
@@ -2201,7 +2167,7 @@ func (u *Updater) performLocalBootUpdate() {
 		}
 	}
 
-	if err := u.bootStatus.SetStatus(u.ctx, status.StatusPendingReboot); err != nil {
+	if err := u.bootStatus.SetPendingReboot(u.ctx); err != nil {
 		u.logger.Printf("[boot-local] failed to set pending-reboot status: %v", err)
 	}
 
@@ -2214,7 +2180,7 @@ func (u *Updater) performLocalBootUpdate() {
 			}
 		} else {
 			u.logger.Printf("[boot-local] dry-run: simulating post-reboot state")
-			if err := u.bootStatus.SetIdleAndClearVersion(u.ctx); err != nil {
+			if err := u.bootStatus.SetIdle(u.ctx); err != nil {
 				u.logger.Printf("[boot-local] failed to set idle status in dry run: %v", err)
 			}
 		}

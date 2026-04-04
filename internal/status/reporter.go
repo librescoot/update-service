@@ -20,7 +20,11 @@ const (
 	StatusError         Status = "error"
 )
 
-// Reporter handles Redis status reporting for OTA updates using HashPublisher
+// Reporter handles Redis status reporting for OTA updates using HashPublisher.
+//
+// Every state transition writes all affected fields in a single SetMany call,
+// so consumers (e.g. "lsc ota watch") never see an inconsistent snapshot such
+// as status=downloading without download-progress.
 type Reporter struct {
 	pub       *ipc.HashPublisher
 	component string
@@ -36,243 +40,195 @@ func NewReporter(client *ipc.Client, component string, logger *log.Logger) *Repo
 	}
 }
 
-// SetStatus updates the status for this component in Redis
-func (r *Reporter) SetStatus(ctx context.Context, status Status) error {
-	key := fmt.Sprintf("status:%s", r.component)
-
-	err := r.pub.Set(key, string(status))
-	if err != nil {
-		return fmt.Errorf("failed to set status for component %s: %w", r.component, err)
-	}
-
-	r.logger.Printf("Set status for %s: %s", r.component, status)
-	return nil
+// key returns a namespaced Redis hash field for this component.
+func (r *Reporter) key(field string) string {
+	return fmt.Sprintf("%s:%s", field, r.component)
 }
 
-// SetUpdateVersion updates the target update version for this component in Redis
-func (r *Reporter) SetUpdateVersion(ctx context.Context, version string) error {
-	key := fmt.Sprintf("update-version:%s", r.component)
-
-	err := r.pub.Set(key, version)
-	if err != nil {
-		return fmt.Errorf("failed to set update version for component %s: %w", r.component, err)
-	}
-
-	r.logger.Printf("Set update version for %s: %s", r.component, version)
-	return nil
-}
-
-// ClearUpdateVersion removes the update version for this component from Redis
-func (r *Reporter) ClearUpdateVersion(ctx context.Context) error {
-	key := fmt.Sprintf("update-version:%s", r.component)
-
-	err := r.pub.Delete(key)
-	if err != nil {
-		return fmt.Errorf("failed to clear update version for component %s: %w", r.component, err)
-	}
-
-	r.logger.Printf("Cleared update version for %s", r.component)
-	return nil
-}
+// --- Read ---
 
 // GetStatus retrieves the current status for this component from Redis
 func (r *Reporter) GetStatus(ctx context.Context) (Status, error) {
-	key := fmt.Sprintf("status:%s", r.component)
-
-	result, err := r.pub.Get(key)
+	result, err := r.pub.Get(r.key("status"))
 	if err != nil {
 		return StatusIdle, nil // Default to idle if not set
 	}
-
 	return Status(result), nil
 }
 
-// SetStatusAndVersion atomically sets both status and update version.
-// When transitioning to downloading, resets both progress values to 0.
-func (r *Reporter) SetStatusAndVersion(ctx context.Context, status Status, version string) error {
-	statusKey := fmt.Sprintf("status:%s", r.component)
-	versionKey := fmt.Sprintf("update-version:%s", r.component)
+// --- Atomic state transitions ---
 
-	fields := map[string]any{
-		statusKey:  string(status),
-		versionKey: version,
-	}
-
-	if status == StatusDownloading {
-		fields[fmt.Sprintf("download-progress:%s", r.component)] = 0
-		fields[fmt.Sprintf("install-progress:%s", r.component)] = 0
-	}
-
-	err := r.pub.SetMany(fields)
-	if err != nil {
-		return fmt.Errorf("failed to set status and version for component %s: %w", r.component, err)
-	}
-
-	r.logger.Printf("Set status and version for %s: %s, %s", r.component, status, version)
-	return nil
-}
-
-// SetIdleAndClearVersion atomically sets status to idle and clears update version, error, progress, and method keys
-func (r *Reporter) SetIdleAndClearVersion(ctx context.Context) error {
-	statusKey := fmt.Sprintf("status:%s", r.component)
-	versionKey := fmt.Sprintf("update-version:%s", r.component)
-	errorKey := fmt.Sprintf("error:%s", r.component)
-	errorMessageKey := fmt.Sprintf("error-message:%s", r.component)
-	progressKey := fmt.Sprintf("download-progress:%s", r.component)
-	downloadedKey := fmt.Sprintf("download-bytes:%s", r.component)
-	totalKey := fmt.Sprintf("download-total:%s", r.component)
-	methodKey := fmt.Sprintf("update-method:%s", r.component)
-
-	// Set status to idle
-	if err := r.pub.Set(statusKey, string(StatusIdle)); err != nil {
-		return fmt.Errorf("failed to set idle status for component %s: %w", r.component, err)
-	}
-
-	// Delete the other keys
-	for _, key := range []string{versionKey, errorKey, errorMessageKey, progressKey, downloadedKey, totalKey, methodKey} {
-		_ = r.pub.Delete(key) // Ignore errors on delete
-	}
-
-	r.logger.Printf("Set status to idle and cleared version for %s", r.component)
-	return nil
-}
-
-// SetError atomically sets status to error, stores error details, and clears download progress
-func (r *Reporter) SetError(ctx context.Context, errorType, errorMessage string) error {
-	statusKey := fmt.Sprintf("status:%s", r.component)
-	errorKey := fmt.Sprintf("error:%s", r.component)
-	errorMessageKey := fmt.Sprintf("error-message:%s", r.component)
-	progressKey := fmt.Sprintf("download-progress:%s", r.component)
-	downloadedKey := fmt.Sprintf("download-bytes:%s", r.component)
-	totalKey := fmt.Sprintf("download-total:%s", r.component)
-
-	// Set error status and details
+// SetIdle atomically sets status to idle and clears all other fields.
+func (r *Reporter) SetIdle(ctx context.Context) error {
 	err := r.pub.SetMany(map[string]any{
-		statusKey:       string(StatusError),
-		errorKey:        errorType,
-		errorMessageKey: errorMessage,
+		r.key("status"):            string(StatusIdle),
+		r.key("update-version"):    "",
+		r.key("update-method"):     "",
+		r.key("download-progress"): "",
+		r.key("download-bytes"):    "",
+		r.key("download-total"):    "",
+		r.key("install-progress"):  "",
+		r.key("error"):             "",
+		r.key("error-message"):     "",
 	})
 	if err != nil {
-		return fmt.Errorf("failed to set error for component %s: %w", r.component, err)
+		return fmt.Errorf("set idle for %s: %w", r.component, err)
 	}
-
-	// Clear download progress keys
-	for _, key := range []string{progressKey, downloadedKey, totalKey} {
-		_ = r.pub.Delete(key) // Ignore errors on delete
-	}
-
-	r.logger.Printf("Set error for %s: type=%s, message=%s", r.component, errorType, errorMessage)
+	r.logger.Printf("Set idle for %s", r.component)
 	return nil
 }
 
-// ClearError removes error and error-message keys from Redis
-func (r *Reporter) ClearError(ctx context.Context) error {
-	errorKey := fmt.Sprintf("error:%s", r.component)
-	errorMessageKey := fmt.Sprintf("error-message:%s", r.component)
-
-	_ = r.pub.Delete(errorKey)
-	_ = r.pub.Delete(errorMessageKey)
-
-	r.logger.Printf("Cleared error keys for %s", r.component)
+// SetDownloading atomically sets downloading status with version, method,
+// and resets all progress to 0.
+func (r *Reporter) SetDownloading(ctx context.Context, version, method string) error {
+	err := r.pub.SetMany(map[string]any{
+		r.key("status"):            string(StatusDownloading),
+		r.key("update-version"):    version,
+		r.key("update-method"):     method,
+		r.key("download-progress"): 0,
+		r.key("download-bytes"):    0,
+		r.key("download-total"):    0,
+		r.key("install-progress"):  0,
+		r.key("error"):             "",
+		r.key("error-message"):     "",
+	})
+	if err != nil {
+		return fmt.Errorf("set downloading for %s: %w", r.component, err)
+	}
+	r.logger.Printf("Set downloading for %s: version=%s method=%s", r.component, version, method)
 	return nil
 }
 
-// SetDownloadProgress sets the download progress with both percentage and byte counts
+// SetPreparing atomically transitions to preparing status, clears download
+// progress fields, and resets install progress to 0.
+func (r *Reporter) SetPreparing(ctx context.Context) error {
+	err := r.pub.SetMany(map[string]any{
+		r.key("status"):            string(StatusPreparing),
+		r.key("download-progress"): "",
+		r.key("download-bytes"):    "",
+		r.key("download-total"):    "",
+		r.key("install-progress"):  0,
+	})
+	if err != nil {
+		return fmt.Errorf("set preparing for %s: %w", r.component, err)
+	}
+	r.logger.Printf("Set preparing for %s", r.component)
+	return nil
+}
+
+// SetInstalling atomically transitions to installing status, clears download
+// progress fields, and resets install progress to 0.
+func (r *Reporter) SetInstalling(ctx context.Context) error {
+	err := r.pub.SetMany(map[string]any{
+		r.key("status"):            string(StatusInstalling),
+		r.key("download-progress"): "",
+		r.key("download-bytes"):    "",
+		r.key("download-total"):    "",
+		r.key("install-progress"):  0,
+	})
+	if err != nil {
+		return fmt.Errorf("set installing for %s: %w", r.component, err)
+	}
+	r.logger.Printf("Set installing for %s", r.component)
+	return nil
+}
+
+// SetPendingReboot atomically transitions to pending-reboot status and
+// clears progress fields.
+func (r *Reporter) SetPendingReboot(ctx context.Context) error {
+	err := r.pub.SetMany(map[string]any{
+		r.key("status"):            string(StatusPendingReboot),
+		r.key("download-progress"): "",
+		r.key("download-bytes"):    "",
+		r.key("download-total"):    "",
+		r.key("install-progress"):  "",
+	})
+	if err != nil {
+		return fmt.Errorf("set pending-reboot for %s: %w", r.component, err)
+	}
+	r.logger.Printf("Set pending-reboot for %s", r.component)
+	return nil
+}
+
+// SetError atomically transitions to error status with error details and
+// clears progress fields.
+func (r *Reporter) SetError(ctx context.Context, errorType, errorMessage string) error {
+	err := r.pub.SetMany(map[string]any{
+		r.key("status"):            string(StatusError),
+		r.key("error"):             errorType,
+		r.key("error-message"):     errorMessage,
+		r.key("download-progress"): "",
+		r.key("download-bytes"):    "",
+		r.key("download-total"):    "",
+		r.key("install-progress"):  "",
+	})
+	if err != nil {
+		return fmt.Errorf("set error for %s: %w", r.component, err)
+	}
+	r.logger.Printf("Set error for %s: type=%s message=%s", r.component, errorType, errorMessage)
+	return nil
+}
+
+// --- Partial updates (don't change status) ---
+
+// SetDownloadProgress updates the download progress fields.
+// Status is not changed — this is a partial update called frequently during download.
 func (r *Reporter) SetDownloadProgress(ctx context.Context, downloaded, total int64) error {
-	progressKey := fmt.Sprintf("download-progress:%s", r.component)
-	downloadedKey := fmt.Sprintf("download-bytes:%s", r.component)
-	totalKey := fmt.Sprintf("download-total:%s", r.component)
-
-	// Calculate percentage (0-100)
 	var percentage int
 	if total > 0 {
 		percentage = int((downloaded * 100) / total)
 	}
-
-	err := r.pub.SetMany(map[string]any{
-		progressKey:   percentage,
-		downloadedKey: downloaded,
-		totalKey:      total,
+	return r.pub.SetMany(map[string]any{
+		r.key("download-progress"): percentage,
+		r.key("download-bytes"):    downloaded,
+		r.key("download-total"):    total,
 	})
-	if err != nil {
-		return fmt.Errorf("failed to set download progress for component %s: %w", r.component, err)
-	}
-
-	return nil
 }
 
-// SetInstallProgress sets the install/delta application progress (0-100)
+// ResetDownloadProgress resets download progress to 0% without changing status.
+// Used between sequential delta downloads to show progress restart.
+func (r *Reporter) ResetDownloadProgress(ctx context.Context) error {
+	return r.pub.SetMany(map[string]any{
+		r.key("download-progress"): 0,
+		r.key("download-bytes"):    0,
+		r.key("download-total"):    0,
+	})
+}
+
+// SetInstallProgress updates the install/delta application progress (0-100).
+// Status is not changed — this is a partial update called frequently during install.
 func (r *Reporter) SetInstallProgress(ctx context.Context, percent int) error {
-	progressKey := fmt.Sprintf("install-progress:%s", r.component)
-	err := r.pub.Set(progressKey, percent)
+	return r.pub.Set(r.key("install-progress"), percent)
+}
+
+// SetUpdateVersion updates the target version without changing other fields.
+// Used when the target version changes mid-update (e.g., additional deltas found).
+func (r *Reporter) SetUpdateVersion(ctx context.Context, version string) error {
+	err := r.pub.Set(r.key("update-version"), version)
 	if err != nil {
-		return fmt.Errorf("failed to set install progress for component %s: %w", r.component, err)
+		return fmt.Errorf("set update version for %s: %w", r.component, err)
 	}
+	r.logger.Printf("Set update version for %s: %s", r.component, version)
 	return nil
 }
 
-// ClearInstallProgress removes the install progress key from Redis
-func (r *Reporter) ClearInstallProgress(ctx context.Context) error {
-	progressKey := fmt.Sprintf("install-progress:%s", r.component)
-	return r.pub.Delete(progressKey)
-}
+// --- Startup ---
 
-// ClearDownloadProgress removes the download progress keys from Redis
-func (r *Reporter) ClearDownloadProgress(ctx context.Context) error {
-	progressKey := fmt.Sprintf("download-progress:%s", r.component)
-	downloadedKey := fmt.Sprintf("download-bytes:%s", r.component)
-	totalKey := fmt.Sprintf("download-total:%s", r.component)
-
-	_ = r.pub.Delete(progressKey)
-	_ = r.pub.Delete(downloadedKey)
-	_ = r.pub.Delete(totalKey)
-
-	return nil
-}
-
-// SetUpdateMethod sets the update method being used (delta or full) in Redis
-func (r *Reporter) SetUpdateMethod(ctx context.Context, method string) error {
-	key := fmt.Sprintf("update-method:%s", r.component)
-
-	err := r.pub.Set(key, method)
-	if err != nil {
-		return fmt.Errorf("failed to set update method for component %s: %w", r.component, err)
-	}
-
-	r.logger.Printf("Set update method for %s: %s", r.component, method)
-	return nil
-}
-
-// ClearUpdateMethod removes the update method key from Redis
-func (r *Reporter) ClearUpdateMethod(ctx context.Context) error {
-	key := fmt.Sprintf("update-method:%s", r.component)
-
-	err := r.pub.Delete(key)
-	if err != nil {
-		return fmt.Errorf("failed to clear update method for component %s: %w", r.component, err)
-	}
-
-	r.logger.Printf("Cleared update method for %s", r.component)
-	return nil
-}
-
-// Initialize sets initial values for OTA keys on service startup
+// Initialize sets initial values for OTA keys on service startup.
 func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
-	statusKey := fmt.Sprintf("status:%s", r.component)
-	downloadProgressKey := fmt.Sprintf("download-progress:%s", r.component)
-	installProgressKey := fmt.Sprintf("install-progress:%s", r.component)
-	methodKey := fmt.Sprintf("update-method:%s", r.component)
-
 	err := r.pub.SetMany(map[string]any{
-		statusKey:           string(StatusIdle),
-		downloadProgressKey: 0,
-		installProgressKey:  0,
-		methodKey:           updateMethod,
+		r.key("status"):            string(StatusIdle),
+		r.key("update-method"):     updateMethod,
+		r.key("download-progress"): "",
+		r.key("download-bytes"):    "",
+		r.key("download-total"):    "",
+		r.key("install-progress"):  "",
+		r.key("error"):             "",
+		r.key("error-message"):     "",
 	})
 	if err != nil {
-		return fmt.Errorf("failed to initialize OTA keys for component %s: %w", r.component, err)
+		return fmt.Errorf("initialize OTA keys for %s: %w", r.component, err)
 	}
-
-	r.logger.Printf("Initialized OTA keys for %s (status: idle, progress: 0, method: %s)", r.component, updateMethod)
+	r.logger.Printf("Initialized OTA keys for %s (status: idle, method: %s)", r.component, updateMethod)
 	return nil
 }
