@@ -177,18 +177,18 @@ func (c *Client) TriggerReboot() error {
 }
 
 // GetUpdateMethod gets the configured update method for a component from Redis settings
-// Returns "full" by default if not configured
+// Returns "delta" by default if not configured
 func (c *Client) GetUpdateMethod(component string) (string, error) {
 	key := fmt.Sprintf("updates.%s.method", component)
 	method, err := c.client.HGet("settings", key)
 	if err != nil {
-		// Default to full if not configured
-		return "full", nil
+		// Default to delta if not configured
+		return "delta", nil
 	}
 
 	// Validate the method
 	if method != "delta" && method != "full" {
-		return "full", nil // Default to full for invalid values
+		return "delta", nil // Default to delta for invalid values
 	}
 
 	return method, nil
