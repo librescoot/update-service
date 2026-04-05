@@ -261,7 +261,7 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 	lastCallbackTime := time.Time{} // zero — fires on first data
 	lastLogTime := time.Time{}
 
-	const callbackInterval = 250 * time.Millisecond
+	const callbackInterval = 1 * time.Second
 	const logInterval = 5 * time.Second
 
 	for {
