@@ -14,7 +14,8 @@ import (
 // Returns the SHA256 of the output computed during the write.
 // Output bytes are tracked through the shared progressTracker.
 func ApplyXdelta(ctx context.Context, sourceFile, patchFile, outputFile string, tracker *progressTracker) (string, error) {
-	cmd := exec.CommandContext(ctx, "nice", "-n", "10", "xdelta3", "-d", "-c", "-s", sourceFile, patchFile)
+	bin, args := lowPriorityArgs("xdelta3", "-d", "-c", "-s", sourceFile, patchFile)
+	cmd := exec.CommandContext(ctx, bin, args...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

@@ -7,6 +7,18 @@ import (
 	"os/exec"
 )
 
+// lowPriorityArgs prepends ionice/nice to minimize CPU and IO impact during OTA updates.
+func lowPriorityArgs(name string, args ...string) (string, []string) {
+	// ionice -c3 = idle IO class, nice -n 19 = lowest CPU priority
+	fullArgs := append([]string{"-c3", "nice", "-n", "19", name}, args...)
+	return "ionice", fullArgs
+}
+
+func lowPriorityCommand(name string, args ...string) *exec.Cmd {
+	bin, fullArgs := lowPriorityArgs(name, args...)
+	return exec.Command(bin, fullArgs...)
+}
+
 // ShellGzip compresses a file using system gzip command
 func ShellGzip(inputFile, outputFile string, level int) error {
 	outFile, err := os.Create(outputFile)
@@ -15,7 +27,7 @@ func ShellGzip(inputFile, outputFile string, level int) error {
 	}
 	defer outFile.Close()
 
-	cmd := exec.Command("gzip", fmt.Sprintf("-%d", level), "-c", inputFile)
+	cmd := lowPriorityCommand("gzip", fmt.Sprintf("-%d", level), "-c", inputFile)
 	cmd.Stdout = outFile
 	cmd.Stderr = os.Stderr
 
@@ -39,7 +51,7 @@ func ShellGunzipTracked(inputFile, outputFile string, tracker *progressTracker) 
 	}
 	defer outFile.Close()
 
-	cmd := exec.Command("gunzip", "-c", inputFile)
+	cmd := lowPriorityCommand("gunzip", "-c", inputFile)
 	cmd.Stderr = os.Stderr
 
 	if tracker != nil {
@@ -69,7 +81,7 @@ func ShellGunzipTracked(inputFile, outputFile string, tracker *progressTracker) 
 
 // ShellTarExtract extracts a tar archive using system tar command
 func ShellTarExtract(tarFile, extractDir string) error {
-	cmd := exec.Command("tar", "-xf", tarFile, "-C", extractDir)
+	cmd := lowPriorityCommand("tar", "-xf", tarFile, "-C", extractDir)
 
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("tar extraction failed: %w, output: %s", err, output)
@@ -80,7 +92,7 @@ func ShellTarExtract(tarFile, extractDir string) error {
 
 // ShellTarCreate creates a tar archive using system tar command
 func ShellTarCreate(tarFile, sourceDir string) error {
-	cmd := exec.Command("tar", "-cf", tarFile, "-C", sourceDir, ".")
+	cmd := lowPriorityCommand("tar", "-cf", tarFile, "-C", sourceDir, ".")
 
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("tar creation failed: %w, output: %s", err, output)
@@ -91,7 +103,7 @@ func ShellTarCreate(tarFile, sourceDir string) error {
 
 // ShellSHA256 calculates SHA256 using system sha256sum command
 func ShellSHA256(file string) (string, error) {
-	cmd := exec.Command("sha256sum", file)
+	cmd := lowPriorityCommand("sha256sum", file)
 
 	output, err := cmd.Output()
 	if err != nil {

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -216,7 +215,7 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, tracker *prog
 	}
 	defer outFile.Close()
 
-	gzipCmd := exec.Command("gzip", "-3", "-c")
+	gzipCmd := lowPriorityCommand("gzip", "-3", "-c")
 	gzipCmd.Stdout = outFile
 	gzipIn, err := gzipCmd.StdinPipe()
 	if err != nil {
