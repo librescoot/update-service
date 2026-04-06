@@ -68,9 +68,9 @@ func (m *Manager) CommitWithResult() CommitResult {
 	return m.installer.CommitWithResult()
 }
 
-// NeedsCommit checks if there's a pending update that needs to be committed
-func (m *Manager) NeedsCommit() (bool, error) {
-	return m.installer.NeedsCommit()
+// Rollback rolls back a pending mender update, clearing the standalone-state from LMDB.
+func (m *Manager) Rollback() error {
+	return m.installer.Rollback()
 }
 
 // GetCurrentArtifact returns the currently committed artifact name

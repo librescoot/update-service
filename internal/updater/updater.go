@@ -130,7 +130,10 @@ func (u *Updater) CheckAndCommitPendingUpdate() (needsReboot bool, err error) {
 		return true, nil
 
 	case mender.StateInconsistent:
-		u.logger.Printf("Mender in inconsistent state, may need manual intervention")
+		u.logger.Printf("Mender in inconsistent state, attempting rollback to clean up")
+		if err := u.mender.Rollback(); err != nil {
+			u.logger.Printf("Rollback failed: %v (may need manual intervention)", err)
+		}
 		return false, nil
 
 	default:
@@ -177,7 +180,7 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 
 	// Check if we have a mender file newer than the running version (e.g., from
 	// an interrupted update). If so, install it directly without re-downloading.
-	u.installPendingMenderFile()
+	u.installPendingMenderFile(menderNeedsReboot)
 
 	// Check initial vehicle state and set standby timestamp if needed
 	u.checkInitialStandbyState()
@@ -228,7 +231,14 @@ func (u *Updater) setUpdateMethod(method string) {
 
 // installPendingMenderFile checks if a mender file newer than the running
 // version exists on disk (e.g., from an interrupted update) and installs it.
-func (u *Updater) installPendingMenderFile() {
+// When menderNeedsReboot is true, mender already has a staged update in its
+// LMDB — attempting another install would fail with "already in progress".
+func (u *Updater) installPendingMenderFile(menderNeedsReboot bool) {
+	if menderNeedsReboot {
+		u.logger.Printf("Skipping pending mender file check (mender has an active update)")
+		return
+	}
+
 	currentVersion, err := u.getCurrentVersion()
 	if err != nil || currentVersion == "" {
 		return
@@ -305,18 +315,23 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 		}
 
 	case status.StatusPendingReboot:
-		// Reboot happened, commit was already attempted by CheckAndCommitPendingUpdate
-		u.logger.Printf("Clearing pending-reboot status (reboot completed)")
-		if err := u.status.SetIdle(u.ctx); err != nil {
-			return fmt.Errorf("failed to clear pending-reboot status: %w", err)
-		}
+		if menderNeedsReboot {
+			// Mender still has a staged update waiting for reboot — keep status
+			u.logger.Printf("Keeping pending-reboot status (mender still needs reboot)")
+		} else {
+			// Reboot happened, commit was already attempted by CheckAndCommitPendingUpdate
+			u.logger.Printf("Clearing pending-reboot status (reboot completed)")
+			if err := u.status.SetIdle(u.ctx); err != nil {
+				return fmt.Errorf("failed to clear pending-reboot status: %w", err)
+			}
 
-		// For DBC component, notify vehicle-service that update is complete
-		// (the defer that normally sends this didn't execute due to reboot)
-		if u.config.Component == "dbc" {
-			u.logger.Printf("Sending complete-dbc command after reboot")
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("Failed to send complete-dbc command: %v", err)
+			// For DBC component, notify vehicle-service that update is complete
+			// (the defer that normally sends this didn't execute due to reboot)
+			if u.config.Component == "dbc" {
+				u.logger.Printf("Sending complete-dbc command after reboot")
+				if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+					u.logger.Printf("Failed to send complete-dbc command: %v", err)
+				}
 			}
 		}
 

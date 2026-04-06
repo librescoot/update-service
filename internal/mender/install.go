@@ -38,10 +38,20 @@ func NewInstaller(logger *log.Logger) *Installer {
 	}
 }
 
-// NeedsCommit checks if there's a pending update that needs to be committed
-func (i *Installer) NeedsCommit() (bool, error) {
-	// Always try to commit on startup - if there's nothing to commit, mender will handle it gracefully
-	return true, nil
+// Rollback rolls back a pending mender update, clearing the standalone-state from LMDB.
+func (i *Installer) Rollback() error {
+	i.logger.Printf("Rolling back mender update")
+	cmd := exec.Command("mender-update", "rollback")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("mender-update rollback failed: %w, stderr: %s", err, stderr.String())
+	}
+
+	i.logger.Printf("mender-update rollback output: %s", stdout.String())
+	return nil
 }
 
 // Install installs the update from the given file path.
