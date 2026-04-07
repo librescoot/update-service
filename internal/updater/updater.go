@@ -47,7 +47,7 @@ type Updater struct {
 
 	// DBC orchestration (MDB-only)
 	orchestrateDBCMu sync.RWMutex
-	orchestrateDBC   bool
+	orchestrateDBCEnabled bool
 	dbcOrchestrating sync.Mutex // prevents overlapping orchestration
 
 	// Track active update goroutines for clean shutdown
@@ -106,8 +106,8 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 
 	// Initialize DBC orchestration setting (MDB-only)
 	if cfg.Component == "mdb" {
-		u.orchestrateDBC = u.resolveOrchestrateDBC()
-		logger.Printf("DBC orchestration: %v", u.orchestrateDBC)
+		u.orchestrateDBCEnabled = u.resolveOrchestrateDBC()
+		logger.Printf("DBC orchestration: %v", u.orchestrateDBCEnabled)
 	}
 
 	return u
@@ -2286,15 +2286,15 @@ func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, v
 func (u *Updater) getOrchestrateDBC() bool {
 	u.orchestrateDBCMu.RLock()
 	defer u.orchestrateDBCMu.RUnlock()
-	return u.orchestrateDBC
+	return u.orchestrateDBCEnabled
 }
 
 func (u *Updater) setOrchestrateDBC(enabled bool) {
 	u.orchestrateDBCMu.Lock()
 	defer u.orchestrateDBCMu.Unlock()
-	if u.orchestrateDBC != enabled {
-		u.logger.Printf("DBC orchestration changed: %v -> %v", u.orchestrateDBC, enabled)
-		u.orchestrateDBC = enabled
+	if u.orchestrateDBCEnabled != enabled {
+		u.logger.Printf("DBC orchestration changed: %v -> %v", u.orchestrateDBCEnabled, enabled)
+		u.orchestrateDBCEnabled = enabled
 	}
 }
 
