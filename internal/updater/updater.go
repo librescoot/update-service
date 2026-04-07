@@ -45,6 +45,11 @@ type Updater struct {
 	// Prevent concurrent update checks
 	updateCheckMu sync.Mutex
 
+	// DBC orchestration (MDB-only)
+	orchestrateDBCMu sync.RWMutex
+	orchestrateDBC   bool
+	dbcOrchestrating sync.Mutex // prevents overlapping orchestration
+
 	// Track active update goroutines for clean shutdown
 	wg sync.WaitGroup
 }
@@ -98,6 +103,12 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		updateMethod = "delta"
 	}
 	u.updateMethod = updateMethod
+
+	// Initialize DBC orchestration setting (MDB-only)
+	if cfg.Component == "mdb" {
+		u.orchestrateDBC = u.resolveOrchestrateDBC()
+		logger.Printf("DBC orchestration: %v", u.orchestrateDBC)
+	}
 
 	return u
 }
@@ -908,6 +919,16 @@ func (u *Updater) monitorSettingsChanges() {
 		u.setUpdateMethod(value)
 		return nil
 	})
+
+	if u.config.Component == "mdb" {
+		watcher.OnField("updates.mdb.orchestrate-dbc", func(value string) error {
+			u.logger.Printf("Received settings change for updates.mdb.orchestrate-dbc: %s", value)
+			if value == "true" || value == "false" {
+				u.setOrchestrateDBC(value == "true")
+			}
+			return nil
+		})
+	}
 
 	if err := watcher.Start(); err != nil {
 		u.logger.Printf("Failed to start settings watcher: %v", err)
@@ -2260,4 +2281,30 @@ func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, v
 	}
 
 	return deltaChain, nil
+}
+
+func (u *Updater) getOrchestrateDBC() bool {
+	u.orchestrateDBCMu.RLock()
+	defer u.orchestrateDBCMu.RUnlock()
+	return u.orchestrateDBC
+}
+
+func (u *Updater) setOrchestrateDBC(enabled bool) {
+	u.orchestrateDBCMu.Lock()
+	defer u.orchestrateDBCMu.Unlock()
+	if u.orchestrateDBC != enabled {
+		u.logger.Printf("DBC orchestration changed: %v -> %v", u.orchestrateDBC, enabled)
+		u.orchestrateDBC = enabled
+	}
+}
+
+// resolveOrchestrateDBC determines the effective value for orchestrate-dbc.
+// Priority: explicit Redis setting > channel-dependent default.
+func (u *Updater) resolveOrchestrateDBC() bool {
+	val, isSet := u.redis.GetOrchestrateDBC()
+	if isSet {
+		return val == "true"
+	}
+	// Default: true for nightly, false otherwise
+	return u.config.Channel == "nightly"
 }
