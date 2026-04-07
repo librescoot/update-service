@@ -923,8 +923,12 @@ func (u *Updater) monitorSettingsChanges() {
 	if u.config.Component == "mdb" {
 		watcher.OnField("updates.mdb.orchestrate-dbc", func(value string) error {
 			u.logger.Printf("Received settings change for updates.mdb.orchestrate-dbc: %s", value)
-			if value == "true" || value == "false" {
+			switch value {
+			case "true", "false":
 				u.setOrchestrateDBC(value == "true")
+			default:
+				// Setting cleared — fall back to channel-dependent default
+				u.setOrchestrateDBC(u.resolveOrchestrateDBC())
 			}
 			return nil
 		})
@@ -1006,6 +1010,15 @@ func (u *Updater) checkForUpdates() {
 	if err != nil {
 		u.logger.Printf("Failed to get releases: %v", err)
 		return
+	}
+
+	// If running on MDB, check if DBC needs an update too (runs in parallel with MDB's own update)
+	if u.config.Component == "mdb" {
+		u.wg.Add(1)
+		go func() {
+			defer u.wg.Done()
+			u.orchestrateDBC(releases)
+		}()
 	}
 
 	// Get the variant_id to find releases for the correct variant

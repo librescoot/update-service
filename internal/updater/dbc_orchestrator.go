@@ -9,7 +9,6 @@ import (
 )
 
 const (
-	dbcReadyTimeout    = 30 * time.Second
 	dbcActivityTimeout = 60 * time.Second
 	dbcPollInterval    = 5 * time.Second
 )
@@ -46,28 +45,22 @@ func (u *Updater) orchestrateDBC(releases []Release) {
 
 	u.logger.Printf("[dbc-orchestrate] DBC update available, powering on dashboard")
 
-	// Power on DBC
+	// Power on DBC and queue the check-now command. The command goes into a
+	// Redis LPUSH queue (scooter:update:dbc) which persists until consumed by
+	// the DBC's update-service via BRPOP. No readiness check needed — even if
+	// the DBC hasn't fully booted yet, the command will be picked up when its
+	// update-service starts listening.
 	if err := u.redis.SendHardwareCommand("dashboard:on"); err != nil {
 		u.logger.Printf("[dbc-orchestrate] Failed to send dashboard:on: %v", err)
 		return
 	}
 
-	// Wait for DBC to become ready (version:dbc hash gets populated on boot)
-	if !u.waitForDBCReady() {
-		u.logger.Printf("[dbc-orchestrate] DBC did not become ready within %v, powering off", dbcReadyTimeout)
-		if err := u.redis.SendHardwareCommand("dashboard:off"); err != nil {
-			u.logger.Printf("[dbc-orchestrate] Failed to send dashboard:off: %v", err)
-		}
-		return
-	}
-
-	u.logger.Printf("[dbc-orchestrate] DBC ready, sending check-now")
-
-	// Trigger DBC update check
 	if err := u.redis.PushUpdateCommandToComponent("dbc", "check-now"); err != nil {
 		u.logger.Printf("[dbc-orchestrate] Failed to send check-now to DBC: %v", err)
 		return
 	}
+
+	u.logger.Printf("[dbc-orchestrate] Dashboard powered on, check-now queued")
 
 	// Watch for DBC update activity
 	if !u.watchDBCActivity() {
@@ -102,10 +95,10 @@ func (u *Updater) isDBCUpdateAvailable(releases []Release) bool {
 	// Get DBC's current version
 	dbcVersion, err := u.redis.GetComponentVersion("dbc")
 	if err != nil || dbcVersion == "" {
-		// Can't determine DBC version (maybe it's off and never published).
-		// If we have no version info at all, we can't tell if an update is needed.
-		u.logger.Printf("[dbc-orchestrate] Cannot determine DBC version (off or never booted?), skipping")
-		return false
+		// DBC version unknown (off, never booted, or version not persisted to MDB Redis).
+		// A release exists for DBC, so power it on and let its own update-service decide.
+		u.logger.Printf("[dbc-orchestrate] DBC version unknown, release %s exists — will power on to check", release.TagName)
+		return true
 	}
 
 	// Compare versions using existing logic
@@ -141,7 +134,7 @@ func (u *Updater) isVersionNewer(releaseTag, installedVersion, channel string) b
 		return compareVersions(releaseTag, normInstalled) > 0
 	}
 
-	// Nightly/testing: lexicographic comparison of lowercased tags
+	// Nightly/testing: tags are like "nightly-20260407-abc123", lexicographic > means newer
 	normRelease := strings.ToLower(releaseTag)
 	normInstalled := strings.ToLower(installedVersion)
 
@@ -149,33 +142,11 @@ func (u *Updater) isVersionNewer(releaseTag, installedVersion, channel string) b
 	if !strings.HasPrefix(normInstalled, channel+"-") {
 		parts := strings.Split(normRelease, "-")
 		if len(parts) >= 2 && normInstalled == parts[1] {
-			return false // same version
-		}
-	}
-
-	return normRelease != normInstalled
-}
-
-// waitForDBCReady polls until the DBC's version hash is populated in Redis,
-// indicating it has booted and its version-service has started.
-func (u *Updater) waitForDBCReady() bool {
-	ctx, cancel := context.WithTimeout(u.ctx, dbcReadyTimeout)
-	defer cancel()
-
-	ticker := time.NewTicker(dbcPollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
 			return false
-		case <-ticker.C:
-			version, err := u.redis.GetComponentVersion("dbc")
-			if err == nil && version != "" {
-				return true
-			}
 		}
 	}
+
+	return normRelease > normInstalled
 }
 
 // watchDBCActivity polls the DBC OTA status. Returns true if DBC transitions
