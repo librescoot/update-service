@@ -243,3 +243,34 @@ func (c *Client) GetTargetVersion(component string) (string, error) {
 	}
 	return version, nil
 }
+
+// SendHardwareCommand sends a command to vehicle-service via the scooter:hardware queue.
+// Used for dashboard:on, dashboard:off, etc.
+func (c *Client) SendHardwareCommand(command string) error {
+	return ipc.SendRequest(c.client, "scooter:hardware", command)
+}
+
+// GetDBCOTAStatus reads the DBC's OTA status from the shared ota hash.
+func (c *Client) GetDBCOTAStatus() (string, error) {
+	return c.client.HGet("ota", "status:dbc")
+}
+
+// GetOrchestrateDBC reads the orchestrate-dbc setting from Redis.
+// Returns the string value ("true"/"false") and whether it was explicitly set.
+func (c *Client) GetOrchestrateDBC() (string, bool) {
+	val, err := c.client.HGet("settings", "updates.mdb.orchestrate-dbc")
+	if err != nil || val == "" {
+		return "", false
+	}
+	return val, true
+}
+
+// GetDBCChannel reads the DBC update channel from Redis settings.
+// Returns empty string if not set.
+func (c *Client) GetDBCChannel() string {
+	val, err := c.client.HGet("settings", "updates.dbc.channel")
+	if err != nil {
+		return ""
+	}
+	return val
+}
