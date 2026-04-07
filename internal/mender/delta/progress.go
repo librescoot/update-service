@@ -19,6 +19,10 @@ func newProgressTracker(totalBytes int64, cb ProgressCallback) *progressTracker 
 	}
 }
 
+func (pt *progressTracker) setTotal(total int64) {
+	pt.total = total
+}
+
 func (pt *progressTracker) add(n int64, label string) {
 	pt.processed += n
 	if pt.callback == nil || pt.total <= 0 {

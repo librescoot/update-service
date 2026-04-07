@@ -40,11 +40,8 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 	compressedPayload := filepath.Join(dataDir, "0000.tar.gz")
 	payloadPath := filepath.Join(work, "payload")
 
-	// Estimate total bytes of work:
-	//   decompress output ≈ compressedSize * 3.5
-	//   xdelta output per hop ≈ same as decompressed
-	//   compress input = decompressed size
-	//   manifest = hash all output files ≈ compressedSize
+	// Initial estimate uses compressedSize * 3.5 for decompressed payload size.
+	// After decompression, we recalculate with the actual size.
 	compressedInfo, _ := os.Stat(compressedPayload)
 	compressedSize := int64(0)
 	if compressedInfo != nil {
@@ -60,6 +57,13 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 		return fmt.Errorf("decompress payload: %w", err)
 	}
 	os.Remove(compressedPayload)
+
+	// Recalculate total work using the actual decompressed size
+	if payloadInfo, err := os.Stat(payloadPath); err == nil {
+		actualPayload := payloadInfo.Size()
+		// n xdelta steps + 1 compress + manifest hashing (≈ compressedSize)
+		tracker.setTotal(tracker.processed + actualPayload*int64(n+1) + compressedSize)
+	}
 
 	var lastMetadata *DeltaMetadata
 
