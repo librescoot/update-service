@@ -40,14 +40,19 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 	compressedPayload := filepath.Join(dataDir, "0000.tar.gz")
 	payloadPath := filepath.Join(work, "payload")
 
-	// Initial estimate uses compressedSize * 3.5 for decompressed payload size.
-	// After decompression, we recalculate with the actual size.
 	compressedInfo, _ := os.Stat(compressedPayload)
 	compressedSize := int64(0)
 	if compressedInfo != nil {
 		compressedSize = compressedInfo.Size()
 	}
-	estimatedPayload := compressedSize * 7 / 2
+
+	// Try to get the decompressed payload size from the first delta's metadata
+	// to avoid the inaccurate compressedSize * 3.5 estimate
+	estimatedPayload := decompressedSizeFromDelta(deltaPaths[0])
+	if estimatedPayload == 0 {
+		estimatedPayload = compressedSize * 7 / 2
+	}
+	// Total work: 1 decompress + n xdelta steps + 1 compress + manifest hashing
 	totalWork := estimatedPayload*(int64(n)+2) + compressedSize
 
 	tracker := newProgressTracker(totalWork, progress)
@@ -58,11 +63,14 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 	}
 	os.Remove(compressedPayload)
 
-	// Recalculate total work using the actual decompressed size
+	// If we used an estimate, recalculate with the actual decompressed size
 	if payloadInfo, err := os.Stat(payloadPath); err == nil {
 		actualPayload := payloadInfo.Size()
-		// n xdelta steps + 1 compress + manifest hashing (≈ compressedSize)
-		tracker.setTotal(tracker.processed + actualPayload*int64(n+1) + compressedSize)
+		newTotal := tracker.processed + actualPayload*int64(n+1) + compressedSize
+		// Only recalculate if it would not cause progress to go backwards
+		if newTotal > tracker.total {
+			tracker.setTotal(newTotal)
+		}
 	}
 
 	var lastMetadata *DeltaMetadata
@@ -168,6 +176,34 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 
 	progress(100, fmt.Sprintf("complete (%d deltas)", n))
 	return nil
+}
+
+// decompressedSizeFromDelta extracts the old decompressed payload size from a
+// delta's metadata.json, if available (v3+ with size fields).
+func decompressedSizeFromDelta(deltaPath string) int64 {
+	tmpDir, err := os.MkdirTemp("", "delta-peek-*")
+	if err != nil {
+		return 0
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if err := ShellTarExtract(deltaPath, tmpDir); err != nil {
+		return 0
+	}
+	data, err := os.ReadFile(filepath.Join(tmpDir, "metadata.json"))
+	if err != nil {
+		return 0
+	}
+	var meta DeltaMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return 0
+	}
+	for _, change := range meta.Changes {
+		if change.Type == "modified" && change.OldMeta.DecompressedSize > 0 {
+			return change.OldMeta.DecompressedSize
+		}
+	}
+	return 0
 }
 
 func copyFile(src, dst string) error {

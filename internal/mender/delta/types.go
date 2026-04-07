@@ -3,7 +3,11 @@ package delta
 import "log"
 
 type DeltaMetadata struct {
+	OldArtifactName    string                `json:"old_artifact_name,omitempty"`
+	NewArtifactName    string                `json:"new_artifact_name,omitempty"`
+	OldPayloadChecksum string                `json:"old_payload_checksum"`
 	NewPayloadChecksum string                `json:"new_payload_checksum"`
+	CreatedAt          string                `json:"created_at,omitempty"`
 	Version            int                   `json:"version"`
 	Changes            map[string]ChangeInfo `json:"changes"`
 }
@@ -20,6 +24,8 @@ type FileMeta struct {
 	Compressed         bool   `json:"compressed"`
 	SHA256             string `json:"sha256"`
 	DecompressedSHA256 string `json:"decompressed_sha256"`
+	Size               int64  `json:"size,omitempty"`
+	DecompressedSize   int64  `json:"decompressed_size,omitempty"`
 }
 
 type ProgressCallback func(percent int, message string)
