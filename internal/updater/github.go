@@ -18,11 +18,11 @@ const (
 	backoffJitter  = 0.2 // 20% jitter
 )
 
-// Asset represents a GitHub release asset
+// Asset represents a release asset
 type Asset struct {
-	Name               string `json:"name"`
-	Size               int64  `json:"size"`
-	BrowserDownloadURL string `json:"browser_download_url"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+	URL  string `json:"url"`
 }
 
 // Release represents a GitHub release
@@ -34,10 +34,11 @@ type Release struct {
 	Assets      []Asset   `json:"assets"`
 }
 
-// GitHubAPI handles interactions with the GitHub API
+// GitHubAPI handles fetching release data from a release index
 type GitHubAPI struct {
 	ctx     context.Context
 	baseURL string
+	channel string
 	client  *http.Client
 	logger  Logger
 }
@@ -47,11 +48,12 @@ type Logger interface {
 	Printf(format string, v ...interface{})
 }
 
-// NewGitHubAPI creates a new GitHub API client
-func NewGitHubAPI(ctx context.Context, baseURL string, logger Logger) *GitHubAPI {
+// NewGitHubAPI creates a new release index client
+func NewGitHubAPI(ctx context.Context, baseURL, channel string, logger Logger) *GitHubAPI {
 	return &GitHubAPI{
 		ctx:     ctx,
 		baseURL: baseURL,
+		channel: channel,
 		client:  &http.Client{Timeout: 10 * time.Second},
 		logger:  logger,
 	}
@@ -69,7 +71,9 @@ func (g *GitHubAPI) GetReleases() ([]Release, error) {
 	)
 
 	// Create the request outside the retry loop
-	req, err := http.NewRequestWithContext(g.ctx, "GET", g.baseURL, nil)
+	url := g.baseURL + "/" + g.channel + ".json"
+
+	req, err := http.NewRequestWithContext(g.ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
