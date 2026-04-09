@@ -22,7 +22,7 @@ var version = "dev"
 
 var (
 	redisAddr         = flag.String("redis-addr", "localhost:6379", "Redis server address")
-	githubReleasesURL = flag.String("github-releases-url", "https://api.github.com/repos/librescoot/librescoot/releases", "GitHub Releases API URL")
+	releasesURL = flag.String("releases-url", "https://downloads.librescoot.org/releases", "Release index base URL")
 	checkInterval     = flag.Duration("check-interval", 6*time.Hour, "Interval between update checks (use 0 or 'never' to disable)")
 	component         = flag.String("component", "", "Component to manage updates for (mdb or dbc)")
 	channel           = flag.String("channel", "nightly", "Update channel (stable, testing, nightly)")
@@ -88,7 +88,7 @@ func main() {
 	// Track which CLI flags were explicitly set (non-default)
 	cliChannelSet := flag.Lookup("channel").Value.String() != flag.Lookup("channel").DefValue
 	cliCheckIntervalSet := flag.Lookup("check-interval").Value.String() != flag.Lookup("check-interval").DefValue
-	cliGithubURLSet := flag.Lookup("github-releases-url").Value.String() != flag.Lookup("github-releases-url").DefValue
+	cliReleasesURLSet := flag.Lookup("releases-url").Value.String() != flag.Lookup("releases-url").DefValue
 	cliDryRunSet := flag.Lookup("dry-run").Value.String() != flag.Lookup("dry-run").DefValue
 
 	// Detect channel from installed version
@@ -111,7 +111,7 @@ func main() {
 	// Initialize config with CLI flags and detected/default values
 	cfg := config.New(
 		*redisAddr,
-		*githubReleasesURL,
+		*releasesURL,
 		*checkInterval,
 		*component,
 		effectiveChannel,
@@ -127,7 +127,7 @@ func main() {
 	// Save CLI values if they were explicitly set
 	cliChannel := cfg.Channel
 	cliCheckInterval := cfg.CheckInterval
-	cliGithubURL := cfg.GitHubReleasesURL
+	cliReleasesURL := cfg.ReleasesURL
 	cliDryRun := cfg.DryRun
 
 	// Check if channel will come from Redis settings
@@ -150,15 +150,15 @@ func main() {
 	if cliCheckIntervalSet {
 		cfg.CheckInterval = cliCheckInterval
 	}
-	if cliGithubURLSet {
-		cfg.GitHubReleasesURL = cliGithubURL
+	if cliReleasesURLSet {
+		cfg.ReleasesURL = cliReleasesURL
 	}
 	if cliDryRunSet {
 		cfg.DryRun = cliDryRun
 	}
 
 	// Start watching for settings changes in the background
-	go watchSettingsChanges(ctx, redisClient, cfg, logger, cliChannelSet, cliCheckIntervalSet, cliGithubURLSet, cliDryRunSet)
+	go watchSettingsChanges(ctx, redisClient, cfg, logger, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet)
 
 	// Initialize power inhibitor client
 	inhibitorClient, err := inhibitor.New(*redisAddr, logger)
@@ -224,7 +224,7 @@ func main() {
 }
 
 // watchSettingsChanges monitors Redis for settings changes and applies them to the config
-func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger, cliChannelSet, cliCheckIntervalSet, cliGithubURLSet, cliDryRunSet bool) {
+func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet bool) {
 	// Use HashWatcher to monitor settings hash
 	watcher := redisClient.NewSettingsWatcher()
 	watcher.OnAny(func(settingKey, value string) error {
@@ -245,9 +245,9 @@ func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *c
 					logger.Printf("Ignoring Redis update for check-interval (overridden by CLI flag)")
 					return nil
 				}
-			case "github-releases-url":
-				if cliGithubURLSet {
-					logger.Printf("Ignoring Redis update for github-releases-url (overridden by CLI flag)")
+			case "releases-url":
+				if cliReleasesURLSet {
+					logger.Printf("Ignoring Redis update for releases-url (overridden by CLI flag)")
 					return nil
 				}
 			case "dry-run":

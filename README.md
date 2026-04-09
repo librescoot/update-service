@@ -89,7 +89,7 @@ The service can be configured via command-line flags or Redis settings. CLI flag
 | `--component`           | Component to manage updates for.                                  | `""`                                                           | **Yes** (must be `mdb` or `dbc`) | No (CLI only) |
 | `--redis-addr`          | Redis server address.                                             | `localhost:6379`                                               | No       | No (CLI only) |
 | `--channel`             | Update channel to track.                                          | `nightly`                                                      | No       | Yes |
-| `--github-releases-url` | GitHub Releases API URL for update discovery.                     | `https://api.github.com/repos/librescoot/librescoot/releases`  | No       | Yes |
+| `--releases-url` | Release index base URL for update discovery.                      | `https://downloads.librescoot.org/releases`                    | No       | Yes |
 | `--check-interval`      | Interval between update checks.                                   | `6h`                                                           | No       | Yes |
 | `--dry-run`             | If true, log reboot actions instead of performing them.           | `false`                                                        | No       | Yes |
 
@@ -102,7 +102,7 @@ Settings can be configured per-component in the Redis `settings` hash. The updat
 **Setting Keys:**
 - `updates.{component}.channel` - Update channel (`stable`, `testing`, or `nightly`)
 - `updates.{component}.check-interval` - Check interval (e.g., `6h`, `1h`, `30m`)
-- `updates.{component}.github-releases-url` - GitHub Releases API URL
+- `updates.{component}.releases-url` - Release index base URL
 - `updates.{component}.dry-run` - Dry-run mode (`true` or `false`)
 - `updates.{component}.method` - Update method (`full` or `delta`)
 

@@ -90,7 +90,7 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		status:      status.NewReporter(redisClient.GetClient(), cfg.Component, logger),
 		bootUpdater: bootUpdater,
 		bootStatus:  bootStatusReporter,
-		githubAPI:   NewGitHubAPI(updaterCtx, cfg.GitHubReleasesURL, logger),
+		githubAPI:   NewGitHubAPI(updaterCtx, cfg.ReleasesURL, cfg.Channel, logger),
 		logger:      logger,
 		ctx:         updaterCtx,
 		cancel:      cancel,
@@ -1073,7 +1073,7 @@ func (u *Updater) checkForUpdates() {
 		// Match assets by variant_id (e.g., "unu-mdb", "unu-dbc", "rpi5")
 		// Asset names should be like: librescoot-{variant_id}-{timestamp}.mender
 		if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".mender") {
-			assetURL = asset.BrowserDownloadURL
+			assetURL = asset.URL
 			u.logger.Printf("Found matching asset: %s", asset.Name)
 			break
 		}
@@ -1634,7 +1634,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		deltaURL := ""
 		for _, asset := range release.Assets {
 			if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
-				deltaURL = asset.BrowserDownloadURL
+				deltaURL = asset.URL
 				break
 			}
 		}
@@ -1762,7 +1762,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 				deltaURL := ""
 				for _, asset := range release.Assets {
 					if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
-						deltaURL = asset.BrowserDownloadURL
+						deltaURL = asset.URL
 						break
 					}
 				}
@@ -2112,7 +2112,7 @@ func (u *Updater) findDeltaAsset(release Release, variantID string) string {
 		// Asset names should be like: librescoot-{variant_id}-{timestamp}.delta
 		if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
 			u.logger.Printf("Found delta asset: %s", asset.Name)
-			return asset.BrowserDownloadURL
+			return asset.URL
 		}
 	}
 	return ""
@@ -2124,7 +2124,7 @@ func (u *Updater) findMenderAsset(release Release, variantID string) string {
 		// Match mender assets by variant_id
 		if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".mender") {
 			u.logger.Printf("Found mender asset: %s", asset.Name)
-			return asset.BrowserDownloadURL
+			return asset.URL
 		}
 	}
 	return ""

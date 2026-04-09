@@ -23,7 +23,7 @@ type Config struct {
 	RedisAddr string
 
 	// GitHub Releases API configuration
-	GitHubReleasesURL string
+	ReleasesURL string
 	CheckInterval     time.Duration
 
 	// Component and channel configuration
@@ -51,7 +51,7 @@ type Config struct {
 // New creates a new Config with the given parameters
 func New(
 	redisAddr string,
-	githubReleasesURL string,
+	releasesURL string,
 	checkInterval time.Duration,
 	component string,
 	channel string,
@@ -68,7 +68,7 @@ func New(
 	}
 	return &Config{
 		RedisAddr:         redisAddr,
-		GitHubReleasesURL: githubReleasesURL,
+		ReleasesURL: releasesURL,
 		CheckInterval:     checkInterval,
 		Component:         component,
 		Channel:           channel,
@@ -149,9 +149,9 @@ func (c *Config) LoadFromRedis(redis RedisSettings) error {
 		}
 	}
 
-	// Load github-releases-url from Redis if available
-	if url, err := redis.HGet(SettingsHashKey, prefix+"github-releases-url"); err == nil && url != "" {
-		c.GitHubReleasesURL = url
+	// Load releases-url from Redis if available
+	if url, err := redis.HGet(SettingsHashKey, prefix+"releases-url"); err == nil && url != "" {
+		c.ReleasesURL = url
 	}
 
 	// Load dry-run from Redis if available
@@ -190,8 +190,8 @@ func (c *Config) ApplyRedisUpdate(key, value string) bool {
 			c.CheckInterval = duration
 			return true
 		}
-	case "github-releases-url":
-		c.GitHubReleasesURL = value
+	case "releases-url":
+		c.ReleasesURL = value
 		return true
 	case "dry-run":
 		if dryRun, err := strconv.ParseBool(value); err == nil {
