@@ -59,16 +59,25 @@ func RepackMender(sourceDir, menderPath string) error {
 			return fmt.Errorf("write header %s: %w", item, err)
 		}
 
-		data, err := os.ReadFile(fullPath)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", item, err)
-		}
-		if _, err := tw.Write(data); err != nil {
-			return fmt.Errorf("write %s: %w", item, err)
+		if err := copyFileToWriter(tw, fullPath); err != nil {
+			return fmt.Errorf("copy %s: %w", item, err)
 		}
 	}
 
 	return nil
+}
+
+// copyFileToWriter streams a file's contents into w without buffering the
+// whole file in memory. Critical on memory-constrained targets (DBC has
+// 512 MB RAM, no swap) where the recompressed payload is ~160 MB.
+func copyFileToWriter(w io.Writer, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(w, f)
+	return err
 }
 
 // UpdateHeaderChecksum extracts header.tar.gz, updates rootfs-image.checksum
@@ -172,11 +181,7 @@ func recreateHeaderTarGz(outputPath, sourceDir string) error {
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
-		data, err := os.ReadFile(fe.fullPath)
-		if err != nil {
-			return err
-		}
-		if _, err := tw.Write(data); err != nil {
+		if err := copyFileToWriter(tw, fe.fullPath); err != nil {
 			return err
 		}
 	}
