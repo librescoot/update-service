@@ -31,6 +31,7 @@ type Updater struct {
 	status           *status.Reporter
 	bootUpdater      *boot.BootUpdater // nil if --boot-update not set
 	bootStatus       *status.Reporter  // reporter for "{component}-boot" keys
+	dbcStatus        *status.Reporter  // reporter for "dbc" keys (MDB-only, for clearing stale DBC state)
 	githubAPI        *GitHubAPI
 	logger           *log.Logger
 	ctx              context.Context
@@ -80,6 +81,11 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		bootStatusReporter = status.NewReporter(redisClient.GetClient(), cfg.Component+"-boot", logger)
 	}
 
+	var dbcStatusReporter *status.Reporter
+	if cfg.Component == "mdb" {
+		dbcStatusReporter = status.NewReporter(redisClient.GetClient(), "dbc", logger)
+	}
+
 	u := &Updater{
 		config:      cfg,
 		redis:       redisClient,
@@ -89,6 +95,7 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		status:      status.NewReporter(redisClient.GetClient(), cfg.Component, logger),
 		bootUpdater: bootUpdater,
 		bootStatus:  bootStatusReporter,
+		dbcStatus:   dbcStatusReporter,
 		githubAPI:   NewGitHubAPI(updaterCtx, cfg.ReleasesURL, cfg.Channel, logger),
 		logger:      logger,
 		ctx:         updaterCtx,
@@ -471,6 +478,28 @@ func (u *Updater) setStandbyStartTime(t time.Time) {
 // This runs for the lifetime of the service so TriggerReboot always has current data.
 func (u *Updater) monitorVehicleState() {
 	watcher := u.redis.NewVehicleWatcher(config.VehicleHashKey)
+
+	// MDB-only: when DBC is powered off while its OTA status is stuck in
+	// "pending-reboot" (e.g. DBC finished installing but got shut down before
+	// rebooting), clear the stale state so a future orchestration cycle will
+	// power the DBC back on instead of treating it as "already updating".
+	if u.dbcStatus != nil {
+		watcher.OnField("dashboard:power", func(power string) error {
+			if power != "off" {
+				return nil
+			}
+			dbcOTA, err := u.redis.GetDBCOTAStatus()
+			if err != nil || dbcOTA != string(status.StatusPendingReboot) {
+				return nil
+			}
+			u.logger.Printf("[dbc-orchestrate] DBC powered off while status=pending-reboot; clearing stale state")
+			if err := u.dbcStatus.SetIdle(u.ctx); err != nil {
+				u.logger.Printf("[dbc-orchestrate] Failed to clear DBC pending-reboot state: %v", err)
+			}
+			return nil
+		})
+	}
+
 	watcher.OnField("state", func(state string) error {
 		if state == "stand-by" {
 			if u.getStandbyStartTime().IsZero() {
