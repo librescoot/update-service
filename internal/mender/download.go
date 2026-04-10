@@ -199,7 +199,7 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 
 	var resp *http.Response
 	maxRetries := 5
-	for i := 0; i < maxRetries; i++ {
+	for i := range maxRetries {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}

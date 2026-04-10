@@ -67,7 +67,7 @@ func (c *Client) AddInhibit(id string, inhibitType InhibitType, duration time.Du
 	c.logger.Printf("Adding power inhibit: id=%s, type=%s, duration=%s", id, inhibitType, durationStr)
 
 	// Create inhibit data
-	inhibitData := map[string]interface{}{
+	inhibitData := map[string]any{
 		"id":       id,
 		"type":     string(inhibitType),
 		"duration": int64(duration.Seconds()),

@@ -273,10 +273,7 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, tracker *prog
 
 			// Hash the inner file portion
 			if innerRemaining > 0 {
-				usable := int64(n)
-				if usable > innerRemaining {
-					usable = innerRemaining
-				}
+				usable := min(int64(n), innerRemaining)
 				innerHasher.Write(buf[:usable])
 				innerRemaining -= usable
 			}

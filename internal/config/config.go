@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -9,12 +10,12 @@ import (
 
 // Fixed keys for Redis
 const (
-	OtaStatusHashKey   = "ota"
-	OtaChannel         = "ota"
-	VehicleHashKey     = "vehicle"
-	OsReleaseHashKey   = "os-release"
-	SettingsHashKey    = "settings"
-	SettingsChannel    = "settings"
+	OtaStatusHashKey = "ota"
+	OtaChannel       = "ota"
+	VehicleHashKey   = "vehicle"
+	OsReleaseHashKey = "os-release"
+	SettingsHashKey  = "settings"
+	SettingsChannel  = "settings"
 )
 
 // Config holds the configuration for the update service
@@ -23,8 +24,8 @@ type Config struct {
 	RedisAddr string
 
 	// GitHub Releases API configuration
-	ReleasesURL string
-	CheckInterval     time.Duration
+	ReleasesURL   string
+	CheckInterval time.Duration
 
 	// Component and channel configuration
 	Component string // "mdb" or "dbc" - which component this instance manages (CLI-only, never from Redis)
@@ -67,12 +68,12 @@ func New(
 		bootDTBFile = "librescoot-" + component + ".dtb"
 	}
 	return &Config{
-		RedisAddr:         redisAddr,
-		ReleasesURL: releasesURL,
-		CheckInterval:     checkInterval,
-		Component:         component,
-		Channel:           channel,
-		DownloadDir:       downloadDir,
+		RedisAddr:     redisAddr,
+		ReleasesURL:   releasesURL,
+		CheckInterval: checkInterval,
+		Component:     component,
+		Channel:       channel,
+		DownloadDir:   downloadDir,
 		// Default values for update constraints
 		MdbRebootCheckInterval: 5 * time.Minute,
 		UpdateRetryInterval:    15 * time.Minute,
@@ -96,12 +97,7 @@ func IsValidComponent(component string) bool {
 func IsValidChannel(channel string) bool {
 	// Currently supported channels
 	validChannels := []string{"stable", "testing", "nightly"}
-	for _, ch := range validChannels {
-		if ch == channel {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(validChannels, channel)
 }
 
 // InferChannelFromVersion attempts to infer the channel from a version string.

@@ -45,7 +45,7 @@ type GitHubAPI struct {
 
 // Logger interface for logging
 type Logger interface {
-	Printf(format string, v ...interface{})
+	Printf(format string, v ...any)
 }
 
 // NewGitHubAPI creates a new release index client
@@ -144,10 +144,7 @@ func (g *GitHubAPI) GetReleases() ([]Release, error) {
 		}
 
 		// Increase backoff for next attempt (with cap)
-		backoff = time.Duration(float64(backoff) * backoffFactor)
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
+		backoff = min(time.Duration(float64(backoff)*backoffFactor), maxBackoff)
 
 		retries++
 	}

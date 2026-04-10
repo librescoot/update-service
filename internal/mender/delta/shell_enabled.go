@@ -1,5 +1,4 @@
 //go:build shell_commands
-// +build shell_commands
 
 package delta
 

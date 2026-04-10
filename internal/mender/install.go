@@ -77,7 +77,7 @@ func (i *Installer) Install(filePath string, progressCb InstallProgressCallback)
 	scanner := bufio.NewScanner(stderrPipe)
 	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
 		// Split on \r or \n
-		for i := 0; i < len(data); i++ {
+		for i := range data {
 			if data[i] == '\r' || data[i] == '\n' {
 				return i + 1, data[:i], nil
 			}
@@ -94,8 +94,8 @@ func (i *Installer) Install(filePath string, progressCb InstallProgressCallback)
 			continue
 		}
 
-		if strings.HasSuffix(line, "%") {
-			numStr := strings.TrimSuffix(line, "%")
+		if before, ok := strings.CutSuffix(line, "%"); ok {
+			numStr := before
 			if pct, err := strconv.Atoi(numStr); err == nil && pct >= 0 && pct <= 100 {
 				if progressCb != nil {
 					progressCb(pct)

@@ -28,10 +28,7 @@ func (pt *progressTracker) add(n int64, label string) {
 	if pt.callback == nil || pt.total <= 0 {
 		return
 	}
-	pct := int(pt.processed * 99 / pt.total)
-	if pct > 99 {
-		pct = 99
-	}
+	pct := min(int(pt.processed*99/pt.total), 99)
 	if pct != pt.lastPct {
 		pt.lastPct = pct
 		pt.callback(pct, label)

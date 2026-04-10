@@ -29,8 +29,8 @@ type Updater struct {
 	power            *power.Client
 	mender           *mender.Manager
 	status           *status.Reporter
-	bootUpdater      *boot.BootUpdater  // nil if --boot-update not set
-	bootStatus       *status.Reporter   // reporter for "{component}-boot" keys
+	bootUpdater      *boot.BootUpdater // nil if --boot-update not set
+	bootStatus       *status.Reporter  // reporter for "{component}-boot" keys
 	githubAPI        *GitHubAPI
 	logger           *log.Logger
 	ctx              context.Context
@@ -46,9 +46,9 @@ type Updater struct {
 	updateCheckMu sync.Mutex
 
 	// DBC orchestration (MDB-only)
-	orchestrateDBCMu sync.RWMutex
+	orchestrateDBCMu      sync.RWMutex
 	orchestrateDBCEnabled bool
-	dbcOrchestrating sync.Mutex // prevents overlapping orchestration
+	dbcOrchestrating      sync.Mutex // prevents overlapping orchestration
 
 	// Track active update goroutines for clean shutdown
 	wg sync.WaitGroup
@@ -64,7 +64,6 @@ func (u *Updater) menderInstallProgressCb() mender.InstallProgressCallback {
 		}
 	}
 }
-
 
 // New creates a new component-aware updater
 func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inhibitorClient *inhibitor.Client, powerClient *power.Client, bootUpdater *boot.BootUpdater, logger *log.Logger) *Updater {
@@ -784,7 +783,7 @@ func (u *Updater) handleUpdateFromURL(url string) {
 		return
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if u.ctx.Err() != nil {
 			u.logger.Printf("Context cancelled during download attempt %d", i+1)
 			return
@@ -1250,10 +1249,7 @@ func compareVersions(v1, v2 string) int {
 	parts1 := strings.Split(v1, ".")
 	parts2 := strings.Split(v2, ".")
 
-	maxLen := len(parts1)
-	if len(parts2) > maxLen {
-		maxLen = len(parts2)
-	}
+	maxLen := max(len(parts2), len(parts1))
 
 	for i := 0; i < maxLen; i++ {
 		var n1, n2 int
@@ -1302,7 +1298,6 @@ func (u *Updater) performUpdate(release Release, assetURL string) {
 		// Use full tag name for nightly/testing too
 		version = strings.ToLower(release.TagName)
 	}
-
 
 	// Step 1: Set downloading status, update method, and add download inhibitor
 	if err := u.status.SetDownloading(u.ctx, version, "full"); err != nil {
@@ -1565,7 +1560,6 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	u.logger.Printf("Delta chain for %s: %s -> [%s] (%d deltas, %d bytes vs %d full)",
 		u.config.Component, baseVersion, strings.Join(deltaVersionList, ", "), len(deltaChain), totalDeltaSize, fullUpdateSize)
 
-
 	// Set status
 	if err := u.status.SetDownloading(u.ctx, latestVersion, "delta"); err != nil {
 		u.logger.Printf("Failed to set downloading status: %v", err)
@@ -1641,7 +1635,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 		if deltaURL == "" {
 			u.logger.Printf("No delta asset found for %s, cannot continue", release.TagName)
-			for j := 0; j < i; j++ {
+			for j := range i {
 				if downloads[j].deltaPath != "" {
 					u.mender.CleanupDeltaFile(downloads[j].deltaPath)
 				}
@@ -1668,7 +1662,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			}
 			if time.Now().After(downloadDeadline) {
 				u.logger.Printf("Download failed after %v of retries: %v", deltaDownloadMaxRetryDuration, err)
-				for j := 0; j < i; j++ {
+				for j := range i {
 					if downloads[j].deltaPath != "" {
 						u.mender.CleanupDeltaFile(downloads[j].deltaPath)
 					}
@@ -1677,10 +1671,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 				return
 			}
 			remaining := time.Until(downloadDeadline)
-			wait := deltaDownloadRetryInterval
-			if remaining < wait {
-				wait = remaining
-			}
+			wait := min(remaining, deltaDownloadRetryInterval)
 			u.logger.Printf("Download attempt failed, retrying in %v: %v", wait, err)
 			select {
 			case <-u.ctx.Done():
