@@ -186,6 +186,12 @@ func main() {
 		}
 		bootUpdater = boot.New(cfg.BootMountPoint, cfg.BootDevice, cfg.BootDTBFile, cfg.BootUBootSeek, logger)
 		logger.Printf("Boot updater: device=%s, dtb=%s", cfg.BootDevice, cfg.BootDTBFile)
+
+		// If we're running, the freshly-booted U-Boot works. Clear the
+		// watchdog so it doesn't eventually trigger a spurious rollback.
+		if err := boot.ClearUBootWatchdog(ctx, logger); err != nil {
+			logger.Printf("Warning: failed to clear U-Boot watchdog: %v", err)
+		}
 	}
 
 	// Initialize updater
