@@ -24,7 +24,7 @@ proc /proc proc rw 0 0
 tmpfs /tmp tmpfs rw 0 0
 `,
 			mountPoint: "/uboot",
-			want:       "/dev/mmcblk3boot0",
+			want:       "/dev/mmcblk3",
 		},
 		{
 			name: "mmcblk1p1 at /uboot",
@@ -32,7 +32,7 @@ tmpfs /tmp tmpfs rw 0 0
 /dev/mmcblk1p2 / ext4 rw 0 0
 `,
 			mountPoint: "/uboot",
-			want:       "/dev/mmcblk1boot0",
+			want:       "/dev/mmcblk1",
 		},
 		{
 			name: "mount point not found",
@@ -46,14 +46,12 @@ tmpfs /tmp tmpfs rw 0 0
 			mounts: `/dev/sda /uboot vfat rw 0 0
 `,
 			mountPoint: "/uboot",
-			// /dev/sda has no 'p' partition suffix so base stays as /dev/sda
-			want: "/dev/sdaboot0",
+			want:       "/dev/sda",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Write fake /proc/mounts to a temp file
 			f, err := os.CreateTemp(t.TempDir(), "mounts")
 			if err != nil {
 				t.Fatal(err)
@@ -63,9 +61,6 @@ tmpfs /tmp tmpfs rw 0 0
 			}
 			f.Close()
 
-			// Patch the function to use our temp file by monkey-patching Open
-			// Since we can't easily mock os.Open, we use an internal helper instead.
-			// For the test, we use detectBootDeviceFromFile.
 			got, err := detectBootDeviceFromFile(f.Name(), tt.mountPoint)
 			if tt.wantErr {
 				if err == nil {
@@ -80,6 +75,150 @@ tmpfs /tmp tmpfs rw 0 0
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestStripBootSuffix(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"/dev/mmcblk3boot0", "/dev/mmcblk3"},
+		{"/dev/mmcblk3boot1", "/dev/mmcblk3"},
+		{"/dev/mmcblk1boot0", "/dev/mmcblk1"},
+		{"/dev/mmcblk3", "/dev/mmcblk3"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := stripBootSuffix(tt.in); got != tt.want {
+			t.Errorf("stripBootSuffix(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestParsePartitionConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		output     string
+		wantActive int
+		wantAck    int
+		wantErr    bool
+	}{
+		{
+			name:       "boot0 active with ack",
+			output:     "Boot configuration bytes [PARTITION_CONFIG: 0x48]\n",
+			wantActive: 1,
+			wantAck:    1,
+		},
+		{
+			name:       "boot1 active with ack",
+			output:     "Boot configuration bytes [PARTITION_CONFIG: 0x50]\n",
+			wantActive: 2,
+			wantAck:    1,
+		},
+		{
+			name:       "boot0 active no ack",
+			output:     "Boot configuration bytes [PARTITION_CONFIG: 0x08]\n",
+			wantActive: 1,
+			wantAck:    0,
+		},
+		{
+			name:       "no boot partition enabled",
+			output:     "Boot configuration bytes [PARTITION_CONFIG: 0x00]\n",
+			wantActive: 0,
+			wantAck:    0,
+		},
+		{
+			name:       "user area enabled",
+			output:     "Boot configuration bytes [PARTITION_CONFIG: 0x38]\n",
+			wantActive: 7,
+			wantAck:    0,
+		},
+		{
+			name:       "older label format",
+			output:     "Boot Area Partition [PARTITION_CONFIG: 0x48]\n",
+			wantActive: 1,
+			wantAck:    1,
+		},
+		{
+			name:       "embedded in larger extcsd dump",
+			output:     "...\nBoot configuration: B_SIZE_MULT: 0x10\nBoot configuration bytes [PARTITION_CONFIG: 0x48]\nBoot bus Conditions [BOOT_BUS_CONDITIONS: 0x00]\n...",
+			wantActive: 1,
+			wantAck:    1,
+		},
+		{
+			name:    "missing",
+			output:  "Extended CSD rev 1.7 (MMC 5.0)\n",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			active, ack, err := parsePartitionConfig(tt.output)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got active=%d ack=%d", active, ack)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if active != tt.wantActive {
+				t.Errorf("active = %d, want %d", active, tt.wantActive)
+			}
+			if ack != tt.wantAck {
+				t.Errorf("ack = %d, want %d", ack, tt.wantAck)
+			}
+		})
+	}
+}
+
+func TestInactivePartition(t *testing.T) {
+	tests := []struct {
+		active, want int
+	}{
+		{0, 1},
+		{1, 2},
+		{2, 1},
+		{7, 1},
+	}
+	for _, tt := range tests {
+		if got := inactivePartition(tt.active); got != tt.want {
+			t.Errorf("inactivePartition(%d) = %d, want %d", tt.active, got, tt.want)
+		}
+	}
+}
+
+func TestBootPartitionDevice(t *testing.T) {
+	tests := []struct {
+		mmc  string
+		n    int
+		want string
+	}{
+		{"/dev/mmcblk3", 1, "/dev/mmcblk3boot0"},
+		{"/dev/mmcblk3", 2, "/dev/mmcblk3boot1"},
+		{"/dev/mmcblk1", 1, "/dev/mmcblk1boot0"},
+		{"/dev/mmcblk1", 2, "/dev/mmcblk1boot1"},
+	}
+	for _, tt := range tests {
+		if got := bootPartitionDevice(tt.mmc, tt.n); got != tt.want {
+			t.Errorf("bootPartitionDevice(%q, %d) = %q, want %q", tt.mmc, tt.n, got, tt.want)
+		}
+	}
+}
+
+func TestForceROPathFor(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"/dev/mmcblk3boot0", "/sys/block/mmcblk3boot0/force_ro"},
+		{"/dev/mmcblk3boot1", "/sys/block/mmcblk3boot1/force_ro"},
+		{"/dev/mmcblk1boot1", "/sys/block/mmcblk1boot1/force_ro"},
+	}
+	for _, tt := range tests {
+		if got := forceROPathFor(tt.in); got != tt.want {
+			t.Errorf("forceROPathFor(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }
 
@@ -112,7 +251,6 @@ func TestGetInstalledVersion(t *testing.T) {
 		versionFile: filepath.Join(dir, "boot-version"),
 	}
 
-	// Missing file → ""
 	ver, err := b.GetInstalledVersion()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -121,7 +259,6 @@ func TestGetInstalledVersion(t *testing.T) {
 		t.Errorf("expected empty version, got %q", ver)
 	}
 
-	// Write a version
 	if err := os.WriteFile(b.versionFile, []byte("nightly-20260301T013104\n"), 0644); err != nil {
 		t.Fatal(err)
 	}

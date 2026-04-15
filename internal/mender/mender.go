@@ -11,10 +11,10 @@ import (
 
 // Manager combines download and installation functionality for Mender updates
 type Manager struct {
-	downloader    *Downloader
-	installer     *Installer
-	deltaApplier  *DeltaApplier
-	logger        *log.Logger
+	downloader   *Downloader
+	installer    *Installer
+	deltaApplier *DeltaApplier
+	logger       *log.Logger
 }
 
 // NewManager creates a new Mender manager with the specified download directory

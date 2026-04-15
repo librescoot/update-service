@@ -63,7 +63,7 @@ func TestCommitResult_ExitCodes(t *testing.T) {
 
 func TestInconsistentSuffix(t *testing.T) {
 	testCases := []struct {
-		artifact      string
+		artifact       string
 		isInconsistent bool
 	}{
 		{"release-nightly-20251211T024757", false},
