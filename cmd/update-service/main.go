@@ -31,7 +31,7 @@ var (
 	showVersion    = flag.Bool("version", false, "Print version and exit")
 	bootUpdate     = flag.Bool("boot-update", false, "Enable boot partition updates")
 	bootMountPoint = flag.String("boot-mount", "/uboot", "Boot partition mount point")
-	bootDevice     = flag.String("boot-device", "", "U-Boot device path (auto-detected from mount if empty)")
+	bootDevice     = flag.String("boot-device", "", "Base eMMC device (e.g. /dev/mmcblk3); auto-detected from mount if empty")
 	bootDTB        = flag.String("boot-dtb", "", "DTB filename (default: librescoot-{component}.dtb)")
 	bootUBootSeek  = flag.Int64("boot-uboot-seek", 2, "512-byte blocks to seek before writing U-Boot")
 )
