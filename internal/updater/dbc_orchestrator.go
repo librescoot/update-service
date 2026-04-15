@@ -25,6 +25,18 @@ func (u *Updater) orchestrateDBC(releases []Release) {
 		return
 	}
 
+	// Only orchestrate in stand-by. In any other state the user may be driving
+	// or otherwise interacting with the DBC, and toggling its power is unsafe.
+	state, err := u.redis.GetVehicleState(config.VehicleHashKey)
+	if err != nil {
+		u.logger.Printf("[dbc-orchestrate] Failed to read vehicle state: %v, skipping", err)
+		return
+	}
+	if state != "stand-by" {
+		u.logger.Printf("[dbc-orchestrate] Vehicle state is '%s' (not stand-by), skipping", state)
+		return
+	}
+
 	// Prevent overlapping orchestrations
 	if !u.dbcOrchestrating.TryLock() {
 		u.logger.Printf("[dbc-orchestrate] Already in progress, skipping")
@@ -63,15 +75,29 @@ func (u *Updater) orchestrateDBC(releases []Release) {
 	u.logger.Printf("[dbc-orchestrate] Dashboard powered on, check-now queued")
 
 	// Watch for DBC update activity
-	if !u.watchDBCActivity() {
+	result := u.watchDBCActivity()
+	switch result {
+	case dbcWatchStarted:
+		u.logger.Printf("[dbc-orchestrate] DBC update started, handing off to DBC update-service")
+	case dbcWatchVehicleWoke:
+		u.logger.Printf("[dbc-orchestrate] Vehicle left stand-by during watch, leaving dashboard on")
+	case dbcWatchTimeout:
+		// Re-check vehicle state before powering off — the user may have
+		// woken the scooter in the race between the last poll and now.
+		currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
+		if err != nil {
+			u.logger.Printf("[dbc-orchestrate] Timeout reached but failed to re-check vehicle state: %v, leaving dashboard on", err)
+			return
+		}
+		if currentState != "stand-by" {
+			u.logger.Printf("[dbc-orchestrate] Timeout reached but vehicle is in '%s', leaving dashboard on", currentState)
+			return
+		}
 		u.logger.Printf("[dbc-orchestrate] DBC did not start updating within %v, powering off", dbcActivityTimeout)
 		if err := u.redis.SendHardwareCommand("dashboard:off"); err != nil {
 			u.logger.Printf("[dbc-orchestrate] Failed to send dashboard:off: %v", err)
 		}
-		return
 	}
-
-	u.logger.Printf("[dbc-orchestrate] DBC update started, handing off to DBC update-service")
 }
 
 // isDBCUpdateAvailable checks if a newer release exists for the DBC component.
@@ -149,9 +175,19 @@ func (u *Updater) isVersionNewer(releaseTag, installedVersion, channel string) b
 	return normRelease > normInstalled
 }
 
-// watchDBCActivity polls the DBC OTA status. Returns true if DBC transitions
-// to an active update state within the timeout, false otherwise.
-func (u *Updater) watchDBCActivity() bool {
+type dbcWatchResult int
+
+const (
+	dbcWatchTimeout dbcWatchResult = iota
+	dbcWatchStarted
+	dbcWatchVehicleWoke
+)
+
+// watchDBCActivity polls the DBC OTA status and vehicle state. Returns
+// dbcWatchStarted if the DBC transitions to an active update state,
+// dbcWatchVehicleWoke if the vehicle leaves stand-by, or dbcWatchTimeout
+// otherwise.
+func (u *Updater) watchDBCActivity() dbcWatchResult {
 	ctx, cancel := context.WithTimeout(u.ctx, dbcActivityTimeout)
 	defer cancel()
 
@@ -161,15 +197,18 @@ func (u *Updater) watchDBCActivity() bool {
 	for {
 		select {
 		case <-ctx.Done():
-			return false
+			return dbcWatchTimeout
 		case <-ticker.C:
+			if state, err := u.redis.GetVehicleState(config.VehicleHashKey); err == nil && state != "stand-by" {
+				return dbcWatchVehicleWoke
+			}
 			status, err := u.redis.GetDBCOTAStatus()
 			if err != nil {
 				continue
 			}
 			switch status {
 			case "downloading", "preparing", "installing", "pending-reboot":
-				return true
+				return dbcWatchStarted
 			}
 		}
 	}
