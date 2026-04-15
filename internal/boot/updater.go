@@ -236,8 +236,9 @@ func writeFileVerified(dst, src string) error {
 }
 
 // writeUBoot writes the new U-Boot image to the inactive eMMC boot partition,
-// verifies via SHA256, then flips PARTITION_CONFIG to boot from it.
-// The previously active partition is left intact as a fallback.
+// verifies via SHA256, arms the U-Boot env watchdog for rollback, then flips
+// PARTITION_CONFIG to boot from the new partition. The previously active
+// partition is left intact as a fallback.
 func (b *BootUpdater) writeUBoot(ctx context.Context, imxPath string) error {
 	imxData, err := os.ReadFile(imxPath)
 	if err != nil {
@@ -258,13 +259,85 @@ func (b *BootUpdater) writeUBoot(ctx context.Context, imxPath string) error {
 		return err
 	}
 
+	// Arm the watchdog BEFORE flipping: if setenv fails we'd rather keep
+	// booting from the old (known-good) partition than flip without rollback.
+	if err := armUBootWatchdog(ctx, active, ack); err != nil {
+		return fmt.Errorf("arm u-boot watchdog: %w", err)
+	}
+
 	b.logger.Printf("[boot] flipping PARTITION_CONFIG to boot from partition %d (ack=%d)", target, ack)
 	if err := flipPartitionConfig(ctx, b.mmcDevice, target, ack); err != nil {
+		// Disarm so the old (still-active) U-Boot doesn't eventually
+		// "revert" to itself and reset once per bootlimit.
+		if derr := disarmUBootWatchdog(ctx); derr != nil {
+			b.logger.Printf("[boot] warning: failed to disarm watchdog after flip failure: %v", derr)
+		}
 		return fmt.Errorf("flip partition config to %d: %w", target, err)
 	}
 
 	b.logger.Printf("[boot] U-Boot update complete: new partition=%d, fallback partition=%d", target, active)
 	return nil
+}
+
+// armUBootWatchdog sets the U-Boot env variables that let the bootloader
+// roll back to the previously-active partition if the freshly-written one
+// fails to boot Linux uboot_ab_bootlimit times. fallbackPart / fallbackAck
+// describe the partition and BOOT_ACK bit to revert to.
+func armUBootWatchdog(ctx context.Context, fallbackPart, fallbackAck int) error {
+	vars := [][2]string{
+		{"uboot_upgrade", "1"},
+		{"uboot_ab_bootcount", "0"},
+		{"uboot_altbootpart", strconv.Itoa(fallbackPart)},
+		{"uboot_altbootpart_ack", strconv.Itoa(fallbackAck)},
+	}
+	for _, kv := range vars {
+		if err := fwSetenv(ctx, kv[0], kv[1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ClearUBootWatchdog clears the watchdog state, signalling a successful boot
+// and confirmation that the new U-Boot is working. No-op when the watchdog is
+// not armed.
+func ClearUBootWatchdog(ctx context.Context, logger *log.Logger) error {
+	active, _ := fwGetenv(ctx, "uboot_upgrade")
+	if active != "1" {
+		return nil
+	}
+	logger.Printf("[boot] clearing U-Boot watchdog (boot confirmed healthy)")
+	return disarmUBootWatchdog(ctx)
+}
+
+// disarmUBootWatchdog clears uboot_upgrade and uboot_ab_bootcount.
+func disarmUBootWatchdog(ctx context.Context) error {
+	for _, k := range []string{"uboot_upgrade", "uboot_ab_bootcount"} {
+		if err := fwSetenv(ctx, k, "0"); err != nil {
+			return fmt.Errorf("fw_setenv %s: %w", k, err)
+		}
+	}
+	return nil
+}
+
+// fwSetenv invokes fw_setenv to update a U-Boot env variable.
+func fwSetenv(ctx context.Context, key, value string) error {
+	cmd := exec.CommandContext(ctx, "fw_setenv", key, value)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("fw_setenv %s=%s: %w (output: %s)", key, value, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// fwGetenv returns the current value of a U-Boot env variable via fw_printenv.
+// Returns empty string and nil if the variable is unset.
+func fwGetenv(ctx context.Context, key string) (string, error) {
+	out, err := exec.CommandContext(ctx, "fw_printenv", "-n", key).Output()
+	if err != nil {
+		return "", nil
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // writeAndVerifyUBootImage unlocks force_ro for the target boot partition,
