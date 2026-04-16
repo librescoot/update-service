@@ -1710,11 +1710,6 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		}
 		downloads[i].deltaPath = deltaPath
 		u.logger.Printf("Downloaded delta %d/%d: %s", i+1, len(deltaChain), release.TagName)
-
-		// Reset download progress between deltas (so next delta starts at 0%)
-		if err := u.status.ResetDownloadProgress(u.ctx); err != nil {
-			u.logger.Printf("Failed to reset download progress: %v", err)
-		}
 	}
 
 	u.logger.Printf("All %d deltas downloaded, applying chain", len(downloads))

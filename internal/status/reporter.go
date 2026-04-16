@@ -185,15 +185,6 @@ func (r *Reporter) SetDownloadProgress(ctx context.Context, downloaded, total in
 	})
 }
 
-// ResetDownloadProgress resets download progress to 0% without changing status.
-// Used between sequential delta downloads to show progress restart.
-func (r *Reporter) ResetDownloadProgress(ctx context.Context) error {
-	return r.pub.SetMany(map[string]any{
-		r.key("download-progress"): 0,
-		r.key("download-bytes"):    0,
-		r.key("download-total"):    0,
-	})
-}
 
 // SetInstallProgress updates the install/delta application progress (0-100).
 // Status is not changed — this is a partial update called frequently during install.
