@@ -157,9 +157,6 @@ func main() {
 		cfg.DryRun = cliDryRun
 	}
 
-	// Start watching for settings changes in the background
-	go watchSettingsChanges(ctx, redisClient, cfg, logger, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet)
-
 	// Initialize power inhibitor client
 	inhibitorClient, err := inhibitor.New(*redisAddr, logger)
 	if err != nil {
@@ -202,6 +199,11 @@ func main() {
 		logger.Fatalf("Failed to start updater: %v", err)
 	}
 
+	// Start watching for settings changes in the background. Must be after
+	// updater.Start so the watcher can notify the updater when check-interval
+	// changes at runtime.
+	go watchSettingsChanges(ctx, redisClient, cfg, logger, updater, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet)
+
 	// Log configuration summary
 	channelSource := "default"
 	if cliChannelSet {
@@ -224,7 +226,7 @@ func main() {
 }
 
 // watchSettingsChanges monitors Redis for settings changes and applies them to the config
-func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet bool) {
+func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger, upd *updater.Updater, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet bool) {
 	// Use HashWatcher to monitor settings hash
 	watcher := redisClient.NewSettingsWatcher()
 	watcher.OnAny(func(settingKey, value string) error {
@@ -262,10 +264,13 @@ func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *c
 		if cfg.ApplyRedisUpdate(settingKey, value) {
 			logger.Printf("Applied setting update: %s = %s", settingKey, value)
 
-			// If check-interval was updated, evaluate if we should check now
+			// If check-interval was updated, wake the update loop so it picks up
+			// the new value (or stops if set to 0), and evaluate if we should
+			// check now.
 			if len(settingKey) > len(prefix) && settingKey[:len(prefix)] == prefix {
 				settingName := settingKey[len(prefix):]
 				if settingName == "check-interval" {
+					upd.NotifyCheckIntervalChanged()
 					evaluateCheckIntervalChange(ctx, redisClient, cfg, logger)
 				}
 			}

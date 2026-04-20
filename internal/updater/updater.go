@@ -57,6 +57,10 @@ type Updater struct {
 	orchestrateDBCEnabled bool
 	dbcOrchestrating      sync.Mutex // prevents overlapping orchestration
 
+	// Wakes updateCheckLoop to reload config.CheckInterval and reset its timer
+	// when the setting changes at runtime (e.g., set to 0 to disable checks).
+	checkIntervalChanged chan struct{}
+
 	// Track active update goroutines for clean shutdown
 	wg sync.WaitGroup
 }
@@ -93,19 +97,20 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 	}
 
 	u := &Updater{
-		config:      cfg,
-		redis:       redisClient,
-		inhibitor:   inhibitorClient,
-		power:       powerClient,
-		mender:      mender.NewManager(downloadDir, logger),
-		status:      status.NewReporter(redisClient.GetClient(), cfg.Component, logger),
-		bootUpdater: bootUpdater,
-		bootStatus:  bootStatusReporter,
-		dbcStatus:   dbcStatusReporter,
-		githubAPI:   NewGitHubAPI(updaterCtx, cfg.ReleasesURL, cfg.Channel, logger),
-		logger:      logger,
-		ctx:         updaterCtx,
-		cancel:      cancel,
+		config:               cfg,
+		redis:                redisClient,
+		inhibitor:            inhibitorClient,
+		power:                powerClient,
+		mender:               mender.NewManager(downloadDir, logger),
+		status:               status.NewReporter(redisClient.GetClient(), cfg.Component, logger),
+		bootUpdater:          bootUpdater,
+		bootStatus:           bootStatusReporter,
+		dbcStatus:            dbcStatusReporter,
+		githubAPI:            NewGitHubAPI(updaterCtx, cfg.ReleasesURL, cfg.Channel, logger),
+		logger:               logger,
+		ctx:                  updaterCtx,
+		cancel:               cancel,
+		checkIntervalChanged: make(chan struct{}, 1),
 	}
 
 	// Initialize update method from Redis
@@ -1020,26 +1025,45 @@ func (u *Updater) monitorSettingsChanges() {
 	u.logger.Printf("Settings monitor stopped for %s", u.config.Component)
 }
 
-// updateCheckLoop periodically checks for updates
+// updateCheckLoop periodically checks for updates. Reacts to runtime changes
+// of config.CheckInterval via NotifyCheckIntervalChanged so that setting the
+// interval to 0 actually stops the loop and changing it resets the timer.
 func (u *Updater) updateCheckLoop() {
-	if u.config.CheckInterval == 0 {
-		<-u.ctx.Done()
-		return
+	// Initial check on startup if enabled
+	if u.config.CheckInterval > 0 {
+		u.checkForUpdates()
 	}
 
-	ticker := time.NewTicker(u.config.CheckInterval)
-	defer ticker.Stop()
-
-	// Do an initial check immediately
-	u.checkForUpdates()
-
 	for {
+		interval := u.config.CheckInterval
+
+		if interval <= 0 {
+			// Disabled — block until the interval is re-enabled or we shut down
+			select {
+			case <-u.ctx.Done():
+				u.logger.Printf("Update check loop stopped")
+				return
+			case <-u.checkIntervalChanged:
+				continue
+			}
+		}
+
+		timer := time.NewTimer(interval)
 		select {
 		case <-u.ctx.Done():
+			timer.Stop()
 			u.logger.Printf("Update check loop stopped")
 			return
-		case <-ticker.C:
-			u.checkForUpdates()
+		case <-u.checkIntervalChanged:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			continue
+		case <-timer.C:
+			// Re-read in case the config was set to 0 just before the timer fired.
+			if u.config.CheckInterval > 0 {
+				u.checkForUpdates()
+			}
 		}
 	}
 }
@@ -1063,6 +1087,16 @@ func (u *Updater) restartCheckAfterCorruptFile() {
 		defer u.wg.Done()
 		u.checkForUpdates()
 	}()
+}
+
+// NotifyCheckIntervalChanged signals updateCheckLoop to reload the configured
+// check interval and reset its timer. Call this after mutating
+// config.CheckInterval at runtime. Non-blocking; coalesces pending signals.
+func (u *Updater) NotifyCheckIntervalChanged() {
+	select {
+	case u.checkIntervalChanged <- struct{}{}:
+	default:
+	}
 }
 
 // checkForUpdates checks for updates and initiates the update process if updates are available
