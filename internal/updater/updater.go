@@ -46,6 +46,12 @@ type Updater struct {
 	// Prevent concurrent update checks
 	updateCheckMu sync.Mutex
 
+	// Serializes every long-running update operation (file install, URL install,
+	// full, delta). Held for the full duration of the operation — startup's
+	// pending-file install used to race with a concurrent `check-now` delta, and
+	// the file install's `complete-dbc` would cut dashboard power mid-delta.
+	updateOpMu sync.Mutex
+
 	// DBC orchestration (MDB-only)
 	orchestrateDBCMu      sync.RWMutex
 	orchestrateDBCEnabled bool
@@ -277,6 +283,14 @@ func (u *Updater) installPendingMenderFile(menderNeedsReboot bool) {
 	}
 
 	u.logger.Printf("Found pending mender file %s (running %s), installing", menderVersion, currentVersion)
+
+	// Publish non-idle status synchronously before spawning the goroutine —
+	// otherwise a command like `check-now` arriving in the same millisecond can
+	// see StatusIdle, skip the guard in checkForUpdates, and spawn a concurrent
+	// delta update that races the file install.
+	if err := u.status.SetDownloading(u.ctx, strings.ToLower(menderVersion), "full"); err != nil {
+		u.logger.Printf("Failed to set downloading status before pending install: %v", err)
+	}
 
 	// Install in background so we don't block startup
 	u.wg.Add(1)
@@ -667,6 +681,12 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		return
 	}
 
+	if !u.updateOpMu.TryLock() {
+		u.logger.Printf("Update already in progress, ignoring file request: %s", source)
+		return
+	}
+	defer u.updateOpMu.Unlock()
+
 	u.logger.Printf("Processing update from local file: %s", source)
 
 	if _, err := os.Stat(source); err != nil {
@@ -771,6 +791,13 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 // Supports format: https://example.com/file.mender or https://example.com/file.mender:sha256:checksum
 func (u *Updater) handleUpdateFromURL(url string) {
 	source, checksum, _ := u.parseUpdateSource(url)
+
+	if !u.updateOpMu.TryLock() {
+		u.logger.Printf("Update already in progress, ignoring URL request: %s", source)
+		return
+	}
+	defer u.updateOpMu.Unlock()
+
 	if checksum != "" {
 		u.logger.Printf("Checksum provided: %s", checksum)
 	}
@@ -1316,8 +1343,21 @@ func (u *Updater) getCurrentVersion() (string, error) {
 	return u.redis.GetComponentVersion(u.config.Component)
 }
 
-// performUpdate performs the actual update process
+// performUpdate is the public entry point for a full update — acquires
+// updateOpMu so it won't race with another in-flight update operation.
 func (u *Updater) performUpdate(release Release, assetURL string) {
+	if !u.updateOpMu.TryLock() {
+		u.logger.Printf("Update already in progress, skipping full update to %s", release.TagName)
+		return
+	}
+	defer u.updateOpMu.Unlock()
+	u.performUpdateLocked(release, assetURL)
+}
+
+// performUpdateLocked does the actual update work. Caller must already hold
+// updateOpMu — internal callers inside performDeltaUpdate / fallbackToFullUpdate
+// run under the same lock and use this entry directly to avoid deadlock.
+func (u *Updater) performUpdateLocked(release Release, assetURL string) {
 	u.logger.Printf("Starting update process for %s to version %s", u.config.Component, release.TagName)
 
 	var version string
@@ -1504,6 +1544,17 @@ const deltaDownloadRetryInterval = 5 * time.Minute
 const deltaDownloadMaxRetryDuration = 15 * time.Minute
 
 func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string, isRecheck bool) {
+	// The recursive re-check call at the end of this function runs inside the
+	// same goroutine that already holds updateOpMu — skip TryLock in that case
+	// to avoid self-deadlocking on the non-reentrant mutex.
+	if !isRecheck {
+		if !u.updateOpMu.TryLock() {
+			u.logger.Printf("Update already in progress, skipping delta update")
+			return
+		}
+		defer u.updateOpMu.Unlock()
+	}
+
 	// Step 0: Determine the base version to start from
 	// First, check if we have a mender file for the current running version
 	baseVersion := currentVersion
@@ -1530,7 +1581,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			menderURL := u.findMenderAsset(latestRelease, variantID)
 			if menderURL != "" {
 				u.logger.Printf("Falling back to full update with latest version")
-				u.performUpdate(latestRelease, menderURL)
+				u.performUpdateLocked(latestRelease, menderURL)
 			}
 		}
 		return
@@ -1571,7 +1622,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			totalDeltaSize, fullUpdateSize)
 		menderURL := u.findMenderAsset(latestRelease, variantID)
 		if menderURL != "" {
-			u.performUpdate(latestRelease, menderURL)
+			u.performUpdateLocked(latestRelease, menderURL)
 		}
 		return
 	}
@@ -1948,7 +1999,7 @@ func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, reason str
 		menderURL := u.findMenderAsset(latestRelease, variantID)
 		if menderURL != "" {
 			u.logger.Printf("Starting full update to %s", latestRelease.TagName)
-			u.performUpdate(latestRelease, menderURL)
+			u.performUpdateLocked(latestRelease, menderURL)
 		}
 	}
 }
