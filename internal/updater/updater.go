@@ -771,7 +771,9 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 			if removeErr := u.mender.RemoveFile(source); removeErr != nil {
 				u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
 			} else {
-				u.logger.Printf("Deleted corrupted file, next update check will re-download")
+				u.logger.Printf("Deleted corrupted file, restarting update check")
+				u.restartCheckAfterCorruptFile()
+				return
 			}
 		}
 
@@ -920,7 +922,9 @@ func (u *Updater) handleUpdateFromURL(url string) {
 				if removeErr := u.mender.RemoveFile(filePath); removeErr != nil {
 					u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
 				} else {
-					u.logger.Printf("Deleted corrupted file, next update check will re-download")
+					u.logger.Printf("Deleted corrupted file, restarting update check")
+					u.restartCheckAfterCorruptFile()
+					return
 				}
 			}
 
@@ -1038,6 +1042,27 @@ func (u *Updater) updateCheckLoop() {
 			u.checkForUpdates()
 		}
 	}
+}
+
+// restartCheckAfterCorruptFile clears the current status to idle after a
+// corrupted file was deleted, so the error status doesn't block further
+// checks. If periodic checks are enabled, also kicks off an immediate check
+// in a new goroutine so a fresh download can be attempted right away.
+// With CheckInterval=0 (auto-checks disabled), we don't self-trigger and
+// wait for the next manual trigger.
+func (u *Updater) restartCheckAfterCorruptFile() {
+	if err := u.status.SetIdle(u.ctx); err != nil {
+		u.logger.Printf("Failed to clear status after corrupt file: %v", err)
+		return
+	}
+	if u.config.CheckInterval == 0 {
+		return
+	}
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		u.checkForUpdates()
+	}()
 }
 
 // checkForUpdates checks for updates and initiates the update process if updates are available
@@ -1481,7 +1506,9 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string) {
 			if removeErr := u.mender.RemoveFile(filePath); removeErr != nil {
 				u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
 			} else {
-				u.logger.Printf("Deleted corrupted file, next update check will re-download")
+				u.logger.Printf("Deleted corrupted file, restarting update check")
+				u.restartCheckAfterCorruptFile()
+				return
 			}
 		}
 
@@ -1943,7 +1970,9 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			if removeErr := u.mender.RemoveFile(finalMenderPath); removeErr != nil {
 				u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
 			} else {
-				u.logger.Printf("Deleted corrupted file, next update check will re-download")
+				u.logger.Printf("Deleted corrupted file, restarting update check")
+				u.restartCheckAfterCorruptFile()
+				return
 			}
 		}
 
