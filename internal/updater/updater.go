@@ -759,6 +759,22 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 
 	if err := u.mender.Install(source, u.menderInstallProgressCb()); err != nil {
 		u.logger.Printf("Failed to install update from file %s: %v", source, err)
+
+		errStr := err.Error()
+		isCorruptionError := strings.Contains(errStr, "gzip") ||
+			strings.Contains(errStr, "checksum") ||
+			strings.Contains(errStr, "corrupt") ||
+			strings.Contains(errStr, "truncated")
+
+		if isCorruptionError {
+			u.logger.Printf("Installation failed due to file corruption, deleting corrupted file: %s", source)
+			if removeErr := u.mender.RemoveFile(source); removeErr != nil {
+				u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
+			} else {
+				u.logger.Printf("Deleted corrupted file, next update check will re-download")
+			}
+		}
+
 		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update from file %s: %v", source, err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
