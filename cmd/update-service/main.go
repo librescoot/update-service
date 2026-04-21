@@ -21,19 +21,19 @@ import (
 var version = "dev"
 
 var (
-	redisAddr         = flag.String("redis-addr", "localhost:6379", "Redis server address")
-	releasesURL = flag.String("releases-url", "https://downloads.librescoot.org/releases", "Release index base URL")
-	checkInterval     = flag.Duration("check-interval", 6*time.Hour, "Interval between update checks (use 0 or 'never' to disable)")
-	component         = flag.String("component", "", "Component to manage updates for (mdb or dbc)")
-	channel           = flag.String("channel", "nightly", "Update channel (stable, testing, nightly)")
-	downloadDir       = flag.String("download-dir", "", "Download directory for OTA files (default: /data/ota/{component})")
-	dryRun            = flag.Bool("dry-run", false, "If true, don't actually reboot, just notify")
-	showVersion       = flag.Bool("version", false, "Print version and exit")
-	bootUpdate        = flag.Bool("boot-update", false, "Enable boot partition updates")
-	bootMountPoint    = flag.String("boot-mount", "/uboot", "Boot partition mount point")
-	bootDevice        = flag.String("boot-device", "", "U-Boot device path (auto-detected from mount if empty)")
-	bootDTB           = flag.String("boot-dtb", "", "DTB filename (default: librescoot-{component}.dtb)")
-	bootUBootSeek     = flag.Int64("boot-uboot-seek", 2, "512-byte blocks to seek before writing U-Boot")
+	redisAddr      = flag.String("redis-addr", "localhost:6379", "Redis server address")
+	releasesURL    = flag.String("releases-url", "https://downloads.librescoot.org/releases", "Release index base URL")
+	checkInterval  = flag.Duration("check-interval", 6*time.Hour, "Interval between update checks (use 0 or 'never' to disable)")
+	component      = flag.String("component", "", "Component to manage updates for (mdb or dbc)")
+	channel        = flag.String("channel", "nightly", "Update channel (stable, testing, nightly)")
+	downloadDir    = flag.String("download-dir", "", "Download directory for OTA files (default: /data/ota/{component})")
+	dryRun         = flag.Bool("dry-run", false, "If true, don't actually reboot, just notify")
+	showVersion    = flag.Bool("version", false, "Print version and exit")
+	bootUpdate     = flag.Bool("boot-update", false, "Enable boot partition updates")
+	bootMountPoint = flag.String("boot-mount", "/uboot", "Boot partition mount point")
+	bootDevice     = flag.String("boot-device", "", "Base eMMC device (e.g. /dev/mmcblk3); auto-detected from mount if empty")
+	bootDTB        = flag.String("boot-dtb", "", "DTB filename (default: librescoot-{component}.dtb)")
+	bootUBootSeek  = flag.Int64("boot-uboot-seek", 2, "512-byte blocks to seek before writing U-Boot")
 )
 
 func main() {

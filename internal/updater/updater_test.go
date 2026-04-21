@@ -32,9 +32,9 @@ func TestUpdateCheckMutex_PreventsConcurrentChecks(t *testing.T) {
 
 func TestCorruptionErrorDetection(t *testing.T) {
 	testCases := []struct {
-		name           string
-		errorMsg       string
-		isCorruption   bool
+		name         string
+		errorMsg     string
+		isCorruption bool
 	}{
 		{
 			name:         "gzip decompression error",
