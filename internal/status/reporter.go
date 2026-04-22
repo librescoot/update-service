@@ -25,6 +25,15 @@ const (
 // Every state transition writes all affected fields in a single SetMany call,
 // so consumers (e.g. "lsc ota watch") never see an inconsistent snapshot such
 // as status=downloading without download-progress.
+//
+// State transitions use ipc.Sync() so they are ordered in Redis in the order
+// the caller issued them. Without this, back-to-back transitions like
+// SetDownloading followed by SetInstalling for a local-file install can land
+// in reverse order (HashPublisher async fires one goroutine per call with no
+// ordering guarantee), leaving Redis stuck on "downloading" while the service
+// is actually installing. Partial progress updates stay async because they
+// are frequent and eventually consistent: the next update corrects any
+// staleness.
 type Reporter struct {
 	pub       *ipc.HashPublisher
 	component string
@@ -70,7 +79,7 @@ func (r *Reporter) SetIdle(ctx context.Context) error {
 		r.key("install-progress"):  "",
 		r.key("error"):             "",
 		r.key("error-message"):     "",
-	})
+	}, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set idle for %s: %w", r.component, err)
 	}
@@ -91,7 +100,7 @@ func (r *Reporter) SetDownloading(ctx context.Context, version, method string) e
 		r.key("install-progress"):  0,
 		r.key("error"):             "",
 		r.key("error-message"):     "",
-	})
+	}, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set downloading for %s: %w", r.component, err)
 	}
@@ -108,7 +117,7 @@ func (r *Reporter) SetPreparing(ctx context.Context) error {
 		r.key("download-bytes"):    "",
 		r.key("download-total"):    "",
 		r.key("install-progress"):  0,
-	})
+	}, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set preparing for %s: %w", r.component, err)
 	}
@@ -125,7 +134,7 @@ func (r *Reporter) SetInstalling(ctx context.Context) error {
 		r.key("download-bytes"):    "",
 		r.key("download-total"):    "",
 		r.key("install-progress"):  0,
-	})
+	}, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set installing for %s: %w", r.component, err)
 	}
@@ -142,7 +151,7 @@ func (r *Reporter) SetPendingReboot(ctx context.Context) error {
 		r.key("download-bytes"):    "",
 		r.key("download-total"):    "",
 		r.key("install-progress"):  "",
-	})
+	}, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set pending-reboot for %s: %w", r.component, err)
 	}
@@ -161,7 +170,7 @@ func (r *Reporter) SetError(ctx context.Context, errorType, errorMessage string)
 		r.key("download-bytes"):    "",
 		r.key("download-total"):    "",
 		r.key("install-progress"):  "",
-	})
+	}, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set error for %s: %w", r.component, err)
 	}
@@ -194,7 +203,7 @@ func (r *Reporter) SetInstallProgress(ctx context.Context, percent int) error {
 // SetUpdateVersion updates the target version without changing other fields.
 // Used when the target version changes mid-update (e.g., additional deltas found).
 func (r *Reporter) SetUpdateVersion(ctx context.Context, version string) error {
-	err := r.pub.Set(r.key("update-version"), version)
+	err := r.pub.Set(r.key("update-version"), version, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set update version for %s: %w", r.component, err)
 	}
@@ -215,7 +224,7 @@ func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
 		r.key("install-progress"):  "",
 		r.key("error"):             "",
 		r.key("error-message"):     "",
-	})
+	}, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("initialize OTA keys for %s: %w", r.component, err)
 	}
