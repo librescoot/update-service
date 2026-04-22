@@ -185,7 +185,6 @@ func (r *Reporter) SetDownloadProgress(ctx context.Context, downloaded, total in
 	})
 }
 
-
 // SetInstallProgress updates the install/delta application progress (0-100).
 // Status is not changed — this is a partial update called frequently during install.
 func (r *Reporter) SetInstallProgress(ctx context.Context, percent int) error {
