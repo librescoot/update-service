@@ -106,7 +106,7 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		bootUpdater:          bootUpdater,
 		bootStatus:           bootStatusReporter,
 		dbcStatus:            dbcStatusReporter,
-		githubAPI:            NewGitHubAPI(updaterCtx, cfg.ReleasesURL, cfg.Channel, logger),
+		githubAPI:            NewGitHubAPI(updaterCtx, cfg.ReleasesURL, logger),
 		logger:               logger,
 		ctx:                  updaterCtx,
 		cancel:               cancel,
@@ -1136,7 +1136,7 @@ func (u *Updater) checkForUpdates() {
 	}
 
 	// Get releases from GitHub
-	releases, err := u.githubAPI.GetReleases()
+	releases, err := u.githubAPI.GetReleases(u.config.Channel)
 	if err != nil {
 		u.logger.Printf("Failed to get releases: %v", err)
 		return
@@ -1883,7 +1883,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	if u.ctx.Err() != nil {
 		return
 	}
-	freshReleases, err := u.githubAPI.GetReleases()
+	freshReleases, err := u.githubAPI.GetReleases(u.config.Channel)
 	if err != nil {
 		u.logger.Printf("Warning: Failed to check for new releases: %v (proceeding with install)", err)
 	} else {
@@ -1952,7 +1952,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	// version rather than installing something already stale.
 	// isRecheck guards against looping if nightlies publish faster than deltas apply.
 	if !isRecheck {
-		recheckReleases, err := u.githubAPI.GetReleases()
+		recheckReleases, err := u.githubAPI.GetReleases(u.config.Channel)
 		if err != nil {
 			u.logger.Printf("Re-check API call failed: %v (proceeding with install)", err)
 		} else if newerChain, err := u.buildDeltaChain(recheckReleases, workingVersion, u.config.Channel, variantID); err == nil && len(newerChain) > 0 {

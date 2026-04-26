@@ -38,7 +38,6 @@ type Release struct {
 type GitHubAPI struct {
 	ctx     context.Context
 	baseURL string
-	channel string
 	client  *http.Client
 	logger  Logger
 }
@@ -49,18 +48,19 @@ type Logger interface {
 }
 
 // NewGitHubAPI creates a new release index client
-func NewGitHubAPI(ctx context.Context, baseURL, channel string, logger Logger) *GitHubAPI {
+func NewGitHubAPI(ctx context.Context, baseURL string, logger Logger) *GitHubAPI {
 	return &GitHubAPI{
 		ctx:     ctx,
 		baseURL: baseURL,
-		channel: channel,
 		client:  &http.Client{Timeout: 10 * time.Second},
 		logger:  logger,
 	}
 }
 
-// GetReleases fetches releases from the GitHub API with exponential backoff retries
-func (g *GitHubAPI) GetReleases() ([]Release, error) {
+// GetReleases fetches releases for the given channel with exponential backoff retries.
+// The channel is passed per-call rather than cached so runtime channel switches via
+// Redis settings take effect on the next check without restarting the service.
+func (g *GitHubAPI) GetReleases(channel string) ([]Release, error) {
 	var (
 		resp      *http.Response
 		err       error
@@ -71,7 +71,7 @@ func (g *GitHubAPI) GetReleases() ([]Release, error) {
 	)
 
 	// Create the request outside the retry loop
-	url := g.baseURL + "/" + g.channel + ".json"
+	url := g.baseURL + "/" + channel + ".json"
 
 	req, err := http.NewRequestWithContext(g.ctx, "GET", url, nil)
 	if err != nil {
