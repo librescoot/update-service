@@ -25,7 +25,7 @@ var (
 	releasesURL    = flag.String("releases-url", "https://downloads.librescoot.org/releases", "Release index base URL")
 	checkInterval  = flag.Duration("check-interval", 6*time.Hour, "Interval between update checks (use 0 or 'never' to disable)")
 	component      = flag.String("component", "", "Component to manage updates for (mdb or dbc)")
-	channel        = flag.String("channel", "nightly", "Update channel (stable, testing, nightly)")
+	channel        = flag.String("channel", "", "Update channel (stable, testing, nightly); inferred from installed version when omitted")
 	downloadDir    = flag.String("download-dir", "", "Download directory for OTA files (default: /data/ota/{component})")
 	dryRun         = flag.Bool("dry-run", false, "If true, don't actually reboot, just notify")
 	showVersion    = flag.Bool("version", false, "Print version and exit")
@@ -98,14 +98,12 @@ func main() {
 		detectedChannel = config.InferChannelFromVersion(installedVersion)
 	}
 
-	// Determine the effective channel: CLI flag > Redis > detected > "nightly" default
+	// Determine the effective channel: CLI flag > Redis > detected.
+	// No silent fallback: custom-nightly and other unrecognized version
+	// strings must not be auto-promoted onto the regular nightly stream.
 	effectiveChannel := *channel
-	if !cliChannelSet {
-		if detectedChannel != "" {
-			effectiveChannel = detectedChannel
-		} else {
-			effectiveChannel = "nightly"
-		}
+	if !cliChannelSet && detectedChannel != "" {
+		effectiveChannel = detectedChannel
 	}
 
 	// Initialize config with CLI flags and detected/default values
@@ -155,6 +153,14 @@ func main() {
 	}
 	if cliDryRunSet {
 		cfg.DryRun = cliDryRun
+	}
+
+	// Refuse to run without a usable channel. This guards custom-nightly and
+	// other off-stream builds from being silently treated as nightly.
+	if !config.IsValidChannel(cfg.Channel) {
+		logger.Fatalf("No update channel configured for %s (installed version: %q). "+
+			"Set settings.updates.%s.channel in Redis or pass --channel.",
+			*component, installedVersion, *component)
 	}
 
 	// Initialize power inhibitor client
