@@ -1655,6 +1655,9 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		// Fall back to full update
 		latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
 		if found {
+			if !u.isUpdateNeeded(latestRelease) {
+				return
+			}
 			menderURL := u.findMenderAsset(latestRelease, variantID)
 			if menderURL != "" {
 				u.logger.Printf("Falling back to full update with latest version")
@@ -2075,6 +2078,9 @@ func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, reason str
 
 	latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
 	if found {
+		if !u.isUpdateNeeded(latestRelease) {
+			return
+		}
 		menderURL := u.findMenderAsset(latestRelease, variantID)
 		if menderURL != "" {
 			u.logger.Printf("Starting full update to %s", latestRelease.TagName)
@@ -2387,8 +2393,21 @@ func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, v
 	// Filter and sort releases for our channel and variant
 	var candidateReleases []Release
 	for _, release := range releases {
-		// Check if the release is for the specified channel
-		if !strings.HasPrefix(release.TagName, channel+"-") {
+		// Check if the release is for the specified channel.
+		// Mirrors findLatestRelease: stable uses non-prerelease "v*" tags,
+		// nightly/testing use prerelease tags with the channel- prefix.
+		match := false
+		switch channel {
+		case "nightly":
+			match = release.Prerelease && strings.HasPrefix(release.TagName, "nightly-")
+		case "testing":
+			match = release.Prerelease && strings.HasPrefix(release.TagName, "testing-")
+		case "stable":
+			match = !release.Prerelease && strings.HasPrefix(release.TagName, "v")
+		default:
+			match = strings.HasPrefix(release.TagName, channel+"-")
+		}
+		if !match {
 			continue
 		}
 
@@ -2406,14 +2425,23 @@ func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, v
 		}
 	}
 
-	// Sort releases by tag name (ascending chronological order)
+	// Sort releases ascending. Stable tags (vX.Y.Z) need numeric comparison
+	// — lexicographic puts v0.10.0 before v0.2.0. Nightly/testing tags embed
+	// a sortable timestamp (channel-YYYYMMDDThhmmss), so lex is correct.
 	sort.Slice(candidateReleases, func(i, j int) bool {
+		if channel == "stable" {
+			return compareVersions(candidateReleases[i].TagName, candidateReleases[j].TagName) < 0
+		}
 		return strings.ToLower(candidateReleases[i].TagName) < strings.ToLower(candidateReleases[j].TagName)
 	})
 
 	// Find where we are in the chain
 	currentTag := strings.ToLower(currentVersion)
-	if !strings.HasPrefix(currentTag, channel+"-") {
+	if channel == "stable" {
+		if !strings.HasPrefix(currentTag, "v") {
+			currentTag = "v" + currentTag
+		}
+	} else if !strings.HasPrefix(currentTag, channel+"-") {
 		currentTag = strings.ToLower(channel + "-" + currentVersion)
 	}
 	var deltaChain []Release
@@ -2426,7 +2454,13 @@ func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, v
 		}
 
 		// Collect all releases after current version
-		if foundCurrent && strings.ToLower(release.TagName) > currentTag {
+		newer := false
+		if channel == "stable" {
+			newer = compareVersions(release.TagName, currentTag) > 0
+		} else {
+			newer = strings.ToLower(release.TagName) > currentTag
+		}
+		if foundCurrent && newer {
 			deltaChain = append(deltaChain, release)
 		}
 	}
