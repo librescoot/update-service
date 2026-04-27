@@ -177,6 +177,9 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 		u.logger.Printf("Warning: Failed to cleanup stale temp dirs: %v", err)
 	}
 
+	// Remove leftover .mender files at /data/ota/ (legacy location, before per-component subdirs)
+	u.cleanupLegacyMenderFiles()
+
 	// Remove old .mender files, keeping only the newest one
 	u.mender.CleanupStaleMenderFiles()
 
@@ -423,6 +426,23 @@ func (u *Updater) recoverBootStatus() error {
 	}
 
 	return nil
+}
+
+// cleanupLegacyMenderFiles removes .mender files at /data/ota/ (non-recursive).
+// Per-component downloads now live in /data/ota/{component}/, so any .mender at
+// the top level is a leftover from older versions of the service.
+func (u *Updater) cleanupLegacyMenderFiles() {
+	matches, err := filepath.Glob("/data/ota/*.mender")
+	if err != nil {
+		u.logger.Printf("Warning: Failed to glob legacy mender files: %v", err)
+		return
+	}
+	for _, file := range matches {
+		u.logger.Printf("Removing legacy mender file: %s", file)
+		if err := os.Remove(file); err != nil {
+			u.logger.Printf("Warning: Failed to remove legacy mender file %s: %v", file, err)
+		}
+	}
 }
 
 // cleanupDeltaTempDirs removes stale temporary directories created by mender-apply-delta.py
