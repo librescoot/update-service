@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -120,16 +121,80 @@ func (m *Manager) cleanupOldFiles(currentURL string) error {
 
 // extractVersion extracts the version string (e.g. "nightly-20251226T091616") from a
 // mender filename like "librescoot-unu-mdb-nightly-20251226T091616.mender".
-// The version is the channel-timestamp suffix, which sorts lexicographically by time.
+// The version is the channel-version_token suffix.
 func extractVersion(filename string) string {
 	basename := strings.TrimSuffix(filepath.Base(filename), ".mender")
 	// The component prefix ends at the 3rd hyphen: librescoot-unu-mdb-
-	// Everything after that is the version: channel-timestamp
+	// Everything after that is the version: channel-version_token
 	parts := strings.SplitN(basename, "-", 4)
 	if len(parts) < 4 {
 		return ""
 	}
 	return parts[3]
+}
+
+// compareVersions compares two version strings as returned by extractVersion
+// (channel-token form, e.g. "stable-v0.7.0" or "nightly-20251226T091616").
+//
+// When both versions share the same channel and both tokens parse as
+// v-prefixed dotted semver, the comparison is semver-aware so that v0.10.0 >
+// v0.7.0. Otherwise (different channels, or non-semver tokens like ISO
+// timestamps), comparison falls back to lexicographic, which is correct for
+// timestamp-based versions and stable across channels.
+//
+// Returns -1, 0, or 1 for a<b, a==b, a>b.
+func compareVersions(a, b string) int {
+	aChannel, aToken := splitChannelToken(a)
+	bChannel, bToken := splitChannelToken(b)
+	if aChannel == bChannel {
+		if aOK, aParts := parseSemver(aToken); aOK {
+			if bOK, bParts := parseSemver(bToken); bOK {
+				for i := range 3 {
+					if aParts[i] != bParts[i] {
+						if aParts[i] < bParts[i] {
+							return -1
+						}
+						return 1
+					}
+				}
+				return 0
+			}
+		}
+	}
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
+}
+
+func splitChannelToken(v string) (channel, token string) {
+	idx := strings.Index(v, "-")
+	if idx < 0 {
+		return "", v
+	}
+	return v[:idx], v[idx+1:]
+}
+
+func parseSemver(v string) (bool, [3]int) {
+	var out [3]int
+	if !strings.HasPrefix(v, "v") {
+		return false, out
+	}
+	parts := strings.Split(strings.TrimPrefix(v, "v"), ".")
+	if len(parts) != 3 {
+		return false, out
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return false, out
+		}
+		out[i] = n
+	}
+	return true, out
 }
 
 // CleanupStaleMenderFiles removes all but the newest .mender file in the download directory.
@@ -141,12 +206,13 @@ func (m *Manager) CleanupStaleMenderFiles() {
 		return
 	}
 
-	// Find the newest file by version embedded in filename
+	// Find the newest file by version embedded in filename. Comparison is
+	// semver-aware so v0.10.0 sorts above v0.7.0 (lex would invert that).
 	var newestFile string
 	var newestVersion string
 	for _, file := range files {
 		version := extractVersion(file)
-		if version > newestVersion {
+		if newestFile == "" || compareVersions(version, newestVersion) > 0 {
 			newestVersion = version
 			newestFile = file
 		}
@@ -249,7 +315,7 @@ func (m *Manager) FindLatestMenderFile(channel string) (path string, version str
 		}
 
 		ver := extractVersion(file)
-		if ver > newestVersion {
+		if newestFile == "" || compareVersions(ver, newestVersion) > 0 {
 			newestVersion = ver
 			newestFile = file
 		}
