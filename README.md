@@ -1,6 +1,8 @@
-# LibreScoot Update Service
+# Librescoot Update Service
 
-A service for managing over-the-air (OTA) updates for LibreScoot vehicles.
+A service for managing over-the-air (OTA) updates for Librescoot vehicles.
+
+Part of the [Librescoot](https://librescoot.org/) open-source platform.
 
 ## Overview
 
@@ -273,4 +275,11 @@ make host
 
 ## License
 
-[Affero GPL 3.0](LICENSE.md)
+This project is dual-licensed. The source code is available under the
+[GNU Affero General Public License v3.0][agpl-3.0].
+The maintainers reserve the right to grant separate licenses for commercial distribution; please contact the maintainers to discuss commercial licensing.
+
+[![AGPL v3][agpl-image]][agpl-3.0]
+
+[agpl-3.0]: https://www.gnu.org/licenses/agpl-3.0.en.html
+[agpl-image]: https://www.gnu.org/graphics/agplv3-88x31.png
