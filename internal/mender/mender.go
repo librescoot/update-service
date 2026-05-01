@@ -119,18 +119,34 @@ func (m *Manager) cleanupOldFiles(currentURL string) error {
 	return nil
 }
 
-// extractVersion extracts the version string (e.g. "nightly-20251226T091616") from a
-// mender filename like "librescoot-unu-mdb-nightly-20251226T091616.mender".
-// The version is the channel-version_token suffix.
+// extractVersion extracts the version string from a mender filename.
+// Stable filenames are "librescoot-unu-mdb-v1.0.0.mender" → "v1.0.0".
+// Nightly/testing filenames are "librescoot-unu-mdb-nightly-20251226T091616.mender"
+// → "nightly-20251226T091616".
 func extractVersion(filename string) string {
 	basename := strings.TrimSuffix(filepath.Base(filename), ".mender")
 	// The component prefix ends at the 3rd hyphen: librescoot-unu-mdb-
-	// Everything after that is the version: channel-version_token
 	parts := strings.SplitN(basename, "-", 4)
 	if len(parts) < 4 {
 		return ""
 	}
 	return parts[3]
+}
+
+// versionChannel returns the channel implied by a version token as produced by
+// extractVersion. Stable versions are bare semver ("v1.0.0"); nightly/testing
+// carry a "channel-" prefix. Returns "" if the channel cannot be determined.
+func versionChannel(version string) string {
+	if strings.HasPrefix(version, "nightly-") {
+		return "nightly"
+	}
+	if strings.HasPrefix(version, "testing-") {
+		return "testing"
+	}
+	if strings.HasPrefix(version, "v") || (len(version) > 0 && version[0] >= '0' && version[0] <= '9') {
+		return "stable"
+	}
+	return ""
 }
 
 // compareVersions compares two version strings as returned by extractVersion
@@ -302,19 +318,17 @@ func (m *Manager) FindLatestMenderFile(channel string) (path string, version str
 		return "", "", false
 	}
 
-	// Filter to files matching the channel and find the newest by version
+	// Filter to files matching the channel and find the newest by version.
+	// Stable filenames are "...-v1.0.0.mender" with no channel infix, so we
+	// classify by the extracted version token rather than substring matching.
 	var newestFile string
 	var newestVersion string
-	channelPrefix := channel + "-"
 
 	for _, file := range files {
-		basename := filepath.Base(file)
-		// Check if this file is for the right channel
-		if !strings.Contains(basename, channelPrefix) {
+		ver := extractVersion(file)
+		if ver == "" || versionChannel(ver) != channel {
 			continue
 		}
-
-		ver := extractVersion(file)
 		if newestFile == "" || compareVersions(ver, newestVersion) > 0 {
 			newestVersion = ver
 			newestFile = file
@@ -325,21 +339,8 @@ func (m *Manager) FindLatestMenderFile(channel string) (path string, version str
 		return "", "", false
 	}
 
-	// Extract version from filename
-	// Format: librescoot-unu-mdb-nightly-20251226T091616.mender
-	// We want: nightly-20251226T091616
-	basename := filepath.Base(newestFile)
-	basename = strings.TrimSuffix(basename, ".mender")
-
-	// Find the channel-timestamp pattern
-	if idx := strings.Index(basename, channelPrefix); idx >= 0 {
-		version = basename[idx:]
-		m.logger.Printf("Found latest mender file: %s (version: %s)", newestFile, version)
-		return newestFile, version, true
-	}
-
-	m.logger.Printf("Found latest mender file but couldn't extract version: %s", newestFile)
-	return newestFile, "", true
+	m.logger.Printf("Found latest mender file: %s (version: %s)", newestFile, newestVersion)
+	return newestFile, newestVersion, true
 }
 
 // ApplyDeltaUpdate applies a delta update to generate a new mender file
