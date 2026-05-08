@@ -96,13 +96,20 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		dbcStatusReporter = status.NewReporter(redisClient.GetClient(), "dbc", logger)
 	}
 
+	statusReporter := status.NewReporter(redisClient.GetClient(), cfg.Component, logger)
+	if cfg.Component == "dbc" {
+		// DBC owns the start-dbc/complete-dbc lifecycle, which lines up with
+		// the `blocking` semantic on the flat status fields.
+		statusReporter.EnableFlatStatus()
+	}
+
 	u := &Updater{
 		config:               cfg,
 		redis:                redisClient,
 		inhibitor:            inhibitorClient,
 		power:                powerClient,
 		mender:               mender.NewManager(downloadDir, logger),
-		status:               status.NewReporter(redisClient.GetClient(), cfg.Component, logger),
+		status:               statusReporter,
 		bootUpdater:          bootUpdater,
 		bootStatus:           bootStatusReporter,
 		dbcStatus:            dbcStatusReporter,
@@ -316,8 +323,13 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 		return fmt.Errorf("failed to get current status: %w", err)
 	}
 
-	// Nothing to recover if already idle or empty
+	// Nothing to recover if already idle or empty. Defensively clear flat
+	// status fields though — a previous run may have crashed mid-update
+	// and left stale `status` / `update-type` values behind.
 	if currentStatus == status.StatusIdle || currentStatus == "" {
+		if err := u.status.ClearFlat(u.ctx); err != nil {
+			u.logger.Printf("Warning: Failed to clear flat status on startup: %v", err)
+		}
 		return nil
 	}
 
