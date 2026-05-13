@@ -1,5 +1,5 @@
 [Unit]
-Description=LibreScoot Update Service (DBC)
+Description=Librescoot Update Service (DBC)
 After=network.target
 After=librescoot-version.service
 After=librescoot-settings.service

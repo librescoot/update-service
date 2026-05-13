@@ -1,5 +1,5 @@
 [Unit]
-Description=LibreScoot Update Service (MDB)
+Description=Librescoot Update Service (MDB)
 After=redis.service
 After=network-online.target
 After=librescoot-modem.service
