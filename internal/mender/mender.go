@@ -59,6 +59,13 @@ func (m *Manager) Install(filePath string, progressCb InstallProgressCallback) e
 	return m.installer.Install(filePath, progressCb)
 }
 
+// VerifyChecksum verifies a local file against a "sha256:<hex>" or "<hex>"
+// checksum string. Used for local-file installs, which don't go through
+// DownloadAndVerify.
+func (m *Manager) VerifyChecksum(filePath, checksum string) error {
+	return m.downloader.VerifyChecksum(filePath, checksum)
+}
+
 // Commit commits the installed update
 func (m *Manager) Commit() error {
 	return m.installer.Commit()

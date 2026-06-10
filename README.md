@@ -142,9 +142,9 @@ The update service listens for commands on the `scooter:update` list. Commands c
 
 #### Custom Update Sources
 - `update-from-file:/path/to/file.mender` - Update from a local Mender file
-- `update-from-file:/path/to/file.mender:sha256:checksum` - Update from local file with checksum verification
+- `update-from-file:/path/to/file.mender#sha256=checksum` - Update from local file with checksum verification
 - `update-from-url:https://example.com/file.mender` - Update from a remote URL
-- `update-from-url:https://example.com/file.mender:sha256:checksum` - Update from URL with checksum verification
+- `update-from-url:https://example.com/file.mender#sha256=checksum` - Update from URL with checksum verification
 
 **Examples:**
 ```bash
@@ -157,7 +157,7 @@ redis-cli LPUSH scooter:update check-now
 redis-cli LPUSH scooter:update:dbc "update-from-file:/data/ota/librescoot-unu-dbc-nightly-20251212T024719.mender"
 
 # Update from a URL with checksum verification
-redis-cli LPUSH scooter:update:dbc "update-from-url:https://github.com/librescoot/librescoot/releases/download/nightly-20251212T024719/librescoot-unu-dbc-nightly-20251212T024719.mender:sha256:abc123..."
+redis-cli LPUSH scooter:update:dbc "update-from-url:https://github.com/librescoot/librescoot/releases/download/nightly-20251212T024719/librescoot-unu-dbc-nightly-20251212T024719.mender#sha256=abc123..."
 
 # Update specific component only
 redis-cli LPUSH scooter:update:mdb "update-from-file:/data/ota/librescoot-unu-mdb-nightly-20251212T024719.mender"
@@ -175,7 +175,9 @@ redis-cli LPUSH scooter:update:mdb "update-from-file:/data/ota/librescoot-unu-md
 
 **Checksum Format:**
 - Only SHA256 checksums are supported
-- Format: `sha256:hexdigest` (e.g., `sha256:a1b2c3d4...`)
+- Preferred: append `#sha256=<hexdigest>` to the file path or URL (keeps URLs valid; the fragment is stripped before download)
+- Legacy `:sha256:<hexdigest>` is still accepted
+- Applies only to the `update-from-file` / `update-from-url` commands; scheduled channel updates are not checksum-verified
 
 **Note:** The `check-now` command is useful for:
 - Testing update functionality without waiting for the next scheduled check
