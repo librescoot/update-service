@@ -20,9 +20,10 @@ const (
 
 // Asset represents a release asset
 type Asset struct {
-	Name string `json:"name"`
-	Size int64  `json:"size"`
-	URL  string `json:"url"`
+	Name   string `json:"name"`
+	Size   int64  `json:"size"`
+	URL    string `json:"url"`
+	Sha256 string `json:"sha256"` // hex digest from the channel JSON; "" on older channels
 }
 
 // Release represents a GitHub release
