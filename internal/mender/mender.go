@@ -6,8 +6,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+
+	"github.com/librescoot/update-service/internal/version"
 )
 
 // Manager combines download and installation functionality for Mender updates
@@ -126,100 +127,6 @@ func (m *Manager) cleanupOldFiles(currentURL string) error {
 	return nil
 }
 
-// extractVersion extracts the version string from a mender filename.
-// Stable filenames are "librescoot-unu-mdb-v1.0.0.mender" → "v1.0.0".
-// Nightly/testing filenames are "librescoot-unu-mdb-nightly-20251226T091616.mender"
-// → "nightly-20251226T091616".
-func extractVersion(filename string) string {
-	basename := strings.TrimSuffix(filepath.Base(filename), ".mender")
-	// The component prefix ends at the 3rd hyphen: librescoot-unu-mdb-
-	parts := strings.SplitN(basename, "-", 4)
-	if len(parts) < 4 {
-		return ""
-	}
-	return parts[3]
-}
-
-// versionChannel returns the channel implied by a version token as produced by
-// extractVersion. Stable versions are bare semver ("v1.0.0"); nightly/testing
-// carry a "channel-" prefix. Returns "" if the channel cannot be determined.
-func versionChannel(version string) string {
-	if strings.HasPrefix(version, "nightly-") {
-		return "nightly"
-	}
-	if strings.HasPrefix(version, "testing-") {
-		return "testing"
-	}
-	if strings.HasPrefix(version, "v") || (len(version) > 0 && version[0] >= '0' && version[0] <= '9') {
-		return "stable"
-	}
-	return ""
-}
-
-// compareVersions compares two version strings as returned by extractVersion
-// (channel-token form, e.g. "stable-v0.7.0" or "nightly-20251226T091616").
-//
-// When both versions share the same channel and both tokens parse as
-// v-prefixed dotted semver, the comparison is semver-aware so that v0.10.0 >
-// v0.7.0. Otherwise (different channels, or non-semver tokens like ISO
-// timestamps), comparison falls back to lexicographic, which is correct for
-// timestamp-based versions and stable across channels.
-//
-// Returns -1, 0, or 1 for a<b, a==b, a>b.
-func compareVersions(a, b string) int {
-	aChannel, aToken := splitChannelToken(a)
-	bChannel, bToken := splitChannelToken(b)
-	if aChannel == bChannel {
-		if aOK, aParts := parseSemver(aToken); aOK {
-			if bOK, bParts := parseSemver(bToken); bOK {
-				for i := range 3 {
-					if aParts[i] != bParts[i] {
-						if aParts[i] < bParts[i] {
-							return -1
-						}
-						return 1
-					}
-				}
-				return 0
-			}
-		}
-	}
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	}
-	return 0
-}
-
-func splitChannelToken(v string) (channel, token string) {
-	idx := strings.Index(v, "-")
-	if idx < 0 {
-		return "", v
-	}
-	return v[:idx], v[idx+1:]
-}
-
-func parseSemver(v string) (bool, [3]int) {
-	var out [3]int
-	if !strings.HasPrefix(v, "v") {
-		return false, out
-	}
-	parts := strings.Split(strings.TrimPrefix(v, "v"), ".")
-	if len(parts) != 3 {
-		return false, out
-	}
-	for i, p := range parts {
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			return false, out
-		}
-		out[i] = n
-	}
-	return true, out
-}
-
 // CleanupStaleMenderFiles removes all but the newest .mender file in the download directory.
 // This is intended to be called on startup to reclaim disk space from old downloads.
 func (m *Manager) CleanupStaleMenderFiles() {
@@ -234,9 +141,9 @@ func (m *Manager) CleanupStaleMenderFiles() {
 	var newestFile string
 	var newestVersion string
 	for _, file := range files {
-		version := extractVersion(file)
-		if newestFile == "" || compareVersions(version, newestVersion) > 0 {
-			newestVersion = version
+		ver := version.FromFilename(file)
+		if newestFile == "" || version.Compare(ver, newestVersion) > 0 {
+			newestVersion = ver
 			newestFile = file
 		}
 	}
@@ -313,7 +220,7 @@ func (m *Manager) FindMenderFileForVersion(version string) (string, bool) {
 
 // FindLatestMenderFile finds the newest .mender file in the download directory for the given channel
 // Returns the path, extracted version, and whether a file was found
-func (m *Manager) FindLatestMenderFile(channel string) (path string, version string, found bool) {
+func (m *Manager) FindLatestMenderFile(channel string) (path string, menderVersion string, found bool) {
 	pattern := filepath.Join(m.downloader.downloadDir, "*.mender")
 	files, err := filepath.Glob(pattern)
 	if err != nil {
@@ -332,11 +239,11 @@ func (m *Manager) FindLatestMenderFile(channel string) (path string, version str
 	var newestVersion string
 
 	for _, file := range files {
-		ver := extractVersion(file)
-		if ver == "" || versionChannel(ver) != channel {
+		ver := version.FromFilename(file)
+		if ver == "" || version.Channel(ver) != channel {
 			continue
 		}
-		if newestFile == "" || compareVersions(ver, newestVersion) > 0 {
+		if newestFile == "" || version.Compare(ver, newestVersion) > 0 {
 			newestVersion = ver
 			newestFile = file
 		}

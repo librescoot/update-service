@@ -110,34 +110,6 @@ func TestManager_FindMenderFileForVersion(t *testing.T) {
 	}
 }
 
-func TestCompareVersions(t *testing.T) {
-	cases := []struct {
-		a, b string
-		want int
-	}{
-		// Stable: extractVersion produces bare semver ("v1.0.0"), no channel prefix.
-		// Same channel ("" / ""), so the semver path engages — must NOT lex-compare.
-		{"v0.7.0", "v0.10.0", -1},
-		{"v0.10.0", "v0.7.0", 1},
-		{"v1.0.0", "v0.99.99", 1},
-		{"v0.8.0", "v0.8.0", 0},
-
-		// Timestamp tokens: lex compare is correct.
-		{"nightly-20260101T120000", "nightly-20260415T120000", -1},
-		{"nightly-20260415T120000", "nightly-20260101T120000", 1},
-
-		// Cross-channel: falls back to lex (stable across runs is enough).
-		{"nightly-20260101T120000", "v0.7.0", -1},
-		{"v0.7.0", "nightly-20260101T120000", 1},
-	}
-	for _, c := range cases {
-		got := compareVersions(c.a, c.b)
-		if got != c.want {
-			t.Errorf("compareVersions(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
-		}
-	}
-}
-
 func TestManager_CleanupStaleMenderFiles_SemverAware(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "mender_test")
 	if err != nil {

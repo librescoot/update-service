@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/librescoot/update-service/internal/config"
+	"github.com/librescoot/update-service/internal/version"
 )
 
 const (
@@ -157,7 +158,7 @@ func (u *Updater) isVersionNewer(releaseTag, installedVersion, channel string) b
 		if !strings.HasPrefix(normInstalled, "v") {
 			normInstalled = "v" + normInstalled
 		}
-		return compareVersions(releaseTag, normInstalled) > 0
+		return version.Compare(releaseTag, normInstalled) > 0
 	}
 
 	// Nightly/testing: tags are like "nightly-20260407-abc123", lexicographic > means newer
