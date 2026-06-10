@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +18,7 @@ import (
 	"github.com/librescoot/update-service/internal/power"
 	"github.com/librescoot/update-service/internal/redis"
 	"github.com/librescoot/update-service/internal/status"
+	"github.com/librescoot/update-service/internal/version"
 )
 
 // Updater represents the component-aware update orchestrator
@@ -280,13 +280,12 @@ func (u *Updater) installPendingMenderFile(menderNeedsReboot bool) {
 		return
 	}
 
-	// Compare: if the mender file version matches the running version, nothing to do
-	if strings.ToLower(menderVersion) == strings.ToLower(currentVersion) {
-		return
-	}
-
-	// For nightly/testing, versions are timestamps — newer = lexicographically greater
-	if strings.ToLower(menderVersion) <= strings.ToLower(currentVersion) {
+	// Skip unless the pending file is strictly newer than the running version.
+	// version.Compare is semver-aware for stable (v0.9.0 < v0.10.0) and
+	// lexicographic for timestamp-based nightly/testing. The old lexicographic
+	// compare wrongly treated a stale stable build (v0.9.0 > v0.10.0) as newer
+	// and downgraded the scooter at startup.
+	if version.Compare(strings.ToLower(menderVersion), strings.ToLower(currentVersion)) <= 0 {
 		return
 	}
 
@@ -1342,7 +1341,7 @@ func (u *Updater) findLatestRelease(releases []Release, variantID, channel strin
 
 		// For stable, use semantic version comparison
 		if channel == "stable" {
-			if compareVersions(release.TagName, latestRelease.TagName) > 0 {
+			if version.Compare(release.TagName, latestRelease.TagName) > 0 {
 				latestRelease = release
 			}
 		} else {
@@ -1381,7 +1380,7 @@ func (u *Updater) isUpdateNeeded(release Release) bool {
 			normCurrent = "v" + normCurrent
 		}
 
-		if compareVersions(release.TagName, normCurrent) > 0 {
+		if version.Compare(release.TagName, normCurrent) > 0 {
 			u.logger.Printf("Update needed for %s (stable): current=%s, release=%s", u.config.Component, currentVersion, release.TagName)
 			return true
 		}
@@ -1411,49 +1410,6 @@ func (u *Updater) isUpdateNeeded(release Release) bool {
 
 	u.logger.Printf("No update needed for %s: current=%s, release=%s", u.config.Component, currentVersion, normalizedReleaseVersion)
 	return false
-}
-
-// compareVersions compares two version strings (v1, v2).
-// Returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal.
-// Assumes format vX.Y.Z or X.Y.Z
-func compareVersions(v1, v2 string) int {
-	v1 = strings.TrimPrefix(v1, "v")
-	v2 = strings.TrimPrefix(v2, "v")
-
-	parts1 := strings.Split(v1, ".")
-	parts2 := strings.Split(v2, ".")
-
-	maxLen := max(len(parts2), len(parts1))
-
-	for i := 0; i < maxLen; i++ {
-		var n1, n2 int
-		var err error
-
-		if i < len(parts1) {
-			n1, err = strconv.Atoi(parts1[i])
-			if err != nil {
-				// If not a number, treat as 0 or handle differently if needed
-				// For now, simple integer comparison
-				n1 = 0
-			}
-		}
-
-		if i < len(parts2) {
-			n2, err = strconv.Atoi(parts2[i])
-			if err != nil {
-				n2 = 0
-			}
-		}
-
-		if n1 > n2 {
-			return 1
-		}
-		if n1 < n2 {
-			return -1
-		}
-	}
-
-	return 0
 }
 
 // getCurrentVersion gets the current version for this component
@@ -2412,7 +2368,7 @@ func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, v
 	// a sortable timestamp (channel-YYYYMMDDThhmmss), so lex is correct.
 	sort.Slice(candidateReleases, func(i, j int) bool {
 		if channel == "stable" {
-			return compareVersions(candidateReleases[i].TagName, candidateReleases[j].TagName) < 0
+			return version.Compare(candidateReleases[i].TagName, candidateReleases[j].TagName) < 0
 		}
 		return strings.ToLower(candidateReleases[i].TagName) < strings.ToLower(candidateReleases[j].TagName)
 	})
@@ -2438,7 +2394,7 @@ func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, v
 		// Collect all releases after current version
 		newer := false
 		if channel == "stable" {
-			newer = compareVersions(release.TagName, currentTag) > 0
+			newer = version.Compare(release.TagName, currentTag) > 0
 		} else {
 			newer = strings.ToLower(release.TagName) > currentTag
 		}
