@@ -1865,7 +1865,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 				u.logger.Printf("Downloading delta %d/%d: %s (retry %d)", i+1, len(deltaChain), release.TagName, attempt)
 			}
 			var err error
-			deltaPath, err = u.mender.DownloadDelta(u.ctx, deltaURL, downloadProgressCallback)
+			deltaPath, err = u.mender.DownloadDelta(u.ctx, deltaURL, assetChecksum(release, deltaURL), downloadProgressCallback)
 			if err == nil {
 				break
 			}
@@ -1970,7 +1970,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 				targetVersion := strings.ToLower(release.TagName)
 				u.logger.Printf("Additional delta %d/%d: %s -> %s", i+1, len(additionalChain), workingVersion, targetVersion)
 
-				deltaPath, err := u.mender.DownloadDelta(u.ctx, deltaURL, downloadProgressCallback)
+				deltaPath, err := u.mender.DownloadDelta(u.ctx, deltaURL, assetChecksum(release, deltaURL), downloadProgressCallback)
 				if err != nil {
 					if u.ctx.Err() != nil {
 						return

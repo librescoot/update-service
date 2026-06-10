@@ -395,10 +395,15 @@ func (m *Manager) ApplyDeltaUpdate(ctx context.Context, deltaURL, currentVersion
 
 // DownloadDelta downloads a delta file without applying it
 // Returns the path to the downloaded delta file
-func (m *Manager) DownloadDelta(ctx context.Context, deltaURL string, progressCallback ProgressCallback) (string, error) {
+func (m *Manager) DownloadDelta(ctx context.Context, deltaURL, checksum string, progressCallback ProgressCallback) (string, error) {
 	deltaPath, err := m.downloader.Download(ctx, deltaURL, progressCallback)
 	if err != nil {
 		return "", fmt.Errorf("failed to download delta file: %w", err)
+	}
+	if checksum != "" {
+		if err := m.downloader.VerifyChecksum(deltaPath, checksum); err != nil {
+			return "", fmt.Errorf("delta checksum verification failed: %w", err)
+		}
 	}
 	return deltaPath, nil
 }
