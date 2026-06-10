@@ -700,6 +700,18 @@ func (u *Updater) parseUpdateSource(source string) (string, string, bool) {
 	return src, checksum, u.isURL(src)
 }
 
+// assetChecksum returns the "sha256:<hex>" checksum for the release asset with
+// the given URL, taken from the channel JSON, or "" if absent (older channels
+// without checksums still install, just unverified).
+func assetChecksum(release Release, url string) string {
+	for _, a := range release.Assets {
+		if a.URL == url && a.Sha256 != "" {
+			return "sha256:" + a.Sha256
+		}
+	}
+	return ""
+}
+
 // isURL checks if the given string is a URL
 func (u *Updater) isURL(source string) bool {
 	return strings.HasPrefix(source, "http://") ||
@@ -1537,7 +1549,13 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string) {
 		}
 	}
 
-	filePath, err := u.mender.DownloadAndVerify(u.ctx, assetURL, "", progressCallback)
+	checksum := assetChecksum(release, assetURL)
+	if checksum != "" {
+		u.logger.Printf("Verifying download against channel checksum %s", checksum)
+	} else {
+		u.logger.Printf("No checksum in channel for %s; downloading unverified", assetURL)
+	}
+	filePath, err := u.mender.DownloadAndVerify(u.ctx, assetURL, checksum, progressCallback)
 	if err != nil {
 		u.logger.Printf("Failed to download update: %v", err)
 		if err := u.status.SetError(u.ctx, "download-failed", fmt.Sprintf("Failed to download update: %v", err)); err != nil {
