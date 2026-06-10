@@ -684,20 +684,20 @@ func (u *Updater) handleCommand(command string) {
 // parseUpdateSource parses an update source (file path or URL) and extracts optional checksum
 // Returns: (source, checksum, isURL)
 func (u *Updater) parseUpdateSource(source string) (string, string, bool) {
-	parts := strings.SplitN(source, ":", 3)
-
-	if len(parts) >= 2 && (parts[0] == "http" || parts[0] == "https" || parts[0] == "file") {
-		if len(parts) == 3 && parts[1] == "sha256" {
-			return parts[0] + ":" + parts[1], parts[2], true
-		}
-		return source, "", true
+	src, checksum := source, ""
+	// Optional checksum suffix, returned as "sha256:<hex>" (the format
+	// VerifyChecksum expects). Preferred "#sha256=<hex>" keeps the source a
+	// valid URL (a fragment HTTP clients strip); ":sha256:<hex>" is the legacy
+	// form. Match on the whole marker so the scheme colon in http(s):// or
+	// file:// isn't mistaken for the separator.
+	if idx := strings.Index(source, "#sha256="); idx != -1 {
+		src = source[:idx]
+		checksum = "sha256:" + source[idx+len("#sha256="):]
+	} else if idx := strings.Index(source, ":sha256:"); idx != -1 {
+		src = source[:idx]
+		checksum = "sha256:" + source[idx+len(":sha256:"):]
 	}
-
-	if len(parts) == 3 && parts[1] == "sha256" {
-		return parts[0], parts[2], false
-	}
-
-	return source, "", false
+	return src, checksum, u.isURL(src)
 }
 
 // isURL checks if the given string is a URL
@@ -710,7 +710,7 @@ func (u *Updater) isURL(source string) bool {
 // handleUpdateFromFile processes an update from a local file path
 // Supports format: /path/to/file.mender or /path/to/file.mender:sha256:checksum
 func (u *Updater) handleUpdateFromFile(filePath string) {
-	source, _, _ := u.parseUpdateSource(filePath)
+	source, checksum, _ := u.parseUpdateSource(filePath)
 	isURL := u.isURL(filePath)
 
 	if isURL {
@@ -792,6 +792,17 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 				u.logger.Printf("Failed to send complete-dbc command: %v", err)
 			}
 		}()
+	}
+
+	if checksum != "" {
+		u.logger.Printf("Verifying checksum for %s", source)
+		if err := u.mender.VerifyChecksum(source, checksum); err != nil {
+			u.logger.Printf("Checksum verification failed for %s: %v", source, err)
+			if err := u.status.SetError(u.ctx, "checksum-mismatch", fmt.Sprintf("Checksum verification failed: %v", err)); err != nil {
+				u.logger.Printf("Failed to set error status: %v", err)
+			}
+			return
+		}
 	}
 
 	if err := u.mender.Install(source, u.menderInstallProgressCb()); err != nil {
