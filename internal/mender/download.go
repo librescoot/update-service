@@ -162,6 +162,33 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 		return "", fmt.Errorf("error checking temporary file: %w", err)
 	}
 
+	// Before resuming, make sure the partial isn't already complete (or stale and
+	// oversized). A complete .tmp - left when a download wrote every byte but was
+	// killed before the rename, or when the asset was re-published smaller under
+	// the same name - would otherwise produce a Range request the server can't
+	// satisfy (HTTP 416). Mirror the finished-file check above: compare against the
+	// server's size and finalize or discard rather than emitting a bad range.
+	if fileSize > 0 {
+		if expectedSize, headErr := d.getExpectedFileSize(ctx, url); headErr != nil {
+			d.logger.Printf("Warning: could not verify partial against server size: %v (will attempt resume)", headErr)
+		} else if fileSize == expectedSize {
+			d.logger.Printf("Partial file already complete (%d bytes), finalizing without re-download", fileSize)
+			if err := os.Rename(downloadTempPath, finalPath); err != nil {
+				return "", fmt.Errorf("error finalizing complete partial: %w", err)
+			}
+			if progressCallback != nil {
+				progressCallback(fileSize, fileSize)
+			}
+			return finalPath, nil
+		} else if fileSize > expectedSize {
+			d.logger.Printf("Partial file (%d bytes) larger than asset (%d bytes), discarding and re-downloading", fileSize, expectedSize)
+			if err := os.Remove(downloadTempPath); err != nil {
+				return "", fmt.Errorf("error removing oversized partial: %w", err)
+			}
+			fileSize = 0
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", fmt.Errorf("error creating request: %w", err)
@@ -225,6 +252,21 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 		return "", fmt.Errorf("error downloading file after %d attempts: %w", maxRetries, err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		// Resume offset is at or past the asset's end, so the partial is already
+		// complete. We only reach here if the proactive size check above couldn't
+		// reach the server (HEAD failed); finalize the partial and let the caller's
+		// checksum verification catch a bad finalize.
+		d.logger.Printf("Server rejected resume range (416); treating %d-byte partial as complete", fileSize)
+		if err := os.Rename(downloadTempPath, finalPath); err != nil {
+			return "", fmt.Errorf("error finalizing partial after 416: %w", err)
+		}
+		if progressCallback != nil {
+			progressCallback(fileSize, fileSize)
+		}
+		return finalPath, nil
+	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)

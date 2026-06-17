@@ -172,6 +172,180 @@ func TestDownloader_DeletesOversizedFile(t *testing.T) {
 	}
 }
 
+// rangeAware416Server serves content with realistic Range semantics: a HEAD
+// returns Content-Length, a satisfiable Range returns 206, and an unsatisfiable
+// Range (start >= length) returns 416 with a Content-Range total, the way S3 /
+// GitHub release storage does.
+func rangeAware416Server(t *testing.T, content []byte) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+			return
+		}
+		if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+			var start int64
+			fmt.Sscanf(rangeHeader, "bytes=%d-", &start)
+			if start >= int64(len(content)) {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", len(content)))
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", int64(len(content))-start))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(content[start:])
+			return
+		}
+		w.Write(content)
+	}))
+}
+
+// A .tmp left at full size (download wrote every byte but the process died before
+// the rename) must be finalized, not abandoned. Resuming it sends an unsatisfiable
+// Range and the server answers 416; the downloader has to treat that as "already
+// complete" rather than a fatal error.
+func TestDownloader_FinalizesCompleteTmpOn416(t *testing.T) {
+	content := []byte("this is the complete file content for the 416 resume case")
+	server := rangeAware416Server(t, content)
+	defer server.Close()
+
+	tmpDir, err := os.MkdirTemp("", "download_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := log.New(os.Stdout, "test: ", 0)
+	downloader := NewDownloader(tmpDir, logger)
+
+	filename := "testfile.mender"
+	filePath := filepath.Join(tmpDir, filename)
+	tmpPath := filePath + ".tmp"
+	if err := os.WriteFile(tmpPath, content, 0644); err != nil {
+		t.Fatalf("Failed to create complete tmp file: %v", err)
+	}
+
+	result, err := downloader.Download(context.Background(), server.URL+"/"+filename, nil)
+	if err != nil {
+		t.Fatalf("Download failed: %v", err)
+	}
+	if result != filePath {
+		t.Errorf("Expected %s, got %s", filePath, result)
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+	if string(data) != string(content) {
+		t.Errorf("File content mismatch: got %q, want %q", string(data), string(content))
+	}
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Errorf("Expected .tmp to be renamed to final, but it still exists")
+	}
+}
+
+// A .tmp larger than the current server content (the asset was re-published smaller
+// under the same name) is stale: resuming sends an unsatisfiable Range -> 416. The
+// downloader must discard it and re-download fresh rather than failing.
+func TestDownloader_DiscardsOversizedTmpOn416(t *testing.T) {
+	content := []byte("short final content")
+	server := rangeAware416Server(t, content)
+	defer server.Close()
+
+	tmpDir, err := os.MkdirTemp("", "download_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := log.New(os.Stdout, "test: ", 0)
+	downloader := NewDownloader(tmpDir, logger)
+
+	filename := "testfile.mender"
+	filePath := filepath.Join(tmpDir, filename)
+	tmpPath := filePath + ".tmp"
+	oversized := []byte("this stale partial is much longer than the current server content")
+	if err := os.WriteFile(tmpPath, oversized, 0644); err != nil {
+		t.Fatalf("Failed to create oversized tmp file: %v", err)
+	}
+
+	result, err := downloader.Download(context.Background(), server.URL+"/"+filename, nil)
+	if err != nil {
+		t.Fatalf("Download failed: %v", err)
+	}
+	if result != filePath {
+		t.Errorf("Expected %s, got %s", filePath, result)
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+	if string(data) != string(content) {
+		t.Errorf("File content mismatch: got %q, want %q", string(data), string(content))
+	}
+}
+
+// When the server won't answer a HEAD with a usable Content-Length, the proactive
+// size check can't run, so a complete .tmp still triggers a 416 on resume. The
+// defensive 416 branch must finalize it rather than failing.
+func TestDownloader_Finalizes416WhenHeadUnavailable(t *testing.T) {
+	content := []byte("complete partial, but the server hides its size from HEAD")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			// No Content-Length: getExpectedFileSize fails, skipping the proactive check.
+			return
+		}
+		if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+			var start int64
+			fmt.Sscanf(rangeHeader, "bytes=%d-", &start)
+			if start >= int64(len(content)) {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", int64(len(content))-start))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(content[start:])
+			return
+		}
+		w.Write(content)
+	}))
+	defer server.Close()
+
+	tmpDir, err := os.MkdirTemp("", "download_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := log.New(os.Stdout, "test: ", 0)
+	downloader := NewDownloader(tmpDir, logger)
+
+	filename := "testfile.mender"
+	filePath := filepath.Join(tmpDir, filename)
+	tmpPath := filePath + ".tmp"
+	if err := os.WriteFile(tmpPath, content, 0644); err != nil {
+		t.Fatalf("Failed to create complete tmp file: %v", err)
+	}
+
+	result, err := downloader.Download(context.Background(), server.URL+"/"+filename, nil)
+	if err != nil {
+		t.Fatalf("Download failed: %v", err)
+	}
+	if result != filePath {
+		t.Errorf("Expected %s, got %s", filePath, result)
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+	if string(data) != string(content) {
+		t.Errorf("File content mismatch: got %q, want %q", string(data), string(content))
+	}
+}
+
 func TestGetExpectedFileSize(t *testing.T) {
 	content := []byte("test content for size check")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
