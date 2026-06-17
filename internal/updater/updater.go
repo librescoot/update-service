@@ -2,6 +2,7 @@ package updater
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -1836,6 +1837,18 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			deltaPath, err = u.mender.DownloadDelta(u.ctx, deltaURL, assetChecksum(release, deltaURL), downloadProgressCallback)
 			if err == nil {
 				break
+			}
+			if errors.Is(err, mender.ErrAssetUnavailable) {
+				// The release was pruned from the host; the chain can never complete.
+				// Stop retrying and fall back to a full update immediately.
+				u.logger.Printf("Delta asset for %s unavailable, falling back to full update: %v", release.TagName, err)
+				for j := range i {
+					if downloads[j].deltaPath != "" {
+						u.mender.CleanupDeltaFile(downloads[j].deltaPath)
+					}
+				}
+				u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("delta asset unavailable: %v", err))
+				return
 			}
 			if time.Now().After(downloadDeadline) {
 				u.logger.Printf("Download failed after %v of retries: %v", deltaDownloadMaxRetryDuration, err)

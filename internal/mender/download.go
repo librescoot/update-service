@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,13 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrAssetUnavailable means the server reported the asset as permanently gone
+// (404/410), e.g. an old release pruned from the download host. Callers should
+// treat this as non-retryable - retrying the same URL will never succeed, so a
+// delta chain should fall back to a full update immediately rather than waiting
+// out its retry deadline.
+var ErrAssetUnavailable = errors.New("release asset unavailable")
 
 // ProgressCallback is called during download to report progress
 // downloaded: bytes downloaded so far
@@ -266,6 +274,12 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 			progressCallback(fileSize, fileSize)
 		}
 		return finalPath, nil
+	}
+
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		// The asset is gone from the host (pruned old release). Retrying the same
+		// URL is futile; signal the caller to stop retrying and fall back.
+		return "", fmt.Errorf("%w: HTTP %d for %s", ErrAssetUnavailable, resp.StatusCode, url)
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {

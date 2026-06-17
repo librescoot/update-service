@@ -2,6 +2,7 @@ package mender
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -343,6 +344,80 @@ func TestDownloader_Finalizes416WhenHeadUnavailable(t *testing.T) {
 	}
 	if string(data) != string(content) {
 		t.Errorf("File content mismatch: got %q, want %q", string(data), string(content))
+	}
+}
+
+// A pruned release asset (gone from the download host) must surface as
+// ErrAssetUnavailable so the delta retry loop can fall back to a full update
+// immediately instead of spinning on a permanent error.
+func TestDownloader_ReportsAssetUnavailableOn404(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	tmpDir, err := os.MkdirTemp("", "download_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := log.New(os.Stdout, "test: ", 0)
+	downloader := NewDownloader(tmpDir, logger)
+
+	_, err = downloader.Download(context.Background(), server.URL+"/gone.delta", nil)
+	if !errors.Is(err, ErrAssetUnavailable) {
+		t.Fatalf("Expected ErrAssetUnavailable, got %v", err)
+	}
+}
+
+func TestDownloader_ReportsAssetUnavailableOn410(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusGone)
+	}))
+	defer server.Close()
+
+	tmpDir, err := os.MkdirTemp("", "download_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := log.New(os.Stdout, "test: ", 0)
+	downloader := NewDownloader(tmpDir, logger)
+
+	_, err = downloader.Download(context.Background(), server.URL+"/gone.delta", nil)
+	if !errors.Is(err, ErrAssetUnavailable) {
+		t.Fatalf("Expected ErrAssetUnavailable, got %v", err)
+	}
+}
+
+// Resuming a partial whose release was pruned must also report ErrAssetUnavailable
+// rather than hanging or falsely finalizing the stale partial.
+func TestDownloader_ReportsAssetUnavailableOnResume(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	tmpDir, err := os.MkdirTemp("", "download_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := log.New(os.Stdout, "test: ", 0)
+	downloader := NewDownloader(tmpDir, logger)
+
+	filename := "gone.delta"
+	tmpPath := filepath.Join(tmpDir, filename+".tmp")
+	if err := os.WriteFile(tmpPath, []byte("partial bytes from a now-deleted release"), 0644); err != nil {
+		t.Fatalf("Failed to create partial file: %v", err)
+	}
+
+	_, err = downloader.Download(context.Background(), server.URL+"/"+filename, nil)
+	if !errors.Is(err, ErrAssetUnavailable) {
+		t.Fatalf("Expected ErrAssetUnavailable, got %v", err)
 	}
 }
 
