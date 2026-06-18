@@ -7,9 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/librescoot/update-service/internal/version"
 )
+
+// deltaSanityEpoch guards the age-based delta reap against an unsynced boot
+// clock: until the wall clock is plausibly past this date, nothing age-reaps.
+var deltaSanityEpoch = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 
 // Manager combines download and installation functionality for Mender updates
 type Manager struct {
@@ -153,6 +158,66 @@ func (m *Manager) CleanupStaleMenderFiles() {
 			m.logger.Printf("Removing stale mender file: %s", file)
 			if err := os.Remove(file); err != nil {
 				m.logger.Printf("Warning: failed to remove stale mender file %s: %v", file, err)
+			}
+		}
+	}
+}
+
+// CleanupStaleDeltaFiles removes obsolete delta artifacts from the download
+// directory. The reference version is the newest LOCAL ".mender" token (a
+// download-dir artifact, not necessarily the running OS version). A delta is
+// reaped when it is provably superseded on the same channel (target version <=
+// reference, clock-independent), or as an age backstop for deltas the version
+// test cannot judge: cross-channel orphans, unparseable names, or the case
+// where the local base ".mender" is itself stale after a channel switch.
+func (m *Manager) CleanupStaleDeltaFiles(maxAge time.Duration) {
+	dir := m.downloader.downloadDir
+
+	// Reference: newest local .mender token. Computed here, not assumed to
+	// have been set by CleanupStaleMenderFiles (which is not always called first).
+	var referenceVersion string
+	menderFiles, _ := filepath.Glob(filepath.Join(dir, "*.mender"))
+	for _, file := range menderFiles {
+		ver := version.FromFilename(file)
+		if referenceVersion == "" || version.Compare(ver, referenceVersion) > 0 {
+			referenceVersion = ver
+		}
+	}
+	referenceChannel := version.Channel(referenceVersion)
+
+	// Include the resumable .delta.tmp partials: both call sites run with no
+	// concurrent download writer, so reaping a dead partial promptly is safe.
+	var candidates []string
+	for _, pattern := range []string{filepath.Join(dir, "*.delta"), filepath.Join(dir, "*.delta.tmp")} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		candidates = append(candidates, matches...)
+	}
+
+	now := time.Now()
+	for _, file := range candidates {
+		reap := false
+
+		dv := version.FromFilename(file)
+		dChan := version.Channel(dv)
+		if referenceVersion != "" && dv != "" && dChan == referenceChannel && version.Compare(dv, referenceVersion) <= 0 {
+			reap = true
+		}
+
+		if !reap {
+			if info, err := os.Stat(file); err == nil {
+				if now.After(deltaSanityEpoch) && info.ModTime().Before(now) && now.Sub(info.ModTime()) > maxAge {
+					reap = true
+				}
+			}
+		}
+
+		if reap {
+			m.logger.Printf("Removing stale delta file: %s", file)
+			if err := os.Remove(file); err != nil {
+				m.logger.Printf("Warning: failed to remove stale delta file %s: %v", file, err)
 			}
 		}
 	}

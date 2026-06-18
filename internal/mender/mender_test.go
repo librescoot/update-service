@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestManager_RemoveFile(t *testing.T) {
@@ -223,5 +224,224 @@ func TestManager_FindLatestMenderFile_NoMatch(t *testing.T) {
 	}
 	if _, _, found := manager.FindLatestMenderFile("testing"); found {
 		t.Errorf("expected no testing file in nightly-only directory")
+	}
+}
+
+func TestManager_CleanupStaleDeltaFiles(t *testing.T) {
+	const maxAge = 30 * 24 * time.Hour
+	freshMtime := time.Now()
+	oldMtime := time.Now().Add(-31 * 24 * time.Hour)
+	futureMtime := time.Now().Add(48 * time.Hour)
+
+	// Each spec'd file: name, mtime, and whether it must survive the call.
+	type fileSpec struct {
+		name  string
+		mtime time.Time
+		keep  bool
+	}
+
+	cases := []struct {
+		name  string
+		files []fileSpec
+	}{
+		// Same-channel version reap (fresh mtime, so age never fires).
+		{
+			name: "same-channel target older than ref",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-nightly-20260101T000000.delta", freshMtime, false},
+			},
+		},
+		{
+			name: "same-channel target equal to ref",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-nightly-20260428T013225.delta", freshMtime, false},
+			},
+		},
+		{
+			name: "same-channel equal-version partial",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-nightly-20260428T013225.delta.tmp", freshMtime, false},
+			},
+		},
+		{
+			name: "same-channel forward delta kept for reuse",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-nightly-20260601T000000.delta", freshMtime, true},
+			},
+		},
+		// Cross-channel: version path must not fire; fresh stays, old reaps via age.
+		{
+			name: "cross-channel stable delta vs nightly ref fresh",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-v0.8.0.delta", freshMtime, true},
+			},
+		},
+		{
+			name: "cross-channel testing delta vs nightly ref fresh",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-testing-20260428T013225.delta", freshMtime, true},
+			},
+		},
+		{
+			name: "cross-channel stable delta vs testing ref fresh",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-testing-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-v0.8.0.delta", freshMtime, true},
+			},
+		},
+		{
+			name: "cross-channel stable delta vs nightly ref old reaps via age",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-v0.8.0.delta", oldMtime, false},
+			},
+		},
+		// Empty / malformed token.
+		{
+			name: "malformed token fresh kept",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"garbage.delta", freshMtime, true},
+			},
+		},
+		{
+			name: "malformed token old reaps via age",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"garbage.delta", oldMtime, false},
+			},
+		},
+		// No-reference (age-only) mode.
+		{
+			name: "no reference fresh kept",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260101T000000.delta", freshMtime, true},
+			},
+		},
+		{
+			name: "no reference old reaps via age",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260101T000000.delta", oldMtime, false},
+			},
+		},
+		// Future-mtime guard: a future mtime must never age-reap.
+		{
+			name: "no reference future mtime kept",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260101T000000.delta", futureMtime, true},
+			},
+		},
+		// Multiple .mender files: the reference must be the NEWEST by version,
+		// not the first/last/oldest. With newest-wins the delta is <= ref on the
+		// same channel and reaps; an oldest-wins reference (20260101) would judge
+		// the delta as a forward delta (dv > ref) and wrongly keep it.
+		{
+			name: "newest of two mender files is the reference",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260101T000000.mender", freshMtime, true},
+				{"librescoot-unu-dbc-nightly-20260601T000000.mender", freshMtime, true},
+				{"librescoot-unu-dbc-nightly-20260301T000000.delta", freshMtime, false},
+			},
+		},
+		// Channel-switch-stale-base path (the case the doc comment calls out):
+		// the local base .mender is stale, and a same-channel delta is NEWER than
+		// it (dv > ref), so the version test declines to reap. Reaping must then
+		// fall through to the age backstop.
+		{
+			name: "stale base mender same-channel newer delta old reaps via age",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260101T000000.mender", freshMtime, true},
+				{"librescoot-unu-dbc-nightly-20260601T000000.delta", oldMtime, false},
+			},
+		},
+		{
+			name: "stale base mender same-channel newer delta fresh kept",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260101T000000.mender", freshMtime, true},
+				{"librescoot-unu-dbc-nightly-20260601T000000.delta", freshMtime, true},
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tmpDir, err := os.MkdirTemp("", "mender_delta_test")
+			if err != nil {
+				t.Fatalf("Failed to create temp dir: %v", err)
+			}
+			defer os.RemoveAll(tmpDir)
+
+			logger := log.New(os.Stdout, "test: ", 0)
+			manager := NewManager(tmpDir, logger)
+
+			for _, f := range c.files {
+				p := filepath.Join(tmpDir, f.name)
+				if err := os.WriteFile(p, []byte("x"), 0644); err != nil {
+					t.Fatalf("Failed to create %s: %v", f.name, err)
+				}
+				if err := os.Chtimes(p, f.mtime, f.mtime); err != nil {
+					t.Fatalf("Failed to set mtime on %s: %v", f.name, err)
+				}
+			}
+
+			manager.CleanupStaleDeltaFiles(maxAge)
+
+			for _, f := range c.files {
+				p := filepath.Join(tmpDir, f.name)
+				_, err := os.Stat(p)
+				if f.keep && err != nil {
+					t.Errorf("expected %s to survive, got err=%v", f.name, err)
+				}
+				if !f.keep && !os.IsNotExist(err) {
+					t.Errorf("expected %s to be reaped, got err=%v", f.name, err)
+				}
+			}
+		})
+	}
+}
+
+// When the wall clock has not advanced past deltaSanityEpoch (unsynced boot
+// clock), the age backstop must not reap anything, even an ancient mtime that
+// would otherwise exceed maxAge. The version path is unaffected; only the age
+// branch is gated by the epoch.
+func TestManager_CleanupStaleDeltaFiles_UnsyncedClock(t *testing.T) {
+	const maxAge = 30 * 24 * time.Hour
+
+	// Push the epoch into the future so now.After(deltaSanityEpoch) is false,
+	// simulating a boot clock that has not yet synced.
+	saved := deltaSanityEpoch
+	deltaSanityEpoch = time.Now().Add(365 * 24 * time.Hour)
+	defer func() { deltaSanityEpoch = saved }()
+
+	tmpDir, err := os.MkdirTemp("", "mender_delta_epoch_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := log.New(os.Stdout, "test: ", 0)
+	manager := NewManager(tmpDir, logger)
+
+	// No reference .mender, so only the age path could reap. With the epoch in
+	// the future, the age guard suppresses it and the ancient delta survives.
+	ancient := filepath.Join(tmpDir, "librescoot-unu-dbc-nightly-20260101T000000.delta")
+	if err := os.WriteFile(ancient, []byte("x"), 0644); err != nil {
+		t.Fatalf("Failed to create delta: %v", err)
+	}
+	oldMtime := time.Now().Add(-365 * 24 * time.Hour)
+	if err := os.Chtimes(ancient, oldMtime, oldMtime); err != nil {
+		t.Fatalf("Failed to set mtime: %v", err)
+	}
+
+	manager.CleanupStaleDeltaFiles(maxAge)
+
+	if _, err := os.Stat(ancient); err != nil {
+		t.Errorf("expected ancient delta to survive while clock is unsynced, got err=%v", err)
 	}
 }

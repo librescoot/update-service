@@ -185,11 +185,15 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 		u.logger.Printf("Warning: Failed to cleanup stale temp dirs: %v", err)
 	}
 
-	// Remove leftover .mender files at /data/ota/ (legacy location, before per-component subdirs)
-	u.cleanupLegacyMenderFiles()
+	// Remove leftover OTA artifacts at /data/ota/ (legacy location, before per-component subdirs)
+	u.cleanupLegacyOtaFiles()
 
 	// Remove old .mender files, keeping only the newest one
 	u.mender.CleanupStaleMenderFiles()
+
+	// Reap stale delta artifacts against the newest local .mender. Runs before
+	// any download goroutine launches, so there is no concurrent writer.
+	u.mender.CleanupStaleDeltaFiles(deltaMaxAge)
 
 	// Recover from any stuck status on startup
 	if err := u.recoverFromStuckState(menderNeedsReboot); err != nil {
@@ -440,19 +444,44 @@ func (u *Updater) recoverBootStatus() error {
 	return nil
 }
 
-// cleanupLegacyMenderFiles removes .mender files at /data/ota/ (non-recursive).
-// Per-component downloads now live in /data/ota/{component}/, so any .mender at
-// the top level is a leftover from older versions of the service.
-func (u *Updater) cleanupLegacyMenderFiles() {
-	matches, err := filepath.Glob("/data/ota/*.mender")
-	if err != nil {
-		u.logger.Printf("Warning: Failed to glob legacy mender files: %v", err)
-		return
+// cleanupLegacyOtaFiles removes leftover OTA artifacts (.mender, .mender.tmp,
+// .delta, .delta.tmp) at /data/ota/ (non-recursive). Per-component downloads now
+// live in /data/ota/{component}/, so any such file at the top level is a leftover
+// from older versions of the service.
+func (u *Updater) cleanupLegacyOtaFiles() {
+	removeLegacyOtaFiles("/data/ota", u.mender.GetDownloadDir(), u.logger)
+}
+
+// removeLegacyOtaFiles globs the four legacy OTA suffixes directly under baseDir
+// and removes each match. The glob MUST stay non-recursive: live per-component
+// downloads sit one level deeper at baseDir/{component}/ and must not be touched.
+// Any file whose parent dir equals downloadDir is skipped, so a misconfigured
+// DownloadDir pointing at baseDir itself cannot delete live downloads.
+func removeLegacyOtaFiles(baseDir, downloadDir string, logger *log.Logger) {
+	patterns := []string{
+		filepath.Join(baseDir, "*.mender"),
+		filepath.Join(baseDir, "*.mender.tmp"),
+		filepath.Join(baseDir, "*.delta"),
+		filepath.Join(baseDir, "*.delta.tmp"),
 	}
-	for _, file := range matches {
-		u.logger.Printf("Removing legacy mender file: %s", file)
-		if err := os.Remove(file); err != nil {
-			u.logger.Printf("Warning: Failed to remove legacy mender file %s: %v", file, err)
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			if logger != nil {
+				logger.Printf("Warning: Failed to glob legacy OTA files %q: %v", pattern, err)
+			}
+			continue
+		}
+		for _, file := range matches {
+			if filepath.Clean(filepath.Dir(file)) == filepath.Clean(downloadDir) {
+				continue
+			}
+			if logger != nil {
+				logger.Printf("Removing legacy OTA file: %s", file)
+			}
+			if err := os.Remove(file); err != nil && logger != nil {
+				logger.Printf("Warning: Failed to remove legacy OTA file %s: %v", file, err)
+			}
 		}
 	}
 }
@@ -1572,6 +1601,10 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string) {
 
 	u.logger.Printf("Successfully installed update")
 
+	// The downloaded target is now the newest local .mender; reap any deltas it
+	// supersedes before rebooting.
+	u.mender.CleanupStaleDeltaFiles(deltaMaxAge)
+
 	// Step 5: Set pending-reboot status and prepare for reboot
 	if err := u.status.SetPendingReboot(u.ctx); err != nil {
 		u.logger.Printf("Failed to set pending-reboot status: %v", err)
@@ -1637,6 +1670,11 @@ const deltaDownloadRetryInterval = 5 * time.Minute
 // may have intermittent connectivity; 15 minutes covers most transient outages.
 // Can safely be raised to 24*time.Hour for very patient update behaviour.
 const deltaDownloadMaxRetryDuration = 15 * time.Minute
+
+// deltaMaxAge is the age backstop for delta garbage collection: a delta the
+// version test cannot judge (cross-channel, unparseable) is reaped once it is
+// older than this.
+const deltaMaxAge = 30 * 24 * time.Hour
 
 func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string, isRecheck bool) {
 	// The recursive re-check call at the end of this function runs inside the
@@ -2050,6 +2088,10 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 
 	u.logger.Printf("Successfully installed delta update")
+
+	// The assembled target mender is the newest local .mender and consumed chain
+	// deltas are gone; reap remaining superseded deltas before rebooting.
+	u.mender.CleanupStaleDeltaFiles(deltaMaxAge)
 
 	// Step 5: Set pending-reboot status and prepare for reboot
 	if err := u.status.SetPendingReboot(u.ctx); err != nil {

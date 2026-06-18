@@ -36,6 +36,11 @@ func TestFromFilename(t *testing.T) {
 		{"librescoot-unu-dbc-nightly-20251226T091616.mender", "nightly-20251226T091616"},
 		{"/data/ota/librescoot-unu-mdb-testing-20260101T000000.mender", "testing-20260101T000000"},
 		{"too-short.mender", ""},
+		{"librescoot-unu-dbc-nightly-20260428T013225.delta", "nightly-20260428T013225"},
+		{"librescoot-unu-dbc-nightly-20260428T013225.delta.tmp", "nightly-20260428T013225"},
+		{"librescoot-unu-mdb-v1.0.0.mender.tmp", "v1.0.0"},
+		{"librescoot-unu-dbc-v0.8.0.delta", "v0.8.0"},
+		{"too-short.delta", ""},
 	}
 	for _, c := range cases {
 		if got := FromFilename(c.in); got != c.want {

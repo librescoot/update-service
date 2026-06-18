@@ -1,9 +1,81 @@
 package updater
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 )
+
+func TestRemoveLegacyOtaFiles(t *testing.T) {
+	baseDir, err := os.MkdirTemp("", "legacy_ota_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(baseDir)
+
+	subDir := filepath.Join(baseDir, "dbc")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatalf("Failed to create subdir: %v", err)
+	}
+
+	// Top-level legacy artifacts that must be reaped.
+	reaped := []string{
+		"librescoot-unu-mdb-v1.0.0.mender",
+		"librescoot-unu-mdb-v1.0.0.mender.tmp",
+		"librescoot-unu-mdb-nightly-20260101T000000.delta",
+		"librescoot-unu-mdb-nightly-20260101T000000.delta.tmp",
+	}
+	// Files that must survive: live per-component download one level deeper,
+	// and an unrelated top-level file.
+	kept := []string{
+		filepath.Join("dbc", "librescoot-unu-dbc-v1.0.0.mender"),
+		"keepme.txt",
+	}
+
+	for _, f := range append(append([]string{}, reaped...), kept...) {
+		p := filepath.Join(baseDir, f)
+		if err := os.WriteFile(p, []byte("x"), 0644); err != nil {
+			t.Fatalf("Failed to create %s: %v", f, err)
+		}
+	}
+
+	// downloadDir points at the per-component subdir, matching normal config, so
+	// the parent-equals-downloadDir guard is a no-op here.
+	removeLegacyOtaFiles(baseDir, subDir, nil)
+
+	for _, f := range reaped {
+		if _, err := os.Stat(filepath.Join(baseDir, f)); !os.IsNotExist(err) {
+			t.Errorf("expected %s to be removed, got err=%v", f, err)
+		}
+	}
+	for _, f := range kept {
+		if _, err := os.Stat(filepath.Join(baseDir, f)); err != nil {
+			t.Errorf("expected %s to survive, got err=%v", f, err)
+		}
+	}
+}
+
+func TestRemoveLegacyOtaFiles_SkipsActiveDownloadDir(t *testing.T) {
+	baseDir, err := os.MkdirTemp("", "legacy_ota_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(baseDir)
+
+	// Misconfigured DownloadDir pointing at the legacy base itself: live
+	// downloads sit directly at baseDir and must NOT be reaped.
+	live := filepath.Join(baseDir, "librescoot-unu-mdb-v1.0.0.mender")
+	if err := os.WriteFile(live, []byte("x"), 0644); err != nil {
+		t.Fatalf("Failed to create %s: %v", live, err)
+	}
+
+	removeLegacyOtaFiles(baseDir, baseDir, nil)
+
+	if _, err := os.Stat(live); err != nil {
+		t.Errorf("expected live download %s to survive, got err=%v", live, err)
+	}
+}
 
 func TestUpdateCheckMutex_PreventsConcurrentChecks(t *testing.T) {
 	// Test that TryLock prevents concurrent access
