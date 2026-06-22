@@ -2,6 +2,7 @@ package redis
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	ipc "github.com/librescoot/redis-ipc"
@@ -146,14 +147,31 @@ func (c *Client) GetVehicleStateWithTimestamp(vehicleHashKey string) (string, ti
 
 	var timestamp time.Time
 	if result[1] != nil {
-		if ts, ok := result[1].(string); ok && ts != "" {
-			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
-				timestamp = parsed
-			}
+		if ts, ok := result[1].(string); ok {
+			timestamp = parseVehicleTimestamp(ts)
 		}
 	}
 
 	return state, timestamp, nil
+}
+
+// parseVehicleTimestamp parses the vehicle state:timestamp field, which is
+// written by vehicle-service via redis-ipc SetWithTimestamp. The encoding
+// depends on the redis-ipc version on the writer: RFC3339 (>= v0.11) or Unix
+// milliseconds (<= v0.10). Handle both so the standby timer anchors on the real
+// state-entry time on either format; returns the zero time when unparseable so
+// callers fall back to time.Now().
+func parseVehicleTimestamp(ts string) time.Time {
+	if ts == "" {
+		return time.Time{}
+	}
+	if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+		return parsed
+	}
+	if ms, err := strconv.ParseInt(ts, 10, 64); err == nil && ms > 0 {
+		return time.UnixMilli(ms)
+	}
+	return time.Time{}
 }
 
 // NewVehicleWatcher creates a HashWatcher for the vehicle hash
