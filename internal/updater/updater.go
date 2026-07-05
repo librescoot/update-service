@@ -1494,14 +1494,9 @@ func (u *Updater) checkForUpdates() {
 
 	// Find the .mender asset for the variant
 	var assetURL string
-	for _, asset := range release.Assets {
-		// Match assets by variant_id (e.g., "unu-mdb", "unu-dbc", "rpi5")
-		// Asset names should be like: librescoot-{variant_id}-{timestamp}.mender
-		if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".mender") {
-			assetURL = asset.URL
-			u.logger.Printf("Found matching asset: %s", asset.Name)
-			break
-		}
+	if asset, ok := releaseAsset(release, variantID, ".mender"); ok {
+		assetURL = asset.URL
+		u.logger.Printf("Found matching asset: %s", asset.Name)
 	}
 
 	if assetURL == "" {
@@ -1573,13 +1568,7 @@ func (u *Updater) findLatestRelease(releases []Release, variantID, channel strin
 		}
 
 		// Check if the release has assets for the specified variant
-		hasVariantAsset := false
-		for _, asset := range release.Assets {
-			if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".mender") {
-				hasVariantAsset = true
-				break
-			}
-		}
+		_, hasVariantAsset := releaseAsset(release, variantID, ".mender")
 
 		if !hasVariantAsset {
 			continue
@@ -1945,22 +1934,16 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	// Calculate total delta size and compare with full update size
 	var totalDeltaSize int64
 	for _, release := range deltaChain {
-		for _, asset := range release.Assets {
-			if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
-				totalDeltaSize += asset.Size
-				break
-			}
+		if asset, ok := releaseAsset(release, variantID, ".delta"); ok {
+			totalDeltaSize += asset.Size
 		}
 	}
 
 	// Find full update size from the latest release
 	latestRelease := deltaChain[len(deltaChain)-1]
 	var fullUpdateSize int64
-	for _, asset := range latestRelease.Assets {
-		if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".mender") {
-			fullUpdateSize = asset.Size
-			break
-		}
+	if asset, ok := releaseAsset(latestRelease, variantID, ".mender"); ok {
+		fullUpdateSize = asset.Size
 	}
 
 	// If total delta size >= full update size, use full update instead
@@ -2053,11 +2036,8 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 	for i, release := range deltaChain {
 		deltaURL := ""
-		for _, asset := range release.Assets {
-			if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
-				deltaURL = asset.URL
-				break
-			}
+		if asset, ok := releaseAsset(release, variantID, ".delta"); ok {
+			deltaURL = asset.URL
 		}
 
 		if deltaURL == "" {
@@ -2185,11 +2165,8 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 				}
 
 				deltaURL := ""
-				for _, asset := range release.Assets {
-					if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
-						deltaURL = asset.URL
-						break
-					}
+				if asset, ok := releaseAsset(release, variantID, ".delta"); ok {
+					deltaURL = asset.URL
 				}
 
 				if deltaURL == "" {
@@ -2487,14 +2464,25 @@ func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration)
 
 // findMenderAsset finds a mender asset in a release for the specified variant
 func (u *Updater) findMenderAsset(release Release, variantID string) string {
-	for _, asset := range release.Assets {
-		// Match mender assets by variant_id
-		if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".mender") {
-			u.logger.Printf("Found mender asset: %s", asset.Name)
-			return asset.URL
-		}
+	if asset, ok := releaseAsset(release, variantID, ".mender"); ok {
+		u.logger.Printf("Found mender asset: %s", asset.Name)
+		return asset.URL
 	}
 	return ""
+}
+
+// releaseAsset returns the release asset named exactly
+// librescoot-{variantID}-{tag}{ext}, the naming scheme CI uses for every
+// channel. Substring matching is unsafe here: "unu-mdb" is contained in
+// "unu-mdb-minimal", so a loose match could pick a bootstrap image.
+func releaseAsset(release Release, variantID, ext string) (Asset, bool) {
+	want := "librescoot-" + variantID + "-" + release.TagName + ext
+	for _, asset := range release.Assets {
+		if asset.Name == want {
+			return asset, true
+		}
+	}
+	return Asset{}, false
 }
 
 // bootComponent returns the boot component identifier for the given rootfs component.
@@ -2628,13 +2616,7 @@ func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, v
 		}
 
 		// Check if the release has delta assets for the specified variant
-		hasDelta := false
-		for _, asset := range release.Assets {
-			if strings.Contains(asset.Name, variantID) && strings.HasSuffix(asset.Name, ".delta") {
-				hasDelta = true
-				break
-			}
-		}
+		_, hasDelta := releaseAsset(release, variantID, ".delta")
 
 		if hasDelta {
 			candidateReleases = append(candidateReleases, release)
