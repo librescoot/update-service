@@ -19,6 +19,9 @@ func TestParseUpdateSource(t *testing.T) {
 		{"file fragment checksum", "/data/f.mender#sha256=abc", "/data/f.mender", "sha256:abc", false},
 		{"file legacy checksum", "/data/f.mender:sha256:abc", "/data/f.mender", "sha256:abc", false},
 		{"file:// scheme", "file:///data/f.mender#sha256=abc", "file:///data/f.mender", "sha256:abc", true},
+		{"delta no checksum", "/data/ota/mdb/f.delta", "/data/ota/mdb/f.delta", "", false},
+		{"delta fragment checksum", "/data/ota/mdb/f.delta#sha256=abc", "/data/ota/mdb/f.delta", "sha256:abc", false},
+		{"delta legacy checksum", "/data/ota/mdb/f.delta:sha256:abc", "/data/ota/mdb/f.delta", "sha256:abc", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

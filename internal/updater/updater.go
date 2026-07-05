@@ -775,9 +775,17 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		return
 	}
 
-	if !strings.HasSuffix(source, ".mender") {
-		u.logger.Printf("Error: file is not a .mender file: %s", source)
-		if err := u.status.SetError(u.ctx, "invalid-file", fmt.Sprintf("File is not a .mender file: %s", source)); err != nil {
+	switch {
+	case strings.HasSuffix(source, ".mender"):
+		// full image: continues with the flow below
+	case strings.HasSuffix(source, ".delta"):
+		// locally delivered delta (BLE OTA path): apply against the base
+		// image of the running version, then install the assembled .mender
+		u.handleDeltaFromFileLocked(source, checksum)
+		return
+	default:
+		u.logger.Printf("Error: file is not a .mender or .delta file: %s", source)
+		if err := u.status.SetError(u.ctx, "invalid-file", fmt.Sprintf("File is not a .mender or .delta file: %s", source)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
@@ -888,6 +896,209 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		}
 
 		u.logger.Printf("Dry run: setting idle status for %s after file update", u.config.Component)
+		if idleErr := u.status.SetIdle(u.ctx); idleErr != nil {
+			u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
+		}
+	}
+}
+
+// normalizeDeltaBase normalizes an installed version_id for comparison against
+// version tokens extracted from delta filenames: lowercase, "v" prefix for
+// stable semver, and the channel prefix for legacy bare nightly/testing
+// timestamps (os-release VERSION_IDs predating the "channel-" convention).
+func normalizeDeltaBase(current, targetChannel string) string {
+	c := strings.ToLower(strings.TrimSpace(current))
+	if c == "" {
+		return c
+	}
+	switch targetChannel {
+	case "nightly", "testing":
+		if !strings.HasPrefix(c, targetChannel+"-") && c[0] >= '0' && c[0] <= '9' {
+			c = targetChannel + "-" + c
+		}
+	case "stable":
+		if !strings.HasPrefix(c, "v") {
+			c = "v" + c
+		}
+	}
+	return c
+}
+
+// validateDeltaTarget checks that a locally delivered delta (target version
+// from its filename) is applicable on top of the currently installed version.
+// Returns nil and the normalized base version when the delta applies. The
+// error strings are short on purpose: they are relayed to the phone via the
+// ota hash with a 60-character limit.
+func validateDeltaTarget(target, current string) (string, error) {
+	if target == "" {
+		return "", fmt.Errorf("cannot parse delta target version")
+	}
+	targetChannel := version.Channel(target)
+	if targetChannel == "" {
+		return "", fmt.Errorf("cannot determine delta channel")
+	}
+	if strings.TrimSpace(current) == "" {
+		return "", fmt.Errorf("installed version unknown")
+	}
+	base := normalizeDeltaBase(current, targetChannel)
+	if version.Channel(base) != targetChannel {
+		return "", fmt.Errorf("delta is for channel %s, installed is %s", targetChannel, base)
+	}
+	if version.Compare(strings.ToLower(target), base) <= 0 {
+		return "", fmt.Errorf("delta target %s not newer than installed", target)
+	}
+	return base, nil
+}
+
+// handleDeltaFromFileLocked installs a locally delivered .delta file (BLE OTA
+// path): the delta is applied against the base .mender of the running version
+// in the download dir — where BLE transfers are staged too — and the assembled
+// full image is installed. Caller must hold updateOpMu.
+func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
+	target := version.FromFilename(source)
+	currentVersion, err := u.getCurrentVersion()
+	if err != nil {
+		u.logger.Printf("Failed to get current %s version: %v", u.config.Component, err)
+	}
+
+	baseVersion, err := validateDeltaTarget(target, currentVersion)
+	if err != nil {
+		u.logger.Printf("Rejecting delta %s (installed %q): %v", source, currentVersion, err)
+		if statusErr := u.status.SetError(u.ctx, "delta-rejected", err.Error()); statusErr != nil {
+			u.logger.Printf("Failed to set error status: %v", statusErr)
+		}
+		return
+	}
+
+	if _, ok := u.mender.FindMenderFileForVersion(baseVersion); !ok {
+		u.logger.Printf("No base image for running version %s, cannot apply delta %s", currentVersion, source)
+		if err := u.status.SetError(u.ctx, "no-base-image", "no base image for delta; full update required"); err != nil {
+			u.logger.Printf("Failed to set error status: %v", err)
+		}
+		return
+	}
+
+	u.logger.Printf("Applying delta from file: %s (%s -> %s)", source, baseVersion, target)
+
+	if err := u.status.SetDownloading(u.ctx, strings.ToLower(target), "delta"); err != nil {
+		u.logger.Printf("Failed to set downloading status: %v", err)
+		return
+	}
+
+	if u.config.Component == "mdb" {
+		if err := u.inhibitor.AddPreparingInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to add preparing inhibit: %v", err)
+		}
+		defer func() {
+			if err := u.inhibitor.RemovePreparingInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove preparing inhibit: %v", err)
+			}
+			if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove install inhibit: %v", err)
+			}
+		}()
+	}
+
+	if u.config.Component == "dbc" {
+		u.logger.Printf("Starting DBC delta update - sending start-dbc command")
+		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+			u.logger.Printf("Failed to send start-dbc command: %v", err)
+		}
+		defer func() {
+			u.logger.Printf("DBC delta update cleanup - sending complete-dbc command")
+			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+				u.logger.Printf("Failed to send complete-dbc command: %v", err)
+			}
+		}()
+	}
+
+	if checksum != "" {
+		u.logger.Printf("Verifying checksum for %s", source)
+		if err := u.mender.VerifyChecksum(source, checksum); err != nil {
+			u.logger.Printf("Checksum verification failed for %s: %v", source, err)
+			u.mender.CleanupDeltaFile(source)
+			if err := u.status.SetError(u.ctx, "checksum-mismatch", fmt.Sprintf("Checksum verification failed: %v", err)); err != nil {
+				u.logger.Printf("Failed to set error status: %v", err)
+			}
+			return
+		}
+	}
+
+	// Delta application is CPU-bound work
+	if err := u.status.SetPreparing(u.ctx); err != nil {
+		u.logger.Printf("Failed to set preparing status: %v", err)
+	}
+	if err := u.power.RequestOndemandGovernor(); err != nil {
+		u.logger.Printf("Failed to request ondemand governor: %v", err)
+	}
+
+	installProgressCallback := func(percent int) {
+		if err := u.status.SetInstallProgress(u.ctx, percent); err != nil {
+			u.logger.Printf("Failed to set install progress: %v", err)
+		}
+	}
+
+	newMenderPath, err := u.mender.ApplyDownloadedDelta(u.ctx, source, baseVersion, installProgressCallback)
+	if err != nil {
+		if u.ctx.Err() != nil {
+			u.logger.Printf("Delta apply interrupted (shutdown), staged delta kept for retry")
+			return
+		}
+		u.logger.Printf("Delta apply failed: %v", err)
+		if err := u.status.SetError(u.ctx, "delta-apply-failed", fmt.Sprintf("delta apply failed: %v", err)); err != nil {
+			u.logger.Printf("Failed to set error status: %v", err)
+		}
+		return
+	}
+
+	if u.config.DryRun {
+		u.logger.Printf("DRY-RUN: Delta applied, final mender file ready at: %s", newMenderPath)
+		u.logger.Printf("DRY-RUN: Skipping mender-update install and reboot")
+		if err := u.status.SetIdle(u.ctx); err != nil {
+			u.logger.Printf("Failed to set idle status in dry run: %v", err)
+		}
+		return
+	}
+
+	if err := u.status.SetInstalling(u.ctx); err != nil {
+		u.logger.Printf("Failed to set installing status: %v", err)
+	}
+	if u.config.Component == "mdb" {
+		if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to add install inhibit: %v", err)
+		}
+		if err := u.inhibitor.RemovePreparingInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove preparing inhibit: %v", err)
+		}
+	}
+
+	// The applier verified the per-file and rootfs checksums of the assembled
+	// image, so there is no corruption-retry path here (unlike raw downloads).
+	if err := u.mender.Install(newMenderPath, u.menderInstallProgressCb()); err != nil {
+		u.logger.Printf("Failed to install assembled delta update %s: %v", newMenderPath, err)
+		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update from file %s: %v", newMenderPath, err)); err != nil {
+			u.logger.Printf("Failed to set error status: %v", err)
+		}
+		return
+	}
+
+	u.logger.Printf("Successfully installed delta update from file: %s -> %s", baseVersion, target)
+	u.mender.CleanupStaleDeltaFiles(deltaMaxAge)
+
+	if err := u.status.SetPendingReboot(u.ctx); err != nil {
+		u.logger.Printf("Failed to set pending-reboot status: %v", err)
+	}
+
+	if err := u.TriggerReboot(u.config.Component); err != nil {
+		u.logger.Printf("Failed to trigger %s reboot after delta file update: %v", u.config.Component, err)
+		if !strings.Contains(err.Error(), "DRY-RUN") {
+			if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
+				u.logger.Printf("Additionally failed to set error status after reboot trigger failure: %v", statusErr)
+			}
+			return
+		}
+
+		u.logger.Printf("Dry run: setting idle status for %s after delta file update", u.config.Component)
 		if idleErr := u.status.SetIdle(u.ctx); idleErr != nil {
 			u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
 		}
