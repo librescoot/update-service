@@ -680,7 +680,7 @@ func (u *Updater) handleCommand(command string) {
 		u.wg.Add(1)
 		go func() {
 			defer u.wg.Done()
-			u.checkForUpdates()
+			u.checkForUpdates(true)
 		}()
 
 	case strings.HasPrefix(command, "update-from-file:"):
@@ -869,7 +869,7 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 				u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
 			} else {
 				u.logger.Printf("Deleted corrupted file, restarting update check")
-				u.restartCheckAfterCorruptFile()
+				u.restartCheckAfterCorruptFile(true)
 				return
 			}
 		}
@@ -886,7 +886,7 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		u.logger.Printf("Failed to set pending-reboot status: %v", err)
 	}
 
-	if err := u.TriggerReboot(u.config.Component); err != nil {
+	if err := u.TriggerReboot(u.config.Component, true); err != nil {
 		u.logger.Printf("Failed to trigger %s reboot after file update: %v", u.config.Component, err)
 		if !strings.Contains(err.Error(), "DRY-RUN") {
 			if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
@@ -1089,7 +1089,7 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 		u.logger.Printf("Failed to set pending-reboot status: %v", err)
 	}
 
-	if err := u.TriggerReboot(u.config.Component); err != nil {
+	if err := u.TriggerReboot(u.config.Component, true); err != nil {
 		u.logger.Printf("Failed to trigger %s reboot after delta file update: %v", u.config.Component, err)
 		if !strings.Contains(err.Error(), "DRY-RUN") {
 			if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
@@ -1223,7 +1223,7 @@ func (u *Updater) handleUpdateFromURL(url string) {
 					u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
 				} else {
 					u.logger.Printf("Deleted corrupted file, restarting update check")
-					u.restartCheckAfterCorruptFile()
+					u.restartCheckAfterCorruptFile(true)
 					return
 				}
 			}
@@ -1250,7 +1250,7 @@ func (u *Updater) handleUpdateFromURL(url string) {
 
 		if u.config.Component == "mdb" || u.config.Component == "dbc" {
 			u.logger.Printf("%s update installed, triggering reboot", strings.ToUpper(u.config.Component))
-			err := u.TriggerReboot(u.config.Component)
+			err := u.TriggerReboot(u.config.Component, true)
 			if err != nil {
 				u.logger.Printf("Failed to trigger %s reboot: %v", u.config.Component, err)
 				if !strings.Contains(err.Error(), "DRY-RUN") {
@@ -1326,7 +1326,7 @@ func (u *Updater) monitorSettingsChanges() {
 func (u *Updater) updateCheckLoop() {
 	// Initial check on startup if enabled
 	if u.config.CheckInterval > 0 {
-		u.checkForUpdates()
+		u.checkForUpdates(false)
 	}
 
 	for {
@@ -1357,7 +1357,7 @@ func (u *Updater) updateCheckLoop() {
 		case <-timer.C:
 			// Re-read in case the config was set to 0 just before the timer fired.
 			if u.config.CheckInterval > 0 {
-				u.checkForUpdates()
+				u.checkForUpdates(false)
 			}
 		}
 	}
@@ -1368,8 +1368,9 @@ func (u *Updater) updateCheckLoop() {
 // checks. If periodic checks are enabled, also kicks off an immediate check
 // in a new goroutine so a fresh download can be attempted right away.
 // With CheckInterval=0 (auto-checks disabled), we don't self-trigger and
-// wait for the next manual trigger.
-func (u *Updater) restartCheckAfterCorruptFile() {
+// wait for the next manual trigger. The manual flag carries the origin of
+// the failed update into the restarted check (see checkForUpdates).
+func (u *Updater) restartCheckAfterCorruptFile(manual bool) {
 	if err := u.status.SetIdle(u.ctx); err != nil {
 		u.logger.Printf("Failed to clear status after corrupt file: %v", err)
 		return
@@ -1380,7 +1381,7 @@ func (u *Updater) restartCheckAfterCorruptFile() {
 	u.wg.Add(1)
 	go func() {
 		defer u.wg.Done()
-		u.checkForUpdates()
+		u.checkForUpdates(manual)
 	}()
 }
 
@@ -1394,8 +1395,10 @@ func (u *Updater) NotifyCheckIntervalChanged() {
 	}
 }
 
-// checkForUpdates checks for updates and initiates the update process if updates are available
-func (u *Updater) checkForUpdates() {
+// checkForUpdates checks for updates and initiates the update process if updates are available.
+// manual is true when the check was requested explicitly (check-now command) rather than by
+// the periodic timer; manual updates skip the 3-minute standby wait before an MDB reboot.
+func (u *Updater) checkForUpdates(manual bool) {
 	// Prevent concurrent update checks - if an update is already in progress, skip
 	if !u.updateCheckMu.TryLock() {
 		u.logger.Printf("Update check already in progress for %s, skipping duplicate request", u.config.Component)
@@ -1472,7 +1475,7 @@ func (u *Updater) checkForUpdates() {
 		u.wg.Add(1)
 		go func() {
 			defer u.wg.Done()
-			u.performDeltaUpdate(releases, currentVersion, variantID, false)
+			u.performDeltaUpdate(releases, currentVersion, variantID, false, manual)
 		}()
 
 		return
@@ -1508,7 +1511,7 @@ func (u *Updater) checkForUpdates() {
 		u.wg.Add(1)
 		go func() {
 			defer u.wg.Done()
-			u.performUpdate(release, assetURL)
+			u.performUpdate(release, assetURL, manual)
 		}()
 	}
 
@@ -1661,19 +1664,19 @@ func (u *Updater) getCurrentVersion() (string, error) {
 
 // performUpdate is the public entry point for a full update — acquires
 // updateOpMu so it won't race with another in-flight update operation.
-func (u *Updater) performUpdate(release Release, assetURL string) {
+func (u *Updater) performUpdate(release Release, assetURL string, manual bool) {
 	if !u.updateOpMu.TryLock() {
 		u.logger.Printf("Update already in progress, skipping full update to %s", release.TagName)
 		return
 	}
 	defer u.updateOpMu.Unlock()
-	u.performUpdateLocked(release, assetURL)
+	u.performUpdateLocked(release, assetURL, manual)
 }
 
 // performUpdateLocked does the actual update work. Caller must already hold
 // updateOpMu — internal callers inside performDeltaUpdate / fallbackToFullUpdate
 // run under the same lock and use this entry directly to avoid deadlock.
-func (u *Updater) performUpdateLocked(release Release, assetURL string) {
+func (u *Updater) performUpdateLocked(release Release, assetURL string, manual bool) {
 	u.logger.Printf("Starting update process for %s to version %s", u.config.Component, release.TagName)
 
 	var version string
@@ -1788,7 +1791,7 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string) {
 				u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
 			} else {
 				u.logger.Printf("Deleted corrupted file, restarting update check")
-				u.restartCheckAfterCorruptFile()
+				u.restartCheckAfterCorruptFile(manual)
 				return
 			}
 		}
@@ -1822,7 +1825,7 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string) {
 	// Trigger reboot
 	if u.config.Component == "mdb" || u.config.Component == "dbc" {
 		u.logger.Printf("%s update installed, triggering reboot", strings.ToUpper(u.config.Component))
-		err := u.TriggerReboot(u.config.Component)
+		err := u.TriggerReboot(u.config.Component, manual)
 		if err != nil {
 			u.logger.Printf("Failed to trigger %s reboot: %v", u.config.Component, err)
 			// If reboot trigger fails (and not due to dry run), set status to error
@@ -1876,7 +1879,7 @@ const deltaDownloadMaxRetryDuration = 15 * time.Minute
 // older than this.
 const deltaMaxAge = 30 * 24 * time.Hour
 
-func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string, isRecheck bool) {
+func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string, isRecheck, manual bool) {
 	// The recursive re-check call at the end of this function runs inside the
 	// same goroutine that already holds updateOpMu — skip TryLock in that case
 	// to avoid self-deadlocking on the non-reentrant mutex.
@@ -1896,7 +1899,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		_, menderVersion, found := u.mender.FindLatestMenderFile(u.config.Channel)
 		if !found || menderVersion == "" {
 			u.logger.Printf("No local mender file for any version on channel %s, need full update", u.config.Channel)
-			u.fallbackToFullUpdate(releases, variantID, "no local mender file to base delta chain on")
+			u.fallbackToFullUpdate(releases, variantID, "no local mender file to base delta chain on", manual)
 			return
 		}
 		u.logger.Printf("No mender file for running version %s, using available mender file version %s as base", currentVersion, menderVersion)
@@ -1917,7 +1920,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			menderURL := u.findMenderAsset(latestRelease, variantID)
 			if menderURL != "" {
 				u.logger.Printf("Falling back to full update with latest version")
-				u.performUpdateLocked(latestRelease, menderURL)
+				u.performUpdateLocked(latestRelease, menderURL, manual)
 			}
 		}
 		return
@@ -1952,7 +1955,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			totalDeltaSize, fullUpdateSize)
 		menderURL := u.findMenderAsset(latestRelease, variantID)
 		if menderURL != "" {
-			u.performUpdateLocked(latestRelease, menderURL)
+			u.performUpdateLocked(latestRelease, menderURL, manual)
 		}
 		return
 	}
@@ -2047,7 +2050,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 					u.mender.CleanupDeltaFile(downloads[j].deltaPath)
 				}
 			}
-			u.fallbackToFullUpdate(releases, variantID, "no delta asset found")
+			u.fallbackToFullUpdate(releases, variantID, "no delta asset found", manual)
 			return
 		}
 
@@ -2076,7 +2079,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 						u.mender.CleanupDeltaFile(downloads[j].deltaPath)
 					}
 				}
-				u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("delta asset unavailable: %v", err))
+				u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("delta asset unavailable: %v", err), manual)
 				return
 			}
 			if time.Now().After(downloadDeadline) {
@@ -2086,7 +2089,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 						u.mender.CleanupDeltaFile(downloads[j].deltaPath)
 					}
 				}
-				u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("download failed after retries: %v", err))
+				u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("download failed after retries: %v", err), manual)
 				return
 			}
 			remaining := time.Until(downloadDeadline)
@@ -2134,7 +2137,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			return
 		}
 		u.logger.Printf("Delta chain apply failed: %v", err)
-		u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("chain apply failed: %v", err))
+		u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("chain apply failed: %v", err), manual)
 		return
 	}
 
@@ -2217,7 +2220,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		} else if newerChain, err := u.buildDeltaChain(recheckReleases, workingVersion, u.config.Channel, variantID); err == nil && len(newerChain) > 0 {
 			newerVersion := strings.ToLower(newerChain[len(newerChain)-1].TagName)
 			u.logger.Printf("Newer version %s published while applying delta chain; restarting from assembled %s", newerVersion, workingVersion)
-			u.performDeltaUpdate(recheckReleases, workingVersion, variantID, true)
+			u.performDeltaUpdate(recheckReleases, workingVersion, variantID, true, manual)
 			return
 		}
 	}
@@ -2264,7 +2267,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 				u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
 			} else {
 				u.logger.Printf("Deleted corrupted file, restarting update check")
-				u.restartCheckAfterCorruptFile()
+				u.restartCheckAfterCorruptFile(manual)
 				return
 			}
 		}
@@ -2298,7 +2301,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	// Trigger reboot
 	if u.config.Component == "mdb" || u.config.Component == "dbc" {
 		u.logger.Printf("%s delta update installed, triggering reboot", strings.ToUpper(u.config.Component))
-		err := u.TriggerReboot(u.config.Component)
+		err := u.TriggerReboot(u.config.Component, manual)
 		if err != nil {
 			u.logger.Printf("Failed to trigger %s reboot: %v", u.config.Component, err)
 			if !strings.Contains(err.Error(), "DRY-RUN") {
@@ -2324,7 +2327,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 }
 
 // fallbackToFullUpdate logs the delta failure reason and initiates a full update.
-func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, reason string) {
+func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, reason string, manual bool) {
 	u.logger.Printf("Delta update failed (%s), falling back to full update", reason)
 
 	if err := u.status.SetError(u.ctx, "delta-failed", reason); err != nil {
@@ -2344,13 +2347,17 @@ func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, reason str
 		menderURL := u.findMenderAsset(latestRelease, variantID)
 		if menderURL != "" {
 			u.logger.Printf("Starting full update to %s", latestRelease.TagName)
-			u.performUpdateLocked(latestRelease, menderURL)
+			u.performUpdateLocked(latestRelease, menderURL, manual)
 		}
 	}
 }
 
 // TriggerReboot triggers a reboot or restart of the specified component.
-func (u *Updater) TriggerReboot(component string) error {
+// manual marks updates that were requested explicitly (check-now,
+// update-from-file/url, local boot assets) rather than found by the periodic
+// check. For MDB, manual reboots skip the 3-minute standby-duration
+// requirement and fire as soon as the vehicle is in 'stand-by'.
+func (u *Updater) TriggerReboot(component string, manual bool) error {
 	if u.config.DryRun {
 		u.logger.Printf("DRY-RUN: Would reboot/restart %s, but dry-run mode is enabled", component)
 		return fmt.Errorf("DRY-RUN: Would reboot/restart %s", component) // Return an error to signal dry run
@@ -2358,10 +2365,15 @@ func (u *Updater) TriggerReboot(component string) error {
 
 	switch component {
 	case "mdb":
-		const requiredStandbyDuration = 3 * time.Minute
+		requiredStandbyDuration := 3 * time.Minute
 		const safetyBuffer = 5 * time.Second
 
-		u.logger.Printf("Preparing to reboot MDB. Waiting for vehicle to be in 'stand-by' state for at least %v.", requiredStandbyDuration)
+		if manual {
+			requiredStandbyDuration = 0
+			u.logger.Printf("Preparing to reboot MDB (manually requested update). Rebooting as soon as vehicle is in 'stand-by'.")
+		} else {
+			u.logger.Printf("Preparing to reboot MDB. Waiting for vehicle to be in 'stand-by' state for at least %v.", requiredStandbyDuration)
+		}
 
 		// Check if we already have a valid standby timestamp
 		standbyStart := u.getStandbyStartTime()
@@ -2426,7 +2438,11 @@ func (u *Updater) TriggerReboot(component string) error {
 // monitorVehicleState watcher keeps standbyStartTime current, so this function
 // just polls that value on a short ticker.
 func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration) error {
-	u.logger.Printf("Waiting for vehicle to be in 'stand-by' for %v before rebooting", requiredDuration)
+	if requiredDuration > 0 {
+		u.logger.Printf("Waiting for vehicle to be in 'stand-by' for %v before rebooting", requiredDuration)
+	} else {
+		u.logger.Printf("Waiting for vehicle to enter 'stand-by' before rebooting")
+	}
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -2576,7 +2592,7 @@ func (u *Updater) performLocalBootUpdate() {
 	}
 
 	u.logger.Printf("[boot-local] boot update applied, triggering reboot")
-	if err := u.TriggerReboot(u.config.Component); err != nil {
+	if err := u.TriggerReboot(u.config.Component, true); err != nil {
 		if !strings.Contains(err.Error(), "DRY-RUN") {
 			u.logger.Printf("[boot-local] reboot trigger failed: %v", err)
 			if err := u.bootStatus.SetError(u.ctx, "reboot-failed", err.Error()); err != nil {
