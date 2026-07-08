@@ -52,8 +52,8 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 	if estimatedPayload == 0 {
 		estimatedPayload = compressedSize * 7 / 2
 	}
-	// Total work: 1 decompress + n xdelta steps + 1 compress + manifest hashing
-	totalWork := estimatedPayload*(int64(n)+2) + compressedSize
+	// Total work: 1 decompress + n xdelta steps + 1 compress
+	totalWork := estimatedPayload * (int64(n) + 2)
 
 	tracker := newProgressTracker(totalWork, progress)
 
@@ -66,7 +66,7 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 	// If we used an estimate, recalculate with the actual decompressed size
 	if payloadInfo, err := os.Stat(payloadPath); err == nil {
 		actualPayload := payloadInfo.Size()
-		newTotal := tracker.processed + actualPayload*int64(n+1) + compressedSize
+		newTotal := tracker.processed + actualPayload*int64(n+1)
 		// Only recalculate if it would not cause progress to go backwards
 		if newTotal > tracker.total {
 			tracker.setTotal(newTotal)
@@ -160,14 +160,10 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 		a.logger.Printf("Rootfs checksum verified: %s", rootfsChecksum)
 	}
 
-	// Finalize (manifest is slow for large payload — tracked)
-	headerPath := filepath.Join(outputDir, "header.tar.gz")
-	if err := UpdateHeaderChecksum(headerPath, work, rootfsChecksum); err != nil {
-		return fmt.Errorf("update header: %w", err)
-	}
-
-	if err := GenerateManifest(outputDir, tracker); err != nil {
-		return fmt.Errorf("generate manifest: %w", err)
+	// The manifest and header.tar.gz shipped in the delta are used as-is;
+	// only verify the reconstructed payload is what the manifest promises.
+	if err := VerifyPayloadAgainstManifest(outputDir, rootfsChecksum); err != nil {
+		return err
 	}
 
 	if err := RepackMender(outputDir, newMenderPath); err != nil {

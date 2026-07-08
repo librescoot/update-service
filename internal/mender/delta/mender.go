@@ -2,15 +2,12 @@ package delta
 
 import (
 	"archive/tar"
-	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -80,127 +77,25 @@ func copyFileToWriter(w io.Writer, path string) error {
 	return err
 }
 
-// UpdateHeaderChecksum extracts header.tar.gz, updates rootfs-image.checksum
-// in type-info, and recreates header.tar.gz with strict ordering.
-func UpdateHeaderChecksum(headerTarGzPath, workDir, rootfsChecksum string) error {
-	headerDir := filepath.Join(workDir, "header_extract")
-	if err := os.MkdirAll(headerDir, 0755); err != nil {
-		return err
-	}
-	defer os.RemoveAll(headerDir)
-
-	if err := ShellTarExtract(headerTarGzPath, headerDir); err != nil {
-		return fmt.Errorf("extract header.tar.gz: %w", err)
-	}
-
-	// Find and update type-info
-	var typeInfoPath string
-	filepath.Walk(headerDir, func(path string, info os.FileInfo, err error) error {
-		if err == nil && info.Name() == "type-info" {
-			typeInfoPath = path
-		}
-		return nil
-	})
-	if typeInfoPath == "" {
-		return fmt.Errorf("type-info not found in header.tar.gz")
-	}
-
-	data, err := os.ReadFile(typeInfoPath)
+// VerifyPayloadAgainstManifest checks that the reconstructed payload's rootfs
+// checksum is listed as a data/ entry in the manifest shipped with the delta.
+//
+// The manifest and header.tar.gz come verbatim from the new artifact (the
+// delta ships them as "new" files) and must not be regenerated here: mender
+// validates each file inside data/NNNN.tar.gz against a manifest entry named
+// data/NNNN/<filename> holding the checksum of the uncompressed content.
+func VerifyPayloadAgainstManifest(outputDir, rootfsChecksum string) error {
+	data, err := os.ReadFile(filepath.Join(outputDir, "manifest"))
 	if err != nil {
-		return err
+		return fmt.Errorf("read shipped manifest: %w", err)
 	}
-
-	var typeInfo map[string]any
-	if err := json.Unmarshal(data, &typeInfo); err != nil {
-		return fmt.Errorf("parse type-info: %w", err)
-	}
-
-	provides, ok := typeInfo["artifact_provides"].(map[string]any)
-	if !ok {
-		return fmt.Errorf("type-info missing artifact_provides")
-	}
-	provides["rootfs-image.checksum"] = rootfsChecksum
-
-	out, err := json.Marshal(typeInfo)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(typeInfoPath, out, 0644); err != nil {
-		return err
-	}
-
-	// Recreate header.tar.gz with strict ordering
-	return recreateHeaderTarGz(headerTarGzPath, headerDir)
-}
-
-func recreateHeaderTarGz(outputPath, sourceDir string) error {
-	f, err := os.Create(outputPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	gw := gzip.NewWriter(f)
-	defer gw.Close()
-
-	tw := tar.NewWriter(gw)
-	defer tw.Close()
-
-	// Collect all files
-	type fileEntry struct {
-		fullPath string
-		arcName  string
-	}
-	var files []fileEntry
-
-	filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return err
-		}
-		rel, _ := filepath.Rel(sourceDir, path)
-		files = append(files, fileEntry{path, rel})
-		return nil
-	})
-
-	// Mender header ordering: header-info first, type-info second, meta-data third
-	sort.Slice(files, func(i, j int) bool {
-		return headerSortKey(files[i].arcName) < headerSortKey(files[j].arcName)
-	})
-
-	for _, fe := range files {
-		info, err := os.Stat(fe.fullPath)
-		if err != nil {
-			return err
-		}
-		hdr, err := tar.FileInfoHeader(info, "")
-		if err != nil {
-			return err
-		}
-		hdr.Name = fe.arcName
-
-		if err := tw.WriteHeader(hdr); err != nil {
-			return err
-		}
-		if err := copyFileToWriter(tw, fe.fullPath); err != nil {
-			return err
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && strings.HasPrefix(fields[1], "data/") && fields[0] == rootfsChecksum {
+			return nil
 		}
 	}
-
-	return nil
-}
-
-func headerSortKey(name string) string {
-	base := filepath.Base(name)
-	switch base {
-	case "header-info":
-		return "0:" + name
-	case "type-info":
-		return "1:" + name
-	case "meta-data":
-		return "2:" + name
-	default:
-		return "9:" + name
-	}
+	return fmt.Errorf("reconstructed payload checksum %s is not listed in the shipped manifest", rootfsChecksum)
 }
 
 // CompressPayloadAndHash compresses a payload tar with gzip while computing
@@ -296,41 +191,3 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, tracker *prog
 	return hex.EncodeToString(innerHasher.Sum(nil)), nil
 }
 
-// GenerateManifest creates the manifest file with SHA256 checksums of all files.
-// Progress is reported based on bytes hashed vs total bytes.
-func GenerateManifest(outputDir string, tracker *progressTracker) error {
-	manifestPath := filepath.Join(outputDir, "manifest")
-
-	var entries []string
-	filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || info.Name() == "manifest" {
-			return err
-		}
-		rel, _ := filepath.Rel(outputDir, path)
-		checksum, err := fileSHA256(path)
-		if err != nil {
-			return err
-		}
-		entries = append(entries, fmt.Sprintf("%s  %s\n", checksum, rel))
-		// Track bytes hashed
-		tracker.add(info.Size(), "finalizing")
-		return nil
-	})
-
-	sort.Strings(entries)
-	return os.WriteFile(manifestPath, []byte(strings.Join(entries, "")), 0644)
-}
-
-func fileSHA256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
