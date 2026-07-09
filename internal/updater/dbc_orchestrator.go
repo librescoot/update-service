@@ -116,6 +116,16 @@ func (u *Updater) isDBCUpdateAvailable(releases []Release) bool {
 	// Find the latest release for DBC
 	release, found := u.findLatestRelease(releases, dbcVariantID, dbcChannel)
 	if !found {
+		// version:dbc (and with it variant_id) is populated by the DBC itself,
+		// and Redis is wiped on every MDB reboot — with the DBC powered off the
+		// variant lookup falls back to "dbc", which matches no release asset.
+		// Nothing can be proven about the DBC from here: power it on and let
+		// its own update-service decide.
+		if len(releases) > 0 {
+			u.logger.Printf("[dbc-orchestrate] No release matches DBC variant %q on channel %s (variant unknown while DBC is off?) — will power on so the DBC can check itself", dbcVariantID, dbcChannel)
+			return true
+		}
+		u.logger.Printf("[dbc-orchestrate] No releases available on channel %s, skipping", dbcChannel)
 		return false
 	}
 
@@ -129,7 +139,11 @@ func (u *Updater) isDBCUpdateAvailable(releases []Release) bool {
 	}
 
 	// Compare versions using existing logic
-	return u.isVersionNewer(release.TagName, dbcVersion, dbcChannel)
+	if !u.isVersionNewer(release.TagName, dbcVersion, dbcChannel) {
+		u.logger.Printf("[dbc-orchestrate] DBC at %s, latest on %s is %s — up to date, skipping", dbcVersion, dbcChannel, release.TagName)
+		return false
+	}
+	return true
 }
 
 // getDBCChannel determines the effective channel for DBC updates.
