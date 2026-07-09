@@ -1302,14 +1302,18 @@ func (u *Updater) monitorSettingsChanges() {
 			case "true", "false":
 				u.setOrchestrateDBC(value == "true")
 			default:
-				// Setting cleared — fall back to channel-dependent default
+				// Setting cleared — fall back to the default (enabled)
 				u.setOrchestrateDBC(u.resolveOrchestrateDBC())
 			}
 			return nil
 		})
 	}
 
-	if err := watcher.Start(); err != nil {
+	// StartWithSync replays the current hash through the handlers after
+	// subscribing: settings-service reseeds the (non-persistent) hash at
+	// every boot, and plain Start() would miss any field seeded between
+	// our startup reads and the subscription.
+	if err := watcher.StartWithSync(); err != nil {
 		u.logger.Printf("Failed to start settings watcher: %v", err)
 		return
 	}
@@ -2705,12 +2709,13 @@ func (u *Updater) setOrchestrateDBC(enabled bool) {
 }
 
 // resolveOrchestrateDBC determines the effective value for orchestrate-dbc.
-// Priority: explicit Redis setting > channel-dependent default.
+// Priority: explicit Redis setting > default (enabled). The settings schema
+// seeds this key to "true" at boot; use the same default when the seed
+// hasn't landed yet so orchestration is on for every channel either way.
 func (u *Updater) resolveOrchestrateDBC() bool {
 	val, isSet := u.redis.GetOrchestrateDBC()
 	if isSet {
 		return val == "true"
 	}
-	// Default: true for nightly, false otherwise
-	return u.config.Channel == "nightly"
+	return true
 }
