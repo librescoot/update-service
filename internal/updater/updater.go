@@ -213,6 +213,14 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 		}
 	}
 
+	// Standby tracking must be live before anything that can block on
+	// TriggerReboot: performLocalBootUpdate below waits on the standby
+	// timer after applying a boot update, and checkInitialStandbyState /
+	// monitorVehicleState are the only writers of that timer — starting
+	// them later deadlocked the service with the boot update pending.
+	u.checkInitialStandbyState()
+	go u.monitorVehicleState()
+
 	// Check if local boot assets need to be applied (runs once, synchronously)
 	u.performLocalBootUpdate()
 
@@ -224,12 +232,6 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 	// Check if we have a mender file newer than the running version (e.g., from
 	// an interrupted update). If so, install it directly without re-downloading.
 	u.installPendingMenderFile(menderNeedsReboot)
-
-	// Check initial vehicle state and set standby timestamp if needed
-	u.checkInitialStandbyState()
-
-	// Keep standby timer in sync with live vehicle state changes
-	go u.monitorVehicleState()
 
 	// Start monitoring for settings changes
 	go u.monitorSettingsChanges()
