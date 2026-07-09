@@ -1,13 +1,13 @@
 [Unit]
 Description=Librescoot Update Service (MDB)
-After=redis.service
+After=valkey.service
 After=network-online.target
 After=librescoot-modem.service
 After=librescoot-vehicle.service
 After=librescoot-version.service
 After=librescoot-pm.service
 After=librescoot-settings.service
-Requires=redis.service
+Requires=valkey.service
 Wants=network-online.target
 
 [Service]
