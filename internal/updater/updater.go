@@ -213,15 +213,14 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 		}
 	}
 
-	// Standby tracking must be live before anything that can block on
-	// TriggerReboot: performLocalBootUpdate below waits on the standby
-	// timer after applying a boot update, and checkInitialStandbyState /
-	// monitorVehicleState are the only writers of that timer — starting
-	// them later deadlocked the service with the boot update pending.
+	// Standby tracking must be live before performLocalBootUpdate: it seeds the
+	// standby timer that the backgrounded reboot wait polls. checkInitialStandbyState
+	// captures the state at startup and monitorVehicleState keeps it current.
 	u.checkInitialStandbyState()
 	go u.monitorVehicleState()
 
-	// Check if local boot assets need to be applied (runs once, synchronously)
+	// Apply local boot assets if they differ (boot write is synchronous; the
+	// reboot wait it schedules runs in the background so it can't wedge Start()).
 	u.performLocalBootUpdate()
 
 	// Initialize Redis keys if they don't exist
@@ -2461,7 +2460,21 @@ func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration)
 		case <-ticker.C:
 			standbyStart := u.getStandbyStartTime()
 			if standbyStart.IsZero() {
-				continue
+				// monitorVehicleState normally seeds the timer on the transition
+				// into stand-by, but a missed edge (no keyspace event, or the
+				// vehicle was already in stand-by before the watcher synced)
+				// would otherwise leave us waiting forever. Poll Redis directly
+				// so the reboot is self-healing.
+				currentState, stateTs, err := u.redis.GetVehicleStateWithTimestamp(config.VehicleHashKey)
+				if err != nil || currentState != "stand-by" {
+					continue
+				}
+				if stateTs.IsZero() {
+					stateTs = time.Now()
+				}
+				u.setStandbyStartTime(stateTs)
+				u.logger.Printf("Vehicle in 'stand-by' since %s (seeded from poll)", stateTs.Format(time.RFC3339))
+				standbyStart = stateTs
 			}
 
 			durationInStandby := time.Since(standbyStart)
@@ -2597,20 +2610,32 @@ func (u *Updater) performLocalBootUpdate() {
 		u.logger.Printf("[boot-local] failed to set pending-reboot status: %v", err)
 	}
 
-	u.logger.Printf("[boot-local] boot update applied, triggering reboot")
-	if err := u.TriggerReboot(u.config.Component, true); err != nil {
-		if !strings.Contains(err.Error(), "DRY-RUN") {
-			u.logger.Printf("[boot-local] reboot trigger failed: %v", err)
-			if err := u.bootStatus.SetError(u.ctx, "reboot-failed", err.Error()); err != nil {
-				u.logger.Printf("[boot-local] failed to set error status: %v", err)
-			}
-		} else {
-			u.logger.Printf("[boot-local] dry-run: simulating post-reboot state")
-			if err := u.bootStatus.SetIdle(u.ctx); err != nil {
-				u.logger.Printf("[boot-local] failed to set idle status in dry run: %v", err)
+	u.logger.Printf("[boot-local] boot update applied, deferring reboot to background")
+	// The reboot wait must not run on the Start() path. For MDB, TriggerReboot
+	// blocks until the vehicle has been in 'stand-by' long enough, which can be
+	// indefinite. Running it synchronously here wedged Start() before
+	// listenForCommands and updateCheckLoop launched, silently killing OTA
+	// command handling and periodic checks until the next restart. The boot
+	// assets are already written and the version file recorded, so the reboot
+	// can happen whenever the vehicle next reaches stand-by (or on the next
+	// natural power cycle) without blocking anything.
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		if err := u.TriggerReboot(u.config.Component, true); err != nil {
+			if !strings.Contains(err.Error(), "DRY-RUN") {
+				u.logger.Printf("[boot-local] reboot trigger failed: %v", err)
+				if err := u.bootStatus.SetError(u.ctx, "reboot-failed", err.Error()); err != nil {
+					u.logger.Printf("[boot-local] failed to set error status: %v", err)
+				}
+			} else {
+				u.logger.Printf("[boot-local] dry-run: simulating post-reboot state")
+				if err := u.bootStatus.SetIdle(u.ctx); err != nil {
+					u.logger.Printf("[boot-local] failed to set idle status in dry run: %v", err)
+				}
 			}
 		}
-	}
+	}()
 }
 
 // buildDeltaChain builds a complete chain of deltas from currentVersion to the latest release
