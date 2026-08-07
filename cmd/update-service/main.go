@@ -163,19 +163,10 @@ func main() {
 			*component, installedVersion, *component)
 	}
 
-	// Initialize power inhibitor client
-	inhibitorClient, err := inhibitor.New(*redisAddr, logger)
-	if err != nil {
-		logger.Fatalf("Failed to initialize inhibitor client: %v", err)
-	}
-	defer inhibitorClient.Close()
-
-	// Initialize power client
-	powerClient, err := power.New(*redisAddr, logger)
-	if err != nil {
-		logger.Fatalf("Failed to initialize power client: %v", err)
-	}
-	defer powerClient.Close()
+	// Power inhibitor and governor clients ride the same redis-ipc client
+	// as everything else rather than dialling Redis again.
+	inhibitorClient := inhibitor.New(redisClient.GetClient(), logger)
+	powerClient := power.New(redisClient.GetClient(), logger)
 
 	// Initialize boot updater if enabled
 	var bootUpdater *boot.BootUpdater

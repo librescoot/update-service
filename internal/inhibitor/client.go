@@ -1,13 +1,12 @@
 package inhibitor
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	ipc "github.com/librescoot/redis-ipc"
 )
 
 const (
@@ -37,34 +36,17 @@ type InhibitData struct {
 
 // Client represents a Redis client for interacting with the power inhibitor system
 type Client struct {
-	client *redis.Client
-	ctx    context.Context
+	client *ipc.Client
 	logger *log.Logger
 }
 
-// New creates a new power inhibitor client
-func New(redisAddr string, logger *log.Logger) (*Client, error) {
-	client := redis.NewClient(&redis.Options{
-		Addr: redisAddr,
-		DB:   0,
-	})
-
-	ctx := context.Background()
-	// Test connection
-	if err := client.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
-	}
-
+// New creates a power inhibitor client on the caller's shared redis-ipc
+// client. It does not own the connection.
+func New(client *ipc.Client, logger *log.Logger) *Client {
 	return &Client{
 		client: client,
-		ctx:    ctx,
 		logger: logger,
-	}, nil
-}
-
-// Close closes the Redis client
-func (c *Client) Close() error {
-	return c.client.Close()
+	}
 }
 
 // AddInhibit adds a power inhibit
@@ -89,12 +71,12 @@ func (c *Client) AddInhibit(id, who, what, why string, inhibitType InhibitType, 
 		return fmt.Errorf("failed to marshal inhibit data: %w", err)
 	}
 
-	// Add inhibit to Redis
-	pipe := c.client.Pipeline()
-	pipe.HSet(c.ctx, InhibitHashKey, id, string(data))
-	pipe.Publish(c.ctx, InhibitChannel, fmt.Sprintf("add:%s", id))
-
-	_, err = pipe.Exec(c.ctx)
+	// HSET + PUBLISH stay in one pipeline so a subscriber never sees the
+	// notification before the hash entry exists.
+	_, err = c.client.NewTxGroup().
+		Add("HSET", InhibitHashKey, id, string(data)).
+		Add("PUBLISH", InhibitChannel, fmt.Sprintf("add:%s", id)).
+		Exec()
 	if err != nil {
 		return fmt.Errorf("failed to add power inhibit: %w", err)
 	}
@@ -106,12 +88,10 @@ func (c *Client) AddInhibit(id, who, what, why string, inhibitType InhibitType, 
 func (c *Client) RemoveInhibit(id string) error {
 	c.logger.Printf("Removing power inhibit: id=%s", id)
 
-	// Remove inhibit from Redis
-	pipe := c.client.Pipeline()
-	pipe.HDel(c.ctx, InhibitHashKey, id)
-	pipe.Publish(c.ctx, InhibitChannel, fmt.Sprintf("remove:%s", id))
-
-	_, err := pipe.Exec(c.ctx)
+	_, err := c.client.NewTxGroup().
+		Add("HDEL", InhibitHashKey, id).
+		Add("PUBLISH", InhibitChannel, fmt.Sprintf("remove:%s", id)).
+		Exec()
 	if err != nil {
 		return fmt.Errorf("failed to remove power inhibit: %w", err)
 	}
