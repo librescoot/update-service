@@ -1865,7 +1865,6 @@ type deltaDownload struct {
 	release   Release
 	deltaPath string
 	deltaURL  string
-	err       error
 }
 
 // performDeltaUpdate attempts to apply a chain of delta updates to reach the latest version
