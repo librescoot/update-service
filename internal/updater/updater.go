@@ -1880,6 +1880,14 @@ const deltaDownloadRetryInterval = 5 * time.Minute
 // Can safely be raised to 24*time.Hour for very patient update behaviour.
 const deltaDownloadMaxRetryDuration = 15 * time.Minute
 
+// deltaChecksumFailureLimit bounds retries on a checksum mismatch specifically.
+// The time budget above assumes retries are cheap because downloads resume, but
+// a failed checksum discards the file, so each further attempt re-fetches the
+// whole delta. One re-download covers corruption in transit; a second identical
+// failure means the published asset itself is bad and no amount of waiting will
+// fix it, so fall back rather than pay for the delta again.
+const deltaChecksumFailureLimit = 2
+
 // deltaMaxAge is the age backstop for delta garbage collection: a delta the
 // version test cannot judge (cross-channel, unparseable) is reaped once it is
 // older than this.
@@ -2044,6 +2052,18 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	downloads := make([]deltaDownload, len(deltaChain))
 
 	for i, release := range deltaChain {
+		// abandonChain discards the deltas fetched so far and falls back to a
+		// full update. CleanupDeltaFile logs its own failures; we're already
+		// falling back, so there's nowhere further to report them.
+		abandonChain := func(reason string) {
+			for j := range i {
+				if downloads[j].deltaPath != "" {
+					_ = u.mender.CleanupDeltaFile(downloads[j].deltaPath)
+				}
+			}
+			u.fallbackToFullUpdate(releases, variantID, reason, manual)
+		}
+
 		deltaURL := ""
 		if asset, ok := releaseAsset(release, variantID, ".delta"); ok {
 			deltaURL = asset.URL
@@ -2051,24 +2071,19 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 		if deltaURL == "" {
 			u.logger.Printf("No delta asset found for %s, cannot continue", release.TagName)
-			for j := range i {
-				if downloads[j].deltaPath != "" {
-					// CleanupDeltaFile logs its own failures; we're already
-					// falling back to a full update, so there's nowhere
-					// further to report it.
-					_ = u.mender.CleanupDeltaFile(downloads[j].deltaPath)
-				}
-			}
-			u.fallbackToFullUpdate(releases, variantID, "no delta asset found", manual)
+			abandonChain("no delta asset found")
 			return
 		}
 
 		downloads[i].release = release
 		downloads[i].deltaURL = deltaURL
 
-		// Download with patient retry — downloads are resumable so each retry
-		// picks up where the previous left off, costing minimal extra bandwidth.
+		// Download with patient retry — a download interrupted mid-transfer
+		// resumes, so retrying one costs minimal extra bandwidth. A checksum
+		// mismatch is the exception: the file is discarded, so the retry pays
+		// for the whole delta again. Those get their own, much tighter budget.
 		downloadDeadline := time.Now().Add(deltaDownloadMaxRetryDuration)
+		checksumFailures := 0
 		var deltaPath string
 		for attempt := 1; ; attempt++ {
 			if attempt > 1 {
@@ -2083,28 +2098,21 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 				// The release was pruned from the host; the chain can never complete.
 				// Stop retrying and fall back to a full update immediately.
 				u.logger.Printf("Delta asset for %s unavailable, falling back to full update: %v", release.TagName, err)
-				for j := range i {
-					if downloads[j].deltaPath != "" {
-						// CleanupDeltaFile logs its own failures; we're already
-						// falling back to a full update, so there's nowhere
-						// further to report it.
-						_ = u.mender.CleanupDeltaFile(downloads[j].deltaPath)
-					}
-				}
-				u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("delta asset unavailable: %v", err), manual)
+				abandonChain(fmt.Sprintf("delta asset unavailable: %v", err))
 				return
+			}
+			if errors.Is(err, mender.ErrChecksumMismatch) {
+				checksumFailures++
+				if checksumFailures >= deltaChecksumFailureLimit {
+					u.logger.Printf("Delta for %s failed verification %d times, the published asset is bad: %v",
+						release.TagName, checksumFailures, err)
+					abandonChain(fmt.Sprintf("delta failed verification %d times: %v", checksumFailures, err))
+					return
+				}
 			}
 			if time.Now().After(downloadDeadline) {
 				u.logger.Printf("Download failed after %v of retries: %v", deltaDownloadMaxRetryDuration, err)
-				for j := range i {
-					if downloads[j].deltaPath != "" {
-						// CleanupDeltaFile logs its own failures; we're already
-						// falling back to a full update, so there's nowhere
-						// further to report it.
-						_ = u.mender.CleanupDeltaFile(downloads[j].deltaPath)
-					}
-				}
-				u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("download failed after retries: %v", err), manual)
+				abandonChain(fmt.Sprintf("download failed after retries: %v", err))
 				return
 			}
 			remaining := time.Until(downloadDeadline)

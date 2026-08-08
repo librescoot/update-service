@@ -24,6 +24,11 @@ import (
 // out its retry deadline.
 var ErrAssetUnavailable = errors.New("release asset unavailable")
 
+// ErrChecksumMismatch means the downloaded bytes did not match the checksum from
+// the release channel. Unlike a network failure, retrying costs a full re-fetch
+// rather than a resume, so callers should bound how often they retry on it.
+var ErrChecksumMismatch = errors.New("checksum mismatch")
+
 // ProgressCallback is called during download to report progress
 // downloaded: bytes downloaded so far
 // total: total bytes to download (0 if unknown)
@@ -409,7 +414,7 @@ func (d *Downloader) VerifyChecksum(filePath, checksumStr string) error {
 
 	actualHash := hex.EncodeToString(hash.Sum(nil))
 	if actualHash != expectedHash {
-		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedHash, actualHash)
+		return fmt.Errorf("%w: expected %s, got %s", ErrChecksumMismatch, expectedHash, actualHash)
 	}
 
 	d.logger.Printf("Checksum verification successful for %s", filePath)

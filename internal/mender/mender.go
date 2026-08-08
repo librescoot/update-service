@@ -2,6 +2,7 @@ package mender
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -45,10 +46,8 @@ func (m *Manager) DownloadAndVerify(ctx context.Context, url, checksum string, p
 	}
 
 	// Verify checksum if provided
-	if checksum != "" {
-		if err := m.downloader.VerifyChecksum(filePath, checksum); err != nil {
-			return "", err
-		}
+	if err := m.verifyOrDiscard(filePath, checksum); err != nil {
+		return "", err
 	}
 
 	// Clean up old downloaded files after successful verification
@@ -70,6 +69,29 @@ func (m *Manager) Install(filePath string, progressCb InstallProgressCallback) e
 // DownloadAndVerify.
 func (m *Manager) VerifyChecksum(filePath, checksum string) error {
 	return m.downloader.VerifyChecksum(filePath, checksum)
+}
+
+// verifyOrDiscard verifies a just-downloaded file and removes it if it does not
+// match. An empty checksum skips verification.
+//
+// Removing the file is the point: Download short-circuits on a size match, so a
+// bad file left in the download dir turns every subsequent attempt into a
+// re-verification of the same bytes. The retry budget then expires without a
+// single byte having been re-fetched, and the caller falls back to a full
+// artifact to recover from what a few hundred KB would have fixed.
+func (m *Manager) verifyOrDiscard(filePath, checksum string) error {
+	if checksum == "" {
+		return nil
+	}
+	err := m.downloader.VerifyChecksum(filePath, checksum)
+	if err == nil {
+		return nil
+	}
+	m.logger.Printf("Removing %s so the next attempt re-downloads it", filepath.Base(filePath))
+	if rmErr := m.RemoveFile(filePath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+		m.logger.Printf("Warning: failed to remove unverified file: %v", rmErr)
+	}
+	return err
 }
 
 // Commit commits the installed update
@@ -398,10 +420,8 @@ func (m *Manager) DownloadDelta(ctx context.Context, deltaURL, checksum string, 
 	if err != nil {
 		return "", fmt.Errorf("failed to download delta file: %w", err)
 	}
-	if checksum != "" {
-		if err := m.downloader.VerifyChecksum(deltaPath, checksum); err != nil {
-			return "", fmt.Errorf("delta checksum verification failed: %w", err)
-		}
+	if err := m.verifyOrDiscard(deltaPath, checksum); err != nil {
+		return "", fmt.Errorf("delta checksum verification failed: %w", err)
 	}
 	return deltaPath, nil
 }
