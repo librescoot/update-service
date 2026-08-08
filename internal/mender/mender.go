@@ -223,10 +223,35 @@ func (m *Manager) CleanupStaleDeltaFiles(maxAge time.Duration) {
 	}
 }
 
+// withinDownloadDir reports whether path is inside the download directory.
+//
+// It guards two recursive delete paths, so a string prefix test will not do:
+// that would accept a sibling directory sharing the name prefix, and would not
+// resolve traversal segments. Abs cleans the path lexically and Rel reports
+// whether the result escapes.
+//
+// Symlinks are not resolved. That needs the path to exist, which is not true of
+// every caller, and the directory is service-owned.
+func (m *Manager) withinDownloadDir(path string) bool {
+	absDir, err := filepath.Abs(m.downloader.downloadDir)
+	if err != nil {
+		return false
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absDir, absPath)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // CleanupFile removes a downloaded file
 func (m *Manager) CleanupFile(filePath string) error {
 	// Only clean up files within our download directory
-	if !filepath.HasPrefix(filePath, m.downloader.downloadDir) {
+	if !m.withinDownloadDir(filePath) {
 		m.logger.Printf("Warning: not cleaning up file outside download directory: %s", filePath)
 		return nil
 	}
@@ -243,7 +268,7 @@ func (m *Manager) CleanupFile(filePath string) error {
 // RemoveFile removes a specific file (used for cleaning up corrupted downloads)
 func (m *Manager) RemoveFile(filePath string) error {
 	// Only remove files within our download directory
-	if !filepath.HasPrefix(filePath, m.downloader.downloadDir) {
+	if !m.withinDownloadDir(filePath) {
 		return fmt.Errorf("refusing to remove file outside download directory: %s", filePath)
 	}
 

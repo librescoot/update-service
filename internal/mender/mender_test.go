@@ -99,7 +99,7 @@ func TestManager_FindMenderFileForVersion(t *testing.T) {
 	}
 
 	// Should find with lowercase version
-	path, found = manager.FindMenderFileForVersion("nightly-20251212t024719")
+	_, found = manager.FindMenderFileForVersion("nightly-20251212t024719")
 	if !found {
 		t.Errorf("Should have found mender file for lowercase version")
 	}
@@ -443,5 +443,39 @@ func TestManager_CleanupStaleDeltaFiles_UnsyncedClock(t *testing.T) {
 
 	if _, err := os.Stat(ancient); err != nil {
 		t.Errorf("expected ancient delta to survive while clock is unsynced, got err=%v", err)
+	}
+}
+
+func TestManager_withinDownloadDir(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mender_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logger := log.New(os.Stdout, "test: ", 0)
+	manager := NewManager(tmpDir, logger)
+
+	cases := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"file directly inside", filepath.Join(tmpDir, "a.mender"), true},
+		{"file in subdirectory", filepath.Join(tmpDir, "sub", "a.mender"), true},
+		{"the directory itself", tmpDir, true},
+		{"parent directory", filepath.Dir(tmpDir), false},
+		{"unrelated absolute path", "/etc/passwd", false},
+
+		{"sibling sharing the name prefix", tmpDir + "-old", false},
+		{"traversal escaping the directory", filepath.Join(tmpDir, "..", "..", "etc"), false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := manager.withinDownloadDir(c.path); got != c.want {
+				t.Errorf("withinDownloadDir(%q) = %v, want %v", c.path, got, c.want)
+			}
+		})
 	}
 }
