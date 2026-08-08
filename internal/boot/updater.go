@@ -203,14 +203,16 @@ func writeFileVerified(dst, src string) error {
 		return fmt.Errorf("open dst %s: %w", dst, err)
 	}
 	if _, err := f.Write(srcData); err != nil {
-		f.Close()
+		_ = f.Close()
 		return fmt.Errorf("write dst %s: %w", dst, err)
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return fmt.Errorf("sync dst %s: %w", dst, err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close dst %s: %w", dst, err)
+	}
 
 	// Read back and verify
 	dstData, err := os.ReadFile(dst)
@@ -259,7 +261,9 @@ func (b *BootUpdater) writeUBoot(imxPath string) error {
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("sync %s: %w", b.bootDevice, err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", b.bootDevice, err)
+	}
 
 	// Read back and verify
 	rf, err := os.Open(b.bootDevice)

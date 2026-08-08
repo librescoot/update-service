@@ -371,8 +371,9 @@ func (m *Manager) ApplyDeltaUpdate(ctx context.Context, deltaURL, currentVersion
 	// Apply the delta
 	err = m.deltaApplier.ApplyDelta(ctx, oldMenderPath, deltaPath, newMenderPath, deltaProgressCallback)
 	if err != nil {
-		// Clean up the delta file on failure
-		m.deltaApplier.CleanupDeltaFile(deltaPath)
+		// Clean up the delta file on failure; CleanupDeltaFile logs its own
+		// failures, and the error being returned here is the one that matters.
+		_ = m.deltaApplier.CleanupDeltaFile(deltaPath)
 		return "", fmt.Errorf("failed to apply delta update: %w", err)
 	}
 
@@ -422,7 +423,9 @@ func (m *Manager) ApplyDownloadedDelta(ctx context.Context, deltaPath, currentVe
 	err := m.deltaApplier.ApplyDelta(ctx, oldMenderPath, deltaPath, newMenderPath, deltaProgressCallback)
 	if err != nil {
 		if ctx.Err() == nil {
-			m.deltaApplier.CleanupDeltaFile(deltaPath)
+			// CleanupDeltaFile logs its own failures; the error being
+			// returned here is the one that matters.
+			_ = m.deltaApplier.CleanupDeltaFile(deltaPath)
 		}
 		return "", fmt.Errorf("failed to apply delta update: %w", err)
 	}
@@ -474,7 +477,9 @@ func (m *Manager) ApplyDownloadedDeltaChain(ctx context.Context, deltaPaths []st
 		// valid downloads that can be reused on the next attempt.
 		if ctx.Err() == nil {
 			for _, dp := range deltaPaths {
-				m.deltaApplier.CleanupDeltaFile(dp)
+				// CleanupDeltaFile logs its own failures; the error being
+				// returned below is the one that matters.
+				_ = m.deltaApplier.CleanupDeltaFile(dp)
 			}
 		}
 		return "", fmt.Errorf("failed to apply delta chain: %w", err)

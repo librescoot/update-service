@@ -61,7 +61,9 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 	if err := ShellGunzipTracked(compressedPayload, payloadPath, tracker); err != nil {
 		return fmt.Errorf("decompress payload: %w", err)
 	}
-	os.Remove(compressedPayload)
+	// Best-effort: compressedPayload lives under workDir, which is removed
+	// wholesale by the deferred cleanup at the end of this function.
+	_ = os.Remove(compressedPayload)
 
 	// If we used an estimate, recalculate with the actual decompressed size
 	if payloadInfo, err := os.Stat(payloadPath); err == nil {
@@ -104,7 +106,9 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 
 		for relPath, change := range metadata.Changes {
 			outputFilePath := filepath.Join(outputDir, relPath)
-			os.MkdirAll(filepath.Dir(outputFilePath), 0755)
+			if err := os.MkdirAll(filepath.Dir(outputFilePath), 0755); err != nil {
+				return fmt.Errorf("mkdir for %s: %w", relPath, err)
+			}
 
 			switch change.Type {
 			case "new":
@@ -122,22 +126,29 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 				}
 
 				if change.NewMeta.DecompressedSHA256 != "" && sha256hex != change.NewMeta.DecompressedSHA256 {
-					os.Remove(nextPayload)
+					_ = os.Remove(nextPayload)
 					return fmt.Errorf("checksum mismatch after delta %d for %s: got %s, want %s",
 						deltaNum, relPath, sha256hex, change.NewMeta.DecompressedSHA256)
 				}
 
-				os.Remove(payloadPath)
+				// Rename replaces the destination atomically, so a failure to
+				// remove it first is harmless; the Rename error below is what
+				// actually matters.
+				_ = os.Remove(payloadPath)
 				if err := os.Rename(nextPayload, payloadPath); err != nil {
 					return fmt.Errorf("rename payload: %w", err)
 				}
 
 			case "deleted":
-				os.Remove(outputFilePath)
+				if err := os.Remove(outputFilePath); err != nil && !os.IsNotExist(err) {
+					return fmt.Errorf("delete %s: %w", relPath, err)
+				}
 			}
 		}
 
-		os.RemoveAll(deltaDir)
+		// Best-effort: deltaDir lives under workDir, which is removed
+		// wholesale by the deferred cleanup at the end of this function.
+		_ = os.RemoveAll(deltaDir)
 		a.logger.Printf("[Delta %d/%d] verified", deltaNum, n)
 	}
 
@@ -150,7 +161,9 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 	if err != nil {
 		return fmt.Errorf("compress payload: %w", err)
 	}
-	os.Remove(payloadPath)
+	// Best-effort: payloadPath lives under workDir, which is removed
+	// wholesale by the deferred cleanup at the end of this function.
+	_ = os.Remove(payloadPath)
 
 	if lastMetadata != nil && lastMetadata.NewPayloadChecksum != "" {
 		if rootfsChecksum != lastMetadata.NewPayloadChecksum {

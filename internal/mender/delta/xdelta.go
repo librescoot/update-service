@@ -31,21 +31,25 @@ func ApplyXdelta(ctx context.Context, sourceFile, patchFile, outputFile string, 
 	hasher := sha256.New()
 
 	if err := cmd.Start(); err != nil {
-		outFile.Close()
+		_ = outFile.Close()
 		return "", fmt.Errorf("xdelta3 start: %w", err)
 	}
 
 	reader := tracker.reader(stdout, "applying xdelta")
 	_, copyErr := io.Copy(io.MultiWriter(outFile, hasher), reader)
-	outFile.Close()
+	closeErr := outFile.Close()
 
 	if waitErr := cmd.Wait(); waitErr != nil {
-		os.Remove(outputFile)
+		_ = os.Remove(outputFile)
 		return "", fmt.Errorf("xdelta3 failed: %w", waitErr)
 	}
 	if copyErr != nil {
-		os.Remove(outputFile)
+		_ = os.Remove(outputFile)
 		return "", fmt.Errorf("xdelta3 output copy: %w", copyErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(outputFile)
+		return "", fmt.Errorf("xdelta3 output close: %w", closeErr)
 	}
 
 	return hex.EncodeToString(hasher.Sum(nil)), nil

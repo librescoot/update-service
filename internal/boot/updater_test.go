@@ -61,7 +61,9 @@ tmpfs /tmp tmpfs rw 0 0
 			if _, err := f.WriteString(tt.mounts); err != nil {
 				t.Fatal(err)
 			}
-			f.Close()
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
 
 			// Patch the function to use our temp file by monkey-patching Open
 			// Since we can't easily mock os.Open, we use an internal helper instead.

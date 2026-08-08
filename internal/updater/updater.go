@@ -610,7 +610,7 @@ func (u *Updater) monitorVehicleState() {
 
 	// Block until context is cancelled
 	<-u.ctx.Done()
-	watcher.Stop()
+	_ = watcher.Stop()
 }
 
 // checkInitialStandbyState checks the initial vehicle state on startup and sets standby timestamp
@@ -1017,7 +1017,9 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 		u.logger.Printf("Verifying checksum for %s", source)
 		if err := u.mender.VerifyChecksum(source, checksum); err != nil {
 			u.logger.Printf("Checksum verification failed for %s: %v", source, err)
-			u.mender.CleanupDeltaFile(source)
+			// CleanupDeltaFile logs its own failures; the error status set
+			// below is what actually gets reported.
+			_ = u.mender.CleanupDeltaFile(source)
 			if err := u.status.SetError(u.ctx, "checksum-mismatch", fmt.Sprintf("Checksum verification failed: %v", err)); err != nil {
 				u.logger.Printf("Failed to set error status: %v", err)
 			}
@@ -2051,7 +2053,10 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			u.logger.Printf("No delta asset found for %s, cannot continue", release.TagName)
 			for j := range i {
 				if downloads[j].deltaPath != "" {
-					u.mender.CleanupDeltaFile(downloads[j].deltaPath)
+					// CleanupDeltaFile logs its own failures; we're already
+					// falling back to a full update, so there's nowhere
+					// further to report it.
+					_ = u.mender.CleanupDeltaFile(downloads[j].deltaPath)
 				}
 			}
 			u.fallbackToFullUpdate(releases, variantID, "no delta asset found", manual)
@@ -2080,7 +2085,10 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 				u.logger.Printf("Delta asset for %s unavailable, falling back to full update: %v", release.TagName, err)
 				for j := range i {
 					if downloads[j].deltaPath != "" {
-						u.mender.CleanupDeltaFile(downloads[j].deltaPath)
+						// CleanupDeltaFile logs its own failures; we're already
+						// falling back to a full update, so there's nowhere
+						// further to report it.
+						_ = u.mender.CleanupDeltaFile(downloads[j].deltaPath)
 					}
 				}
 				u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("delta asset unavailable: %v", err), manual)
@@ -2090,7 +2098,10 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 				u.logger.Printf("Download failed after %v of retries: %v", deltaDownloadMaxRetryDuration, err)
 				for j := range i {
 					if downloads[j].deltaPath != "" {
-						u.mender.CleanupDeltaFile(downloads[j].deltaPath)
+						// CleanupDeltaFile logs its own failures; we're already
+						// falling back to a full update, so there's nowhere
+						// further to report it.
+						_ = u.mender.CleanupDeltaFile(downloads[j].deltaPath)
 					}
 				}
 				u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("download failed after retries: %v", err), manual)

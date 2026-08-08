@@ -56,7 +56,9 @@ func (a *DeltaApplier) ApplyDeltaChain(ctx context.Context, oldMenderPath string
 	}
 
 	// Ensure temp dir exists
-	os.MkdirAll(defaultTempDir, 0755)
+	if err := os.MkdirAll(defaultTempDir, 0755); err != nil {
+		return fmt.Errorf("create temp directory: %w", err)
+	}
 
 	progress := func(percent int, message string) {
 		a.logger.Printf("Delta chain: %d%% - %s", percent, message)

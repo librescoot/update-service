@@ -367,7 +367,9 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 						progressCallback(totalRead, totalSize)
 					}
 
-					file.Close()
+					if err := file.Close(); err != nil {
+						return "", fmt.Errorf("error closing downloaded file: %w", err)
+					}
 					if err := os.Rename(downloadTempPath, finalPath); err != nil {
 						return "", fmt.Errorf("error renaming temporary file: %w", err)
 					}

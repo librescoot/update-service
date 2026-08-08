@@ -63,7 +63,7 @@ func ShellGunzipTracked(inputFile, outputFile string, tracker *progressTracker) 
 			return fmt.Errorf("gunzip start: %w", err)
 		}
 		if _, err := io.Copy(outFile, tracker.reader(stdout, "decompressing")); err != nil {
-			cmd.Wait()
+			_ = cmd.Wait()
 			return fmt.Errorf("gunzip copy: %w", err)
 		}
 		if err := cmd.Wait(); err != nil {

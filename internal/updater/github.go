@@ -111,7 +111,7 @@ func (g *GitHubAPI) GetReleases(channel string) ([]Release, error) {
 
 		// Handle response cleanup if we got a response but will retry
 		if resp != nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 
 		// Save the last error

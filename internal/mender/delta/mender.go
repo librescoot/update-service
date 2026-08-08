@@ -133,15 +133,15 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, tracker *prog
 	const tarBlock = 512
 	header := make([]byte, tarBlock)
 	if _, err := io.ReadFull(inReader, header); err != nil {
-		gzipIn.Close()
-		gzipCmd.Wait()
+		_ = gzipIn.Close()
+		_ = gzipCmd.Wait()
 		return "", fmt.Errorf("read tar header: %w", err)
 	}
 
 	// Write header to gzip
 	if _, err := gzipIn.Write(header); err != nil {
-		gzipIn.Close()
-		gzipCmd.Wait()
+		_ = gzipIn.Close()
+		_ = gzipCmd.Wait()
 		return "", fmt.Errorf("write header to gzip: %w", err)
 	}
 
@@ -161,8 +161,8 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, tracker *prog
 		if n > 0 {
 			// Write to gzip
 			if _, err := gzipIn.Write(buf[:n]); err != nil {
-				gzipIn.Close()
-				gzipCmd.Wait()
+				_ = gzipIn.Close()
+				_ = gzipCmd.Wait()
 				return "", fmt.Errorf("write to gzip: %w", err)
 			}
 
@@ -177,17 +177,16 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, tracker *prog
 			break
 		}
 		if readErr != nil {
-			gzipIn.Close()
-			gzipCmd.Wait()
+			_ = gzipIn.Close()
+			_ = gzipCmd.Wait()
 			return "", fmt.Errorf("read payload: %w", readErr)
 		}
 	}
 
-	gzipIn.Close()
+	_ = gzipIn.Close()
 	if err := gzipCmd.Wait(); err != nil {
 		return "", fmt.Errorf("gzip failed: %w", err)
 	}
 
 	return hex.EncodeToString(innerHasher.Sum(nil)), nil
 }
-

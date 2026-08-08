@@ -20,7 +20,7 @@ func TestDownloader_SkipsCompleteFile(t *testing.T) {
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
 			return
 		}
-		w.Write(content)
+		_, _ = w.Write(content)
 	}))
 	defer server.Close()
 
@@ -74,14 +74,14 @@ func TestDownloader_ResumesIncompleteFile(t *testing.T) {
 		rangeHeader := r.Header.Get("Range")
 		if rangeHeader != "" {
 			var start int64
-			fmt.Sscanf(rangeHeader, "bytes=%d-", &start)
+			_, _ = fmt.Sscanf(rangeHeader, "bytes=%d-", &start)
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", int64(len(content))-start))
 			w.WriteHeader(http.StatusPartialContent)
-			w.Write(content[start:])
+			_, _ = w.Write(content[start:])
 			return
 		}
 
-		w.Write(content)
+		_, _ = w.Write(content)
 	}))
 	defer server.Close()
 
@@ -131,7 +131,7 @@ func TestDownloader_DeletesOversizedFile(t *testing.T) {
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
 			return
 		}
-		w.Write(content)
+		_, _ = w.Write(content)
 	}))
 	defer server.Close()
 
@@ -186,7 +186,7 @@ func rangeAware416Server(t *testing.T, content []byte) *httptest.Server {
 		}
 		if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
 			var start int64
-			fmt.Sscanf(rangeHeader, "bytes=%d-", &start)
+			_, _ = fmt.Sscanf(rangeHeader, "bytes=%d-", &start)
 			if start >= int64(len(content)) {
 				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", len(content)))
 				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
@@ -194,10 +194,10 @@ func rangeAware416Server(t *testing.T, content []byte) *httptest.Server {
 			}
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", int64(len(content))-start))
 			w.WriteHeader(http.StatusPartialContent)
-			w.Write(content[start:])
+			_, _ = w.Write(content[start:])
 			return
 		}
-		w.Write(content)
+		_, _ = w.Write(content)
 	}))
 }
 
@@ -300,17 +300,17 @@ func TestDownloader_Finalizes416WhenHeadUnavailable(t *testing.T) {
 		}
 		if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
 			var start int64
-			fmt.Sscanf(rangeHeader, "bytes=%d-", &start)
+			_, _ = fmt.Sscanf(rangeHeader, "bytes=%d-", &start)
 			if start >= int64(len(content)) {
 				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 				return
 			}
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", int64(len(content))-start))
 			w.WriteHeader(http.StatusPartialContent)
-			w.Write(content[start:])
+			_, _ = w.Write(content[start:])
 			return
 		}
-		w.Write(content)
+		_, _ = w.Write(content)
 	}))
 	defer server.Close()
 
