@@ -292,33 +292,3 @@ func (c *Client) GetDBCChannel() string {
 	}
 	return val
 }
-
-// GetDBCDownloadSkipChecks returns how many further checks the DBC's own
-// backoff ladder says to skip, or 0 if no backoff is recorded. Best effort:
-// the field lives in MDB Redis and is wiped on an MDB reboot, after which the
-// DBC's own persisted state is what actually stops the transfer.
-//
-// A missing field is not an error, it just means the DBC has never backed
-// off: mirrors how GetOrchestrateDBC treats an absent key. The error return
-// is reserved for a field that is present but unparseable.
-func (c *Client) GetDBCDownloadSkipChecks() (int64, error) {
-	v, err := c.client.HGet("ota", "download-skip-checks:dbc")
-	if err != nil || v == "" {
-		return 0, nil
-	}
-	return strconv.ParseInt(v, 10, 64)
-}
-
-// SetDBCDownloadSkipChecks writes the DBC's remaining skip-check count. The
-// orchestrator uses this to decrement what it read, because the DBC only
-// checks when powered and the MDB powers it in order to check: if only the
-// DBC ever decremented, skipping on this counter would leave it backed off
-// forever. A count of 0 or less clears the field, matching how a spent
-// backoff is represented everywhere else in this hash.
-func (c *Client) SetDBCDownloadSkipChecks(count int64) error {
-	v := ""
-	if count > 0 {
-		v = strconv.FormatInt(count, 10)
-	}
-	return c.client.HSet("ota", "download-skip-checks:dbc", v)
-}
