@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/inhibitor"
-	ipc "github.com/librescoot/redis-ipc"
 )
 
 // newTestUpdaterForInhibits builds an Updater with just enough wired up to

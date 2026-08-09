@@ -4,10 +4,9 @@
 // The state lives on /data rather than in Redis because Redis is wiped on
 // every MDB reboot, and a ladder that resets on each boot never actually
 // backs off. The ladder counts checks skipped rather than a wall-clock
-// deadline, which additionally makes it immune to a wrong clock: a stale RTC
-// reporting a plausible-but-wrong date used to make a stored deadline look
-// far-future and wedge the ladder shut. There is no clock read anywhere in
-// this package.
+// deadline, which makes it immune to a wrong clock: a stale RTC reporting a
+// plausible-but-wrong date would make a stored deadline look far-future and
+// wedge the ladder shut. There is no clock read anywhere in this package.
 //
 // The state stores a rung index, not a check count. A count computed once at
 // record time and then stored would go stale the moment check-interval

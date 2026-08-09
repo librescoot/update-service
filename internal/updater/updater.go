@@ -1449,13 +1449,12 @@ func abortReasonFor(err error) string {
 // transferred; an attempt that moved a meaningful amount resets the ladder
 // rather than advancing it, because it was interrupted rather than hopeless.
 //
-// RecordAbort itself no longer knows about check-interval: it stores a rung
-// index, not a count. The rung-to-count conversion happens here, once, right
-// after the index is chosen, using whatever check-interval is current right
-// now. That is deliberately the only place this conversion is duplicated
+// RecordAbort stores a rung index, not a count. The rung-to-count conversion
+// happens here, once, right after the index is chosen, using whatever
+// check-interval is current. This is the only place that conversion appears
 // outside ShouldSkip: SetAborted needs a count to publish immediately, and
-// ChecksToSkip is the same function ShouldSkip itself will use to recompute
-// the count later, so the two never disagree about what a given rung means.
+// ChecksToSkip is the same function ShouldSkip uses to recompute the count
+// later, so the two never disagree about what a given rung means.
 func (u *Updater) recordDownloadAbort(target string, err error, bytesGained int64) {
 	reason := abortReasonFor(err)
 	rungIndex, recErr := u.backoff.RecordAbort(target, bytesGained)
@@ -2184,14 +2183,12 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	// to avoid self-deadlocking on the non-reentrant mutex. That reasoning
 	// still holds and is the one that actually requires this guard.
 	//
-	// startHeartbeat no longer strictly needs the same guard: it is now
-	// reference-counted (see startHeartbeat), so calling it again on the
-	// recursive call would just share the already-running goroutine rather
-	// than start a second one. It stays under the same condition anyway,
-	// grouped with the mutex it must track: skipping it on the recursive
-	// call avoids one redundant increment/decrement pair, and keeping both
-	// guards together means there is only one condition to read here instead
-	// of two that happen to agree.
+	// startHeartbeat does not strictly need the same guard, being
+	// reference-counted (see startHeartbeat): calling it again on the
+	// recursive call would share the already-running goroutine rather than
+	// start a second one. It sits under the same condition anyway, grouped
+	// with the mutex it must track, so there is one condition to read here
+	// instead of two that happen to agree.
 	if !isRecheck {
 		if !u.updateOpMu.TryLock() {
 			u.logger.Printf("Update already in progress, skipping delta update")

@@ -42,17 +42,13 @@ type Config struct {
 	// Download budget. Each bounds a single attempt; 0 disables that bound.
 	// A budget abort keeps the partial file, so the next attempt resumes.
 	//
-	// These three are read concurrently, once per download attempt, through
-	// DownloadBudget() by the download goroutine, while ApplyRedisUpdate can
-	// rewrite them at any time from the settings-watcher goroutine. budgetMu
-	// guards exactly that: every other Config field is read and written
-	// directly with no synchronization at all, an existing convention of
-	// this struct that this lock does not attempt to fix. These three fields
-	// are different because, unlike Channel or CheckInterval, they never had
-	// a concurrent reader before the budget became a live provider (the
-	// value used to be copied once, at construction, into a Downloader field
-	// that was then never re-read) — this lock is what gives them one, so it
-	// needs to actually be correct.
+	// These three are read once per download attempt through DownloadBudget()
+	// by the download goroutine, while ApplyRedisUpdate can rewrite them at
+	// any time from the settings-watcher goroutine. budgetMu guards exactly
+	// that pair of accesses. Every other Config field is read and written
+	// directly with no synchronization, a convention of this struct that this
+	// lock does not attempt to fix; these three differ in having a genuine
+	// concurrent reader, so their guard has to be correct.
 	budgetMu              sync.RWMutex
 	DownloadMaxDuration   time.Duration // Wall clock cap on one download attempt
 	DownloadStallWindow   time.Duration // Rolling window the throughput floor is measured over
