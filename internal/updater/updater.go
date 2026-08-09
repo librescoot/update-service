@@ -1572,7 +1572,10 @@ func (u *Updater) startHeartbeat() func() {
 // exactly the AUX drain this mechanism exists to prevent. The two ship
 // together or not at all, so a disabled cap means no hold this attempt.
 func (u *Updater) holdSuspend() func() {
-	if u.config.DownloadMaxDuration <= 0 {
+	// Read through the accessor, not the field: the settings watcher can
+	// rewrite it at any time and the three budget fields are guarded.
+	maxDuration, _, _ := u.config.DownloadBudget()
+	if maxDuration <= 0 {
 		u.logger.Printf("Warning: download-max-duration is disabled, not holding suspend for this transfer")
 		return func() {}
 	}
