@@ -1183,6 +1183,10 @@ func (u *Updater) handleUpdateFromURL(url string) {
 		return
 	}
 
+	// Committed to transferring past this point: every early return above
+	// this line must not take the inhibit.
+	defer u.holdSuspend()()
+
 	for i := range 5 {
 		if u.ctx.Err() != nil {
 			u.logger.Printf("Context cancelled during download attempt %d", i+1)
@@ -1421,6 +1425,24 @@ func (u *Updater) recordDownloadAbort(target string, err error, bytesGained int6
 	}
 	if setErr := u.status.SetAborted(u.ctx, reason, retryAfter); setErr != nil {
 		u.logger.Printf("Failed to set aborted status: %v", setErr)
+	}
+}
+
+// holdSuspend takes the suspend inhibit for the duration of a transfer and
+// returns the release function. The caller must defer the result on every
+// path: a leaked inhibit keeps the MDB awake indefinitely.
+//
+// Unlike AddDownloadInhibit, this is not gated to the mdb component: the DBC
+// downloads over the MDB's modem, so the MDB must stay awake for a DBC
+// transfer too.
+func (u *Updater) holdSuspend() func() {
+	if err := u.inhibitor.AddDownloadSuspendInhibit(u.config.Component); err != nil {
+		u.logger.Printf("Failed to add download suspend inhibit: %v", err)
+	}
+	return func() {
+		if err := u.inhibitor.RemoveDownloadSuspendInhibit(u.config.Component); err != nil {
+			u.logger.Printf("Failed to remove download suspend inhibit: %v", err)
+		}
 	}
 }
 
@@ -1834,6 +1856,10 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string, manual b
 		}
 	}()
 
+	// Committed to transferring past this point: every early return above
+	// this line must not take the inhibit.
+	defer u.holdSuspend()()
+
 	// Step 2: Download and verify the update
 	var progress progressTracker
 	progressCallback := func(downloaded, total int64) {
@@ -2151,6 +2177,13 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			}
 		}
 	}()
+
+	// Committed to transferring past this point: every early return above
+	// this line must not take the inhibit. This one hold covers the whole
+	// function, including the opportunistic extra-delta download further
+	// down and the recursive re-check call: both run inline in this same
+	// call, before this defer fires.
+	defer u.holdSuspend()()
 
 	// deltaProgress tracks bytes gained by the current download attempt, for
 	// the backoff ladder. It is a plain value reset by reassignment at the top

@@ -19,8 +19,9 @@ const (
 type InhibitType string
 
 const (
-	TypeBlock InhibitType = "block" // Block power state changes completely
-	TypeDelay InhibitType = "delay" // Delay power state changes for a specified duration
+	TypeBlock       InhibitType = "block"        // Block power state changes completely
+	TypeDelay       InhibitType = "delay"        // Delay power state changes for a specified duration
+	TypeSuspendOnly InhibitType = "suspend-only" // Blocks suspend but not hibernate, poweroff or reboot
 )
 
 // InhibitData represents the data stored in Redis for an inhibit
@@ -113,6 +114,27 @@ func (c *Client) AddDownloadInhibit(componentID string) error {
 func (c *Client) RemoveDownloadInhibit(componentID string) error {
 	id := fmt.Sprintf("download:%s", componentID)
 	return c.RemoveInhibit(id)
+}
+
+// AddDownloadSuspendInhibit holds off idle suspend while a download is running.
+//
+// This has to be suspend-only, not delay: pm-service honours only block and
+// suspend-only, so a delay inhibit would let the MDB suspend about a minute
+// into stand-by and take the modem with it. It must not be block either, since
+// a download has no business standing in the way of a hibernate.
+//
+// Safe only because the download itself is bounded. An unbounded hold by a
+// transfer that never finishes is the AUX drain this whole mechanism exists to
+// prevent, so every exit path must remove it.
+func (c *Client) AddDownloadSuspendInhibit(componentID string) error {
+	id := fmt.Sprintf("download-transfer:%s", componentID)
+	return c.AddInhibit(id, "update-service", "power-state-change",
+		fmt.Sprintf("downloading update for %s", componentID), TypeSuspendOnly, 0)
+}
+
+// RemoveDownloadSuspendInhibit removes the suspend hold taken for a transfer.
+func (c *Client) RemoveDownloadSuspendInhibit(componentID string) error {
+	return c.RemoveInhibit(fmt.Sprintf("download-transfer:%s", componentID))
 }
 
 // AddPreparingInhibit adds a preparing inhibit that delays power state changes
