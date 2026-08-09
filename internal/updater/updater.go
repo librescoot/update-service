@@ -111,10 +111,17 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		redis:     redisClient,
 		inhibitor: inhibitorClient,
 		power:     powerClient,
-		mender: mender.NewManager(downloadDir, mender.Budget{
-			MaxDuration:   cfg.DownloadMaxDuration,
-			StallWindow:   cfg.DownloadStallWindow,
-			StallMinBytes: cfg.DownloadStallMinBytes,
+		// A closure, not a snapshot: cfg.DownloadBudget() is called fresh at
+		// the top of every download attempt, so a runtime settings change
+		// (e.g. download-max-duration edited mid-campaign) takes effect on
+		// the next attempt without needing to reconstruct the Manager.
+		mender: mender.NewManager(downloadDir, func() mender.Budget {
+			maxDuration, stallWindow, stallMinBytes := cfg.DownloadBudget()
+			return mender.Budget{
+				MaxDuration:   maxDuration,
+				StallWindow:   stallWindow,
+				StallMinBytes: stallMinBytes,
+			}
 		}, logger),
 		backoff:              backoff.NewStore(downloadDir, logger),
 		status:               statusReporter,

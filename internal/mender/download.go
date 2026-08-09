@@ -84,18 +84,26 @@ type ProgressCallback func(downloaded, total int64)
 // Downloader handles downloading update files with resumable downloads and retry logic
 type Downloader struct {
 	downloadDir string
-	budget      Budget
+	budget      func() Budget
 	logger      *log.Logger
 }
 
-// NewDownloader creates a new downloader instance
-func NewDownloader(downloadDir string, budget Budget, logger *log.Logger) *Downloader {
+// NewDownloader creates a new downloader instance. budget is called once at
+// the start of every Download attempt, not just once at construction time, so
+// a runtime settings change is picked up by the next attempt without
+// disturbing one already in flight. A nil budget behaves as an always-zero
+// (unlimited) Budget.
+func NewDownloader(downloadDir string, budget func() Budget, logger *log.Logger) *Downloader {
 	// Ensure download directory exists
 	if _, err := os.Stat(downloadDir); os.IsNotExist(err) {
 		logger.Printf("Download directory %s does not exist, creating it...", downloadDir)
 		if err := os.MkdirAll(downloadDir, 0755); err != nil {
 			logger.Printf("Error creating download directory: %v", err)
 		}
+	}
+
+	if budget == nil {
+		budget = func() Budget { return Budget{} }
 	}
 
 	return &Downloader{
@@ -176,6 +184,13 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 		filename = "update.mender"
 	}
 
+	// Read once, at the top of this attempt: the spec promise is that the
+	// budget in effect for an attempt is whatever was configured when the
+	// attempt started, not whatever a settings-watcher goroutine last wrote.
+	// Reading it again partway through would let a runtime change shrink or
+	// grow the cap on a transfer already in flight.
+	budget := d.budget()
+
 	var abort abortRecorder
 	reqCtx, cancelReq := context.WithCancel(ctx)
 	defer cancelReq()
@@ -183,8 +198,8 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 	// The wall-clock cap covers the entire attempt, HEAD requests and connect
 	// retries included, so a link that cannot even establish a connection
 	// still terminates.
-	if d.budget.MaxDuration > 0 {
-		budgetTimer := time.AfterFunc(d.budget.MaxDuration, func() {
+	if budget.MaxDuration > 0 {
+		budgetTimer := time.AfterFunc(budget.MaxDuration, func() {
 			abort.set(ErrDownloadBudgetExceeded)
 			cancelReq()
 		})
@@ -394,9 +409,9 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 
 	var stallTimer *time.Timer
 	var progressed int64
-	stallEnabled := d.budget.StallWindow > 0 && d.budget.StallMinBytes > 0
+	stallEnabled := budget.StallWindow > 0 && budget.StallMinBytes > 0
 	if stallEnabled {
-		stallTimer = time.AfterFunc(d.budget.StallWindow, func() {
+		stallTimer = time.AfterFunc(budget.StallWindow, func() {
 			abort.set(ErrDownloadStalled)
 			cancelReq()
 		})
@@ -418,9 +433,9 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 
 				if stallEnabled {
 					progressed += int64(n)
-					if progressed >= d.budget.StallMinBytes {
+					if progressed >= budget.StallMinBytes {
 						progressed = 0
-						stallTimer.Reset(d.budget.StallWindow)
+						stallTimer.Reset(budget.StallWindow)
 					}
 				}
 

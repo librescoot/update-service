@@ -33,7 +33,7 @@ func TestDownloader_SkipsCompleteFile(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	downloader := NewDownloader(tmpDir, Budget{}, logger)
+	downloader := NewDownloader(tmpDir, func() Budget { return Budget{} }, logger)
 
 	// Pre-create a complete file
 	filename := "testfile.mender"
@@ -94,7 +94,7 @@ func TestDownloader_ResumesIncompleteFile(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	downloader := NewDownloader(tmpDir, Budget{}, logger)
+	downloader := NewDownloader(tmpDir, func() Budget { return Budget{} }, logger)
 
 	// Pre-create an incomplete file (first half of content)
 	filename := "testfile.mender"
@@ -144,7 +144,7 @@ func TestDownloader_DeletesOversizedFile(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	downloader := NewDownloader(tmpDir, Budget{}, logger)
+	downloader := NewDownloader(tmpDir, func() Budget { return Budget{} }, logger)
 
 	// Pre-create an oversized file (larger than server content)
 	filename := "testfile.mender"
@@ -218,7 +218,7 @@ func TestDownloader_FinalizesCompleteTmpOn416(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	downloader := NewDownloader(tmpDir, Budget{}, logger)
+	downloader := NewDownloader(tmpDir, func() Budget { return Budget{} }, logger)
 
 	filename := "testfile.mender"
 	filePath := filepath.Join(tmpDir, filename)
@@ -262,7 +262,7 @@ func TestDownloader_DiscardsOversizedTmpOn416(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	downloader := NewDownloader(tmpDir, Budget{}, logger)
+	downloader := NewDownloader(tmpDir, func() Budget { return Budget{} }, logger)
 
 	filename := "testfile.mender"
 	filePath := filepath.Join(tmpDir, filename)
@@ -322,7 +322,7 @@ func TestDownloader_Finalizes416WhenHeadUnavailable(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	downloader := NewDownloader(tmpDir, Budget{}, logger)
+	downloader := NewDownloader(tmpDir, func() Budget { return Budget{} }, logger)
 
 	filename := "testfile.mender"
 	filePath := filepath.Join(tmpDir, filename)
@@ -364,7 +364,7 @@ func TestDownloader_ReportsAssetUnavailableOn404(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	downloader := NewDownloader(tmpDir, Budget{}, logger)
+	downloader := NewDownloader(tmpDir, func() Budget { return Budget{} }, logger)
 
 	_, err = downloader.Download(context.Background(), server.URL+"/gone.delta", nil)
 	if !errors.Is(err, ErrAssetUnavailable) {
@@ -385,7 +385,7 @@ func TestDownloader_ReportsAssetUnavailableOn410(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	downloader := NewDownloader(tmpDir, Budget{}, logger)
+	downloader := NewDownloader(tmpDir, func() Budget { return Budget{} }, logger)
 
 	_, err = downloader.Download(context.Background(), server.URL+"/gone.delta", nil)
 	if !errors.Is(err, ErrAssetUnavailable) {
@@ -408,7 +408,7 @@ func TestDownloader_ReportsAssetUnavailableOnResume(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	downloader := NewDownloader(tmpDir, Budget{}, logger)
+	downloader := NewDownloader(tmpDir, func() Budget { return Budget{} }, logger)
 
 	filename := "gone.delta"
 	tmpPath := filepath.Join(tmpDir, filename+".tmp")
@@ -439,7 +439,7 @@ func TestGetExpectedFileSize(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	downloader := NewDownloader(tmpDir, Budget{}, logger)
+	downloader := NewDownloader(tmpDir, func() Budget { return Budget{} }, logger)
 
 	size, err := downloader.getExpectedFileSize(context.Background(), server.URL+"/test.mender")
 	if err != nil {
@@ -484,7 +484,7 @@ func TestDownloader_AbortsWhenBelowThroughputFloor(t *testing.T) {
 	tmpDir := t.TempDir()
 	logger := log.New(os.Stdout, "test: ", 0)
 	budget := Budget{StallWindow: 200 * time.Millisecond, StallMinBytes: 4096}
-	d := NewDownloader(tmpDir, budget, logger)
+	d := NewDownloader(tmpDir, func() Budget { return budget }, logger)
 
 	_, err := d.Download(context.Background(), server.URL+"/slow.mender", nil)
 	if !errors.Is(err, ErrDownloadStalled) {
@@ -514,7 +514,7 @@ func TestDownloader_AbortsOnWallClockBudget(t *testing.T) {
 		StallWindow:   10 * time.Second,
 		StallMinBytes: 1,
 	}
-	d := NewDownloader(tmpDir, budget, logger)
+	d := NewDownloader(tmpDir, func() Budget { return budget }, logger)
 
 	_, err := d.Download(context.Background(), server.URL+"/big.mender", nil)
 	if !errors.Is(err, ErrDownloadBudgetExceeded) {
@@ -541,7 +541,7 @@ func TestDownloader_AbortsSilentServerAtStallWindow(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := log.New(os.Stdout, "test: ", 0)
-	d := NewDownloader(tmpDir, Budget{StallWindow: 200 * time.Millisecond, StallMinBytes: 1}, logger)
+	d := NewDownloader(tmpDir, func() Budget { return Budget{StallWindow: 200 * time.Millisecond, StallMinBytes: 1} }, logger)
 
 	start := time.Now()
 	_, err := d.Download(context.Background(), server.URL+"/silent.mender", nil)
@@ -560,7 +560,7 @@ func TestDownloader_ParentCancelIsNotABudgetAbort(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := log.New(os.Stdout, "test: ", 0)
-	d := NewDownloader(tmpDir, Budget{StallWindow: 10 * time.Second, StallMinBytes: 1}, logger)
+	d := NewDownloader(tmpDir, func() Budget { return Budget{StallWindow: 10 * time.Second, StallMinBytes: 1} }, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -600,7 +600,7 @@ func TestDownloader_BurstThenShortGapDoesNotAbort(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := log.New(os.Stdout, "test: ", 0)
-	d := NewDownloader(tmpDir, Budget{StallWindow: time.Second, StallMinBytes: 8 * 1024}, logger)
+	d := NewDownloader(tmpDir, func() Budget { return Budget{StallWindow: time.Second, StallMinBytes: 8 * 1024} }, logger)
 
 	path, err := d.Download(context.Background(), server.URL+"/bursty.mender", nil)
 	if err != nil {
@@ -619,9 +619,38 @@ func TestDownloader_ZeroBudgetIsUnlimited(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := log.New(os.Stdout, "test: ", 0)
-	d := NewDownloader(tmpDir, Budget{}, logger)
+	d := NewDownloader(tmpDir, func() Budget { return Budget{} }, logger)
 
 	if _, err := d.Download(context.Background(), server.URL+"/unlimited.mender", nil); err != nil {
 		t.Fatalf("zero budget must impose no limits, got %v", err)
+	}
+}
+
+// TestDownloader_ReadsBudgetFreshPerAttempt proves the budget provider is
+// consulted at the start of every attempt rather than frozen at construction
+// time: the same long-lived Downloader must pick up a budget change made
+// between two Download() calls without being reconstructed.
+func TestDownloader_ReadsBudgetFreshPerAttempt(t *testing.T) {
+	content := make([]byte, 256*1024)
+	server := trickleServer(content, 4*1024, 20*time.Millisecond)
+	defer server.Close()
+
+	tmpDir := t.TempDir()
+	logger := log.New(os.Stdout, "test: ", 0)
+
+	var current Budget // starts unlimited
+	d := NewDownloader(tmpDir, func() Budget { return current }, logger)
+
+	if _, err := d.Download(context.Background(), server.URL+"/live.mender", nil); err != nil {
+		t.Fatalf("first attempt with unlimited budget failed: %v", err)
+	}
+
+	// Simulate a runtime settings change tightening the cap between attempts,
+	// the way ApplyRedisUpdate would.
+	current = Budget{MaxDuration: 10 * time.Millisecond}
+
+	_, err := d.Download(context.Background(), server.URL+"/live2.mender", nil)
+	if !errors.Is(err, ErrDownloadBudgetExceeded) {
+		t.Fatalf("second attempt should honour the now-tightened budget, got %v", err)
 	}
 }

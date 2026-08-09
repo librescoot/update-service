@@ -25,8 +25,10 @@ type Manager struct {
 	logger       *log.Logger
 }
 
-// NewManager creates a new Mender manager with the specified download directory
-func NewManager(downloadDir string, budget Budget, logger *log.Logger) *Manager {
+// NewManager creates a new Mender manager with the specified download
+// directory. budget is passed through to the Downloader unchanged: it is
+// called once per download attempt, not once at construction time.
+func NewManager(downloadDir string, budget func() Budget, logger *log.Logger) *Manager {
 	return &Manager{
 		downloader:   NewDownloader(downloadDir, budget, logger),
 		installer:    NewInstaller(logger),

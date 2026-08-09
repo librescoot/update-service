@@ -1,6 +1,7 @@
 package config
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -102,4 +103,40 @@ func TestConfig_ApplyRedisUpdate_Budget(t *testing.T) {
 	if c.ApplyRedisUpdate("updates.dbc.download-max-duration", "5m") {
 		t.Error("a dbc setting must not apply to the mdb config")
 	}
+}
+
+// TestDownloadBudget_ConcurrentWithApplyRedisUpdate exercises exactly the
+// pattern a download attempt sees in production: one goroutine reading the
+// budget through DownloadBudget() in a loop (standing in for the download
+// goroutine snapshotting it at the top of each attempt) while another
+// rewrites it via ApplyRedisUpdate (standing in for the settings-watcher
+// goroutine). Run with -race: budgetMu is what makes this safe.
+func TestDownloadBudget_ConcurrentWithApplyRedisUpdate(t *testing.T) {
+	c := New("localhost:6379", "https://example.invalid", time.Hour, "mdb", "stable", "/data/ota/mdb", false, false, "/uboot", "", "", 2)
+
+	const iterations = 2000
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			d := time.Duration(i%5+1) * time.Minute
+			if !c.ApplyRedisUpdate("updates.mdb.download-max-duration", d.String()) {
+				t.Error("download-max-duration should be recognised")
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			maxDuration, _, _ := c.DownloadBudget()
+			if maxDuration <= 0 {
+				t.Error("DownloadBudget should never observe a torn/zero read from these writes")
+			}
+		}
+	}()
+
+	wg.Wait()
 }
