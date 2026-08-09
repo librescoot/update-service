@@ -309,6 +309,22 @@ func (r *Reporter) SetInstallProgress(ctx context.Context, percent int) error {
 	return r.pub.Set(r.key("install-progress"), percent)
 }
 
+// SetSkipChecksRemaining updates just the download-skip-checks field to the
+// count actually remaining after a skip was just served. SetAborted writes
+// the initial count when the backoff is first recorded, but nothing updated
+// it afterwards: it froze at that value until the next attempt cleared it,
+// which made the published field describe a backoff that was not actually
+// being drawn down. This is what makes it track reality: called from every
+// ShouldSkip call site, every time a skip is served, with the exact remaining
+// value ShouldSkip returned. A remaining of 0 clears the field.
+func (r *Reporter) SetSkipChecksRemaining(ctx context.Context, remaining int) error {
+	skip := ""
+	if remaining > 0 {
+		skip = strconv.Itoa(remaining)
+	}
+	return r.pub.Set(r.key("download-skip-checks"), skip)
+}
+
 // SetUpdateVersion updates the target version without changing other fields.
 // Used when the target version changes mid-update (e.g., additional deltas found).
 func (r *Reporter) SetUpdateVersion(ctx context.Context, version string) error {

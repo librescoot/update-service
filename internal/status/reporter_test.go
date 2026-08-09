@@ -110,6 +110,50 @@ func TestSetDownloading_ClearsAbortFields(t *testing.T) {
 	}
 }
 
+func TestSetSkipChecksRemaining_UpdatesTheField(t *testing.T) {
+	r, mr := newTestReporter(t)
+	ctx := context.Background()
+	if err := r.SetAborted(ctx, "stalled", 4); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.SetSkipChecksRemaining(ctx, 3); err != nil {
+		t.Fatal(err)
+	}
+	// SetSkipChecksRemaining is async like SetHeartbeat and SetDownloadProgress,
+	// so poll rather than assert immediately after the call returns.
+	waitForField(t, mr, "download-skip-checks:mdb", "3")
+}
+
+func TestSetSkipChecksRemaining_ZeroClearsTheField(t *testing.T) {
+	r, mr := newTestReporter(t)
+	ctx := context.Background()
+	if err := r.SetAborted(ctx, "stalled", 4); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.SetSkipChecksRemaining(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	waitForField(t, mr, "download-skip-checks:mdb", "")
+}
+
+// waitForField polls an ota hash field until it matches want or a deadline
+// passes, for asserting on a Reporter write that is async by design.
+func waitForField(t *testing.T, mr *miniredis.Miniredis, field, want string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		got = mr.HGet("ota", field)
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Errorf("%s = %q, want %q", field, got, want)
+}
+
 func TestSetHeartbeat_WritesUnixSeconds(t *testing.T) {
 	r, mr := newTestReporter(t)
 	beat := time.Unix(1786298400, 0)

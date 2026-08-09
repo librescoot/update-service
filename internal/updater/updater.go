@@ -1687,7 +1687,10 @@ func (u *Updater) checkForUpdates(manual bool) {
 		u.logger.Printf("No .mender asset found for variant_id %s in release %s", variantID, release.TagName)
 	} else if !u.isUpdateNeeded(release) {
 		u.logger.Printf("No update needed for component %s", u.config.Component)
-	} else if skip, _ := u.backoff.ShouldSkip(release.TagName, u.config.CheckInterval); skip {
+	} else if skip, remaining := u.backoff.ShouldSkip(release.TagName, u.config.CheckInterval); skip {
+		if err := u.status.SetSkipChecksRemaining(u.ctx, remaining); err != nil {
+			u.logger.Printf("Failed to publish remaining backoff checks: %v", err)
+		}
 		u.logger.Printf("Skipping %s for %s: download backed off",
 			release.TagName, u.config.Component)
 	} else {
@@ -2141,7 +2144,10 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			if !u.isUpdateNeeded(latestRelease) {
 				return
 			}
-			if skip, _ := u.backoff.ShouldSkip(latestRelease.TagName, u.config.CheckInterval); skip {
+			if skip, remaining := u.backoff.ShouldSkip(latestRelease.TagName, u.config.CheckInterval); skip {
+				if err := u.status.SetSkipChecksRemaining(u.ctx, remaining); err != nil {
+					u.logger.Printf("Failed to publish remaining backoff checks: %v", err)
+				}
 				return
 			}
 			menderURL := u.findMenderAsset(latestRelease, variantID)
@@ -2163,7 +2169,10 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	// update path, which keys on release.TagName rather than the lowercased
 	// latestVersion below.
 	chainTarget := deltaChain[len(deltaChain)-1].TagName
-	if skip, _ := u.backoff.ShouldSkip(chainTarget, u.config.CheckInterval); skip {
+	if skip, remaining := u.backoff.ShouldSkip(chainTarget, u.config.CheckInterval); skip {
+		if err := u.status.SetSkipChecksRemaining(u.ctx, remaining); err != nil {
+			u.logger.Printf("Failed to publish remaining backoff checks: %v", err)
+		}
 		u.logger.Printf("Skipping delta chain to %s: download backed off", chainTarget)
 		return
 	}
