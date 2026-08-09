@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/librescoot/update-service/internal/backoff"
 	"github.com/librescoot/update-service/internal/boot"
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/inhibitor"
@@ -29,6 +30,7 @@ type Updater struct {
 	inhibitor        *inhibitor.Client
 	power            *power.Client
 	mender           *mender.Manager
+	backoff          *backoff.Store
 	status           *status.Reporter
 	bootUpdater      *boot.BootUpdater // nil if --boot-update not set
 	bootStatus       *status.Reporter  // reporter for "{component}-boot" keys
@@ -105,11 +107,16 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 	}
 
 	u := &Updater{
-		config:               cfg,
-		redis:                redisClient,
-		inhibitor:            inhibitorClient,
-		power:                powerClient,
-		mender:               mender.NewManager(downloadDir, mender.Budget{}, logger),
+		config:    cfg,
+		redis:     redisClient,
+		inhibitor: inhibitorClient,
+		power:     powerClient,
+		mender: mender.NewManager(downloadDir, mender.Budget{
+			MaxDuration:   cfg.DownloadMaxDuration,
+			StallWindow:   cfg.DownloadStallWindow,
+			StallMinBytes: cfg.DownloadStallMinBytes,
+		}, logger),
+		backoff:              backoff.NewStore(downloadDir, logger),
 		status:               statusReporter,
 		bootUpdater:          bootUpdater,
 		bootStatus:           bootStatusReporter,
@@ -1386,6 +1393,62 @@ func (u *Updater) updateCheckLoop() {
 	}
 }
 
+// isDownloadBudgetAbort reports whether err is a download that was abandoned
+// for being too slow, as opposed to a genuine failure. Budget aborts keep the
+// partial file and feed the backoff ladder; failures do not.
+func isDownloadBudgetAbort(err error) bool {
+	return errors.Is(err, mender.ErrDownloadStalled) || errors.Is(err, mender.ErrDownloadBudgetExceeded)
+}
+
+// abortReasonFor maps a budget sentinel to the value published in
+// download-abort-reason.
+func abortReasonFor(err error) string {
+	if errors.Is(err, mender.ErrDownloadStalled) {
+		return "stalled"
+	}
+	return "budget-exceeded"
+}
+
+// recordDownloadAbort persists the abort against target and publishes the
+// resulting retry deadline. bytesGained is how much this attempt actually
+// transferred; an attempt that moved a meaningful amount resets the ladder
+// rather than advancing it, because it was interrupted rather than hopeless.
+func (u *Updater) recordDownloadAbort(target string, err error, bytesGained int64) {
+	reason := abortReasonFor(err)
+	retryAfter, recErr := u.backoff.RecordAbort(target, bytesGained, time.Now())
+	if recErr != nil {
+		u.logger.Printf("Failed to persist download backoff: %v", recErr)
+	}
+	if setErr := u.status.SetAborted(u.ctx, reason, retryAfter); setErr != nil {
+		u.logger.Printf("Failed to set aborted status: %v", setErr)
+	}
+}
+
+// progressTracker turns the download progress callback into a bytes-gained
+// figure for the backoff ladder. The callback reports cumulative bytes
+// including any resumed offset, so the gain for this attempt is the span
+// between the first and last report.
+type progressTracker struct {
+	first int64
+	last  int64
+	seen  bool
+}
+
+func (p *progressTracker) observe(downloaded int64) {
+	if !p.seen {
+		p.first = downloaded
+		p.seen = true
+	}
+	p.last = downloaded
+}
+
+func (p *progressTracker) gained() int64 {
+	if !p.seen {
+		return 0
+	}
+	return p.last - p.first
+}
+
 // restartCheckAfterCorruptFile clears the current status to idle after a
 // corrupted file was deleted, so the error status doesn't block further
 // checks. If periodic checks are enabled, also kicks off an immediate check
@@ -1543,6 +1606,9 @@ func (u *Updater) checkForUpdates(manual bool) {
 		u.logger.Printf("No .mender asset found for variant_id %s in release %s", variantID, release.TagName)
 	} else if !u.isUpdateNeeded(release) {
 		u.logger.Printf("No update needed for component %s", u.config.Component)
+	} else if skip, until := u.backoff.ShouldSkip(release.TagName, time.Now()); skip {
+		u.logger.Printf("Skipping %s for %s: download backed off until %s",
+			release.TagName, u.config.Component, until.Format(time.RFC3339))
 	} else {
 		u.logger.Printf("Update needed for %s: %s (using full update)", u.config.Component, release.TagName)
 		u.wg.Add(1)
@@ -1769,7 +1835,9 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string, manual b
 	}()
 
 	// Step 2: Download and verify the update
+	var progress progressTracker
 	progressCallback := func(downloaded, total int64) {
+		progress.observe(downloaded)
 		if err := u.status.SetDownloadProgress(u.ctx, downloaded, total); err != nil {
 			u.logger.Printf("Failed to update download progress: %v", err)
 		}
@@ -1783,11 +1851,20 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string, manual b
 	}
 	filePath, err := u.mender.DownloadAndVerify(u.ctx, assetURL, checksum, progressCallback)
 	if err != nil {
+		if isDownloadBudgetAbort(err) {
+			u.logger.Printf("Download of %s abandoned: %v", release.TagName, err)
+			u.recordDownloadAbort(release.TagName, err, progress.gained())
+			return
+		}
 		u.logger.Printf("Failed to download update: %v", err)
 		if err := u.status.SetError(u.ctx, "download-failed", fmt.Sprintf("Failed to download update: %v", err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
+	}
+
+	if err := u.backoff.Clear(); err != nil {
+		u.logger.Printf("Failed to clear download backoff after success: %v", err)
 	}
 
 	u.logger.Printf("Successfully downloaded update to: %s", filePath)
