@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -128,5 +129,149 @@ func TestStartHeartbeat_StopIsIdempotent(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("heartbeat goroutine leaked past stop()")
+	}
+}
+
+// TestStartHeartbeat_NestedCallsShareOneGoroutine covers the exact scenario
+// finding 4 is about: performDeltaUpdate's fallback path calls
+// performUpdateLocked directly while its own heartbeat is still running.
+// Both hold a live startHeartbeat() reference at once; this must not spawn a
+// second goroutine, and the field must survive until the last one stops.
+func TestStartHeartbeat_NestedCallsShareOneGoroutine(t *testing.T) {
+	u, mr := newTestUpdaterForHeartbeat(t)
+
+	outerStop := u.startHeartbeat()
+	waitForNonEmptyHeartbeatField(t, mr)
+
+	u.heartbeatMu.Lock()
+	countAfterOuter := u.heartbeatCount
+	u.heartbeatMu.Unlock()
+	if countAfterOuter != 1 {
+		t.Fatalf("heartbeatCount after first start = %d, want 1", countAfterOuter)
+	}
+
+	innerStop := u.startHeartbeat()
+
+	u.heartbeatMu.Lock()
+	countAfterInner := u.heartbeatCount
+	u.heartbeatMu.Unlock()
+	if countAfterInner != 2 {
+		t.Fatalf("heartbeatCount after nested start = %d, want 2", countAfterInner)
+	}
+
+	// The inner (nested) operation finishing first must not clear the field
+	// or stop the goroutine: the outer operation is still in progress.
+	innerStop()
+	if got := mr.HGet("ota", "heartbeat:mdb"); got == "" {
+		t.Error("nested stop cleared the field while the outer operation is still running")
+	}
+	u.heartbeatMu.Lock()
+	countAfterInnerStop := u.heartbeatCount
+	u.heartbeatMu.Unlock()
+	if countAfterInnerStop != 1 {
+		t.Fatalf("heartbeatCount after inner stop = %d, want 1", countAfterInnerStop)
+	}
+
+	outerStop()
+	waitForHeartbeatField(t, mr, "")
+	u.heartbeatMu.Lock()
+	countAfterOuterStop := u.heartbeatCount
+	u.heartbeatMu.Unlock()
+	if countAfterOuterStop != 0 {
+		t.Fatalf("heartbeatCount after outer stop = %d, want 0", countAfterOuterStop)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		u.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat goroutine leaked past the last stop()")
+	}
+}
+
+// TestStartHeartbeat_RefcountNeverGoesNegative calls every stop() twice
+// across several nested starts, which must not push heartbeatCount below
+// zero or spawn an extra goroutine on the next start.
+func TestStartHeartbeat_RefcountNeverGoesNegative(t *testing.T) {
+	u, mr := newTestUpdaterForHeartbeat(t)
+
+	var stops []func()
+	for range 3 {
+		stops = append(stops, u.startHeartbeat())
+	}
+	waitForNonEmptyHeartbeatField(t, mr)
+
+	for _, stop := range stops {
+		stop()
+		stop() // double-call every one of them
+	}
+
+	u.heartbeatMu.Lock()
+	count := u.heartbeatCount
+	u.heartbeatMu.Unlock()
+	if count != 0 {
+		t.Fatalf("heartbeatCount = %d after all stops (each called twice), want 0", count)
+	}
+	waitForHeartbeatField(t, mr, "")
+
+	done := make(chan struct{})
+	go func() {
+		u.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat goroutine leaked after over-stopping")
+	}
+
+	// A fresh start after the count bottomed out at zero must still spawn a
+	// working goroutine rather than being wedged by a negative excursion.
+	stop := u.startHeartbeat()
+	waitForNonEmptyHeartbeatField(t, mr)
+	stop()
+	waitForHeartbeatField(t, mr, "")
+}
+
+// TestStartHeartbeat_ConcurrentStartStop hammers startHeartbeat from many
+// goroutines at once (run with -race). It doesn't assert on ordering, only
+// that the refcount always lands back at zero and the goroutine always
+// exits, i.e. no lost decrement and no leak under real concurrency.
+func TestStartHeartbeat_ConcurrentStartStop(t *testing.T) {
+	u, _ := newTestUpdaterForHeartbeat(t)
+
+	const workers = 20
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			stop := u.startHeartbeat()
+			time.Sleep(time.Millisecond)
+			stop()
+		}()
+	}
+	wg.Wait()
+
+	u.heartbeatMu.Lock()
+	count := u.heartbeatCount
+	u.heartbeatMu.Unlock()
+	if count != 0 {
+		t.Fatalf("heartbeatCount = %d after all concurrent workers finished, want 0", count)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		u.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat goroutine leaked after concurrent start/stop")
 	}
 }

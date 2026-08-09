@@ -64,6 +64,13 @@ type Updater struct {
 	// when the setting changes at runtime (e.g., set to 0 to disable checks).
 	checkIntervalChanged chan struct{}
 
+	// Reference count for startHeartbeat: guards heartbeatCount and
+	// heartbeatStop so nested/sibling long operations share one ticking
+	// goroutine and one heartbeat-field lifecycle. See startHeartbeat.
+	heartbeatMu    sync.Mutex
+	heartbeatCount int
+	heartbeatStop  chan struct{}
+
 	// Track active update goroutines for clean shutdown
 	wg sync.WaitGroup
 }
@@ -1475,45 +1482,80 @@ const heartbeatInterval = 30 * time.Second
 //
 // Without it a consumer cannot tell an update that is wedged from one that is
 // legitimately between attempts, and has to assume the generous case.
+//
+// Reference-counted on u.heartbeatCount: a long operation can start another
+// long operation on top of itself while still running (performUpdateLocked,
+// called directly from performDeltaUpdate's fallback path, while
+// performDeltaUpdate's own heartbeat is still active). Without counting,
+// that produces two goroutines ticking the same 30s write and racing to
+// clear the same field when either one finishes. The goroutine is started
+// only on the 0->1 transition and stopped (clearing the field) only on the
+// 1->0 transition; every call in between just adjusts the count and shares
+// the one goroutine already running.
 func (u *Updater) startHeartbeat() func() {
-	done := make(chan struct{})
-	var once sync.Once
+	u.heartbeatMu.Lock()
+	u.heartbeatCount++
+	if u.heartbeatCount == 1 {
+		stop := make(chan struct{})
+		u.heartbeatStop = stop
 
-	if err := u.status.SetHeartbeat(u.ctx, time.Now()); err != nil {
-		u.logger.Printf("Failed to write initial heartbeat: %v", err)
-	}
+		if err := u.status.SetHeartbeat(u.ctx, time.Now()); err != nil {
+			u.logger.Printf("Failed to write initial heartbeat: %v", err)
+		}
 
-	u.wg.Add(1)
-	go func() {
-		defer u.wg.Done()
-		// A plain defer at goroutine scope, not tied to which branch below
-		// triggers the return: it fires exactly once per goroutine on any
-		// exit path, including shutdown via u.ctx.Done(), which the stop
-		// func returned below cannot observe if it is never called (the
-		// process is going down regardless of whether the caller gets a
-		// chance to run its own defer).
-		defer func() {
-			if err := u.status.ClearHeartbeat(u.ctx); err != nil {
-				u.logger.Printf("Failed to clear heartbeat: %v", err)
-			}
-		}()
-		ticker := time.NewTicker(heartbeatInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-u.ctx.Done():
-				return
-			case <-ticker.C:
-				if err := u.status.SetHeartbeat(u.ctx, time.Now()); err != nil {
-					u.logger.Printf("Failed to write heartbeat: %v", err)
+		u.wg.Add(1)
+		go func() {
+			defer u.wg.Done()
+			// A plain defer at goroutine scope, not tied to which branch
+			// below triggers the return: it fires exactly once per
+			// goroutine on any exit path, including shutdown via
+			// u.ctx.Done(), which a refcounted stop cannot observe if the
+			// process goes down while the count is still above zero.
+			defer func() {
+				if err := u.status.ClearHeartbeat(u.ctx); err != nil {
+					u.logger.Printf("Failed to clear heartbeat: %v", err)
+				}
+			}()
+			ticker := time.NewTicker(heartbeatInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-u.ctx.Done():
+					return
+				case <-ticker.C:
+					if err := u.status.SetHeartbeat(u.ctx, time.Now()); err != nil {
+						u.logger.Printf("Failed to write heartbeat: %v", err)
+					}
 				}
 			}
-		}
-	}()
+		}()
+	}
+	u.heartbeatMu.Unlock()
 
-	return func() { once.Do(func() { close(done) }) }
+	var stopOnce sync.Once
+	return func() {
+		stopOnce.Do(func() {
+			u.heartbeatMu.Lock()
+			u.heartbeatCount--
+			var stop chan struct{}
+			if u.heartbeatCount <= 0 {
+				// Clamp rather than trust the decrement blindly: every real
+				// call site pairs start with exactly one stop via defer, so
+				// this only ever fires the 1->0 transition in practice, but
+				// clamping means a hypothetical extra decrement still can't
+				// take the count negative and wedge the next 0->1 check.
+				u.heartbeatCount = 0
+				stop = u.heartbeatStop
+				u.heartbeatStop = nil
+			}
+			u.heartbeatMu.Unlock()
+			if stop != nil {
+				close(stop)
+			}
+		})
+	}
 }
 
 // holdSuspend takes the suspend inhibit for the duration of a transfer and
@@ -2136,15 +2178,17 @@ const deltaMaxAge = 30 * 24 * time.Hour
 func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string, isRecheck, manual bool) {
 	// The recursive re-check call at the end of this function runs inside the
 	// same goroutine that already holds updateOpMu, skip TryLock in that case
-	// to avoid self-deadlocking on the non-reentrant mutex.
+	// to avoid self-deadlocking on the non-reentrant mutex. That reasoning
+	// still holds and is the one that actually requires this guard.
 	//
-	// Guard the heartbeat the same way, for a different reason: an
-	// unconditional defer here would start a second goroutine ticking the
-	// same field every 30s while the outer one is still running. Harmless to
-	// the reader of the field, but wasted work and confusing in logs. This is
-	// not the same tradeoff as the suspend inhibit, which the recursive call
-	// is allowed to take again: that one is an idempotent HSET, this one is a
-	// goroutine.
+	// startHeartbeat no longer strictly needs the same guard: it is now
+	// reference-counted (see startHeartbeat), so calling it again on the
+	// recursive call would just share the already-running goroutine rather
+	// than start a second one. It stays under the same condition anyway,
+	// grouped with the mutex it must track: skipping it on the recursive
+	// call avoids one redundant increment/decrement pair, and keeping both
+	// guards together means there is only one condition to read here instead
+	// of two that happen to agree.
 	if !isRecheck {
 		if !u.updateOpMu.TryLock() {
 			u.logger.Printf("Update already in progress, skipping delta update")
