@@ -2119,10 +2119,17 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	if err != nil {
 		u.logger.Printf("Failed to build delta chain: %v", err)
 
-		// Fall back to full update
+		// Fall back to full update. Unlike the fallback that abandons a chain
+		// mid-flight, this one is a fresh decision taken before anything has
+		// been transferred, so it must honour the backoff: otherwise a scooter
+		// whose chain will not build re-downloads the full image on every
+		// check and never serves its ladder.
 		latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
 		if found {
 			if !u.isUpdateNeeded(latestRelease) {
+				return
+			}
+			if u.backoff.ShouldSkip(latestRelease.TagName) {
 				return
 			}
 			menderURL := u.findMenderAsset(latestRelease, variantID)
