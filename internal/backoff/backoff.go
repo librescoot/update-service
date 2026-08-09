@@ -8,6 +8,15 @@
 // reporting a plausible-but-wrong date used to make a stored deadline look
 // far-future and wedge the ladder shut. There is no clock read anywhere in
 // this package.
+//
+// The state stores a rung index, not a check count. A count computed once at
+// record time and then stored would go stale the moment check-interval
+// changes afterward: a rung recorded under a 30-minute interval as, say, 48
+// checks still reads as 48 checks after the interval is restored to 6 hours,
+// stranding the device in backoff for roughly 12 days instead of the
+// intended one. The rung index is converted to a count fresh on every call
+// that needs one, always against whatever check-interval is current at that
+// moment.
 package backoff
 
 import (
@@ -34,7 +43,8 @@ const ProgressResetBytes int64 = 1 << 20
 const fallbackCheckInterval = 6 * time.Hour
 
 // rungs is the escalation ladder, expressed as durations and converted to a
-// count of checks to skip at record time. The last entry is the cap.
+// count of checks to skip whenever that count is actually needed. The last
+// entry is the cap.
 var rungs = []time.Duration{
 	1 * time.Hour,
 	3 * time.Hour,
@@ -45,9 +55,10 @@ var rungs = []time.Duration{
 // State is the on-disk record. One per component; the download directory is
 // already per-component.
 type State struct {
-	Target     string `json:"target"`
-	Aborts     int    `json:"aborts"`
-	SkipChecks int    `json:"skip_checks"`
+	Target      string `json:"target"`
+	Aborts      int    `json:"aborts"`
+	RungIndex   int    `json:"rung_index"`
+	SkipsServed int    `json:"skips_served"`
 }
 
 type Store struct {
@@ -81,23 +92,17 @@ func (s *Store) load() State {
 	return st
 }
 
-// ShouldSkip reports whether an attempt at target should be deferred. Serving
-// the backoff is a side effect of asking: when it returns true it has also
-// decremented and persisted the remaining count, so each check spends exactly
-// one skip. Call it at most once per check per target, or it will spend two.
-//
-// A different target is never skipped: a new release deserves a fresh try.
-func (s *Store) ShouldSkip(target string) bool {
-	st := s.load()
-	if st.Target != target || st.SkipChecks <= 0 {
-		return false
+// rungAt returns the rung duration for idx, clamping to the valid range so a
+// corrupt or out-of-range RungIndex from a torn write degrades to the nearest
+// real rung instead of panicking.
+func rungAt(idx int) time.Duration {
+	if idx < 0 {
+		idx = 0
 	}
-	st.SkipChecks--
-	if err := s.write(st); err != nil {
-		s.logger.Printf("Failed to persist decremented backoff state: %v", err)
+	if idx >= len(rungs) {
+		idx = len(rungs) - 1
 	}
-	s.logger.Printf("Skipping check for %s: download backed off, %d check(s) remaining", target, st.SkipChecks)
-	return true
+	return rungs[idx]
 }
 
 // checksFor converts a rung duration into a count of checks to skip, given
@@ -121,11 +126,58 @@ func checksFor(rung, checkInterval time.Duration) int {
 	return int(checks)
 }
 
-// RecordAbort notes an abandoned attempt and returns how many subsequent
-// checks to skip. A zero return means no backoff applies. checkInterval is
-// the configured check cadence, used to convert the rung duration into a
-// count of checks.
-func (s *Store) RecordAbort(target string, bytesGained int64, checkInterval time.Duration) (int, error) {
+// ChecksToSkip converts a rung index into a count of checks to skip at the
+// given check interval. Exported so a caller that just recorded an abort -
+// status.Reporter.SetAborted, immediately after RecordAbort - can publish
+// the same total that ShouldSkip will later enforce, computed the same way.
+// Both must agree, or the published count and the actually-served count
+// drift apart.
+func ChecksToSkip(rungIndex int, checkInterval time.Duration) int {
+	return checksFor(rungAt(rungIndex), checkInterval)
+}
+
+// ShouldSkip reports whether an attempt at target should be deferred, and how
+// many further checks remain backed off after this one. Serving the backoff
+// is a side effect of asking: when it returns true it has also incremented
+// and persisted SkipsServed, so each check spends exactly one skip. Call it
+// at most once per check per target, or it will spend two.
+//
+// The total owed for the current rung is recomputed from checkInterval on
+// every call rather than read back from a stored count, so a check-interval
+// change takes effect on the very next check instead of leaving a device
+// stranded on a total computed under an interval that no longer applies.
+//
+// A different target is never skipped: a new release deserves a fresh try.
+func (s *Store) ShouldSkip(target string, checkInterval time.Duration) (skip bool, remaining int) {
+	st := s.load()
+	if st.Target != target || st.Aborts == 0 {
+		return false, 0
+	}
+
+	total := ChecksToSkip(st.RungIndex, checkInterval)
+	if st.SkipsServed >= total {
+		return false, 0
+	}
+
+	st.SkipsServed++
+	if err := s.write(st); err != nil {
+		s.logger.Printf("Failed to persist decremented backoff state: %v", err)
+	}
+	remaining = total - st.SkipsServed
+	s.logger.Printf("Skipping check for %s: download backed off, %d check(s) remaining", target, remaining)
+	return true, remaining
+}
+
+// RecordAbort notes an abandoned attempt against target and returns the rung
+// index the ladder now sits at, or -1 if the attempt's progress reset the
+// ladder instead (no backoff applies). bytesGained is how much this attempt
+// actually transferred; ProgressResetBytes or more resets rather than
+// advances.
+//
+// This takes no check interval: the state stores a rung index, and the index
+// is converted to a check count only at the moment it is used (ShouldSkip,
+// ChecksToSkip), always against whatever checkInterval is current then.
+func (s *Store) RecordAbort(target string, bytesGained int64) (int, error) {
 	st := s.load()
 	if st.Target != target {
 		st = State{Target: target}
@@ -134,23 +186,23 @@ func (s *Store) RecordAbort(target string, bytesGained int64, checkInterval time
 	if bytesGained >= ProgressResetBytes {
 		s.logger.Printf("Attempt for %s aborted but gained %d bytes, resetting backoff", target, bytesGained)
 		st.Aborts = 0
-		st.SkipChecks = 0
+		st.RungIndex = 0
+		st.SkipsServed = 0
 		if err := s.write(st); err != nil {
-			return 0, err
+			return -1, err
 		}
-		return 0, nil
+		return -1, nil
 	}
 
 	st.Aborts++
-	idx := min(st.Aborts-1, len(rungs)-1)
-	st.SkipChecks = checksFor(rungs[idx], checkInterval)
+	st.RungIndex = min(st.Aborts-1, len(rungs)-1)
+	st.SkipsServed = 0
 
 	if err := s.write(st); err != nil {
-		return 0, err
+		return -1, err
 	}
-	s.logger.Printf("Attempt %d for %s abandoned, skipping the next %d check(s)",
-		st.Aborts, target, st.SkipChecks)
-	return st.SkipChecks, nil
+	s.logger.Printf("Attempt %d for %s abandoned, now at rung %d of %d", st.Aborts, target, st.RungIndex+1, len(rungs))
+	return st.RungIndex, nil
 }
 
 // Clear removes the state after a successful download.

@@ -1423,11 +1423,23 @@ func abortReasonFor(err error) string {
 // resulting skip count. bytesGained is how much this attempt actually
 // transferred; an attempt that moved a meaningful amount resets the ladder
 // rather than advancing it, because it was interrupted rather than hopeless.
+//
+// RecordAbort itself no longer knows about check-interval: it stores a rung
+// index, not a count. The rung-to-count conversion happens here, once, right
+// after the index is chosen, using whatever check-interval is current right
+// now. That is deliberately the only place this conversion is duplicated
+// outside ShouldSkip: SetAborted needs a count to publish immediately, and
+// ChecksToSkip is the same function ShouldSkip itself will use to recompute
+// the count later, so the two never disagree about what a given rung means.
 func (u *Updater) recordDownloadAbort(target string, err error, bytesGained int64) {
 	reason := abortReasonFor(err)
-	skipChecks, recErr := u.backoff.RecordAbort(target, bytesGained, u.config.CheckInterval)
+	rungIndex, recErr := u.backoff.RecordAbort(target, bytesGained)
 	if recErr != nil {
 		u.logger.Printf("Failed to persist download backoff: %v", recErr)
+	}
+	skipChecks := 0
+	if rungIndex >= 0 {
+		skipChecks = backoff.ChecksToSkip(rungIndex, u.config.CheckInterval)
 	}
 	if setErr := u.status.SetAborted(u.ctx, reason, skipChecks); setErr != nil {
 		u.logger.Printf("Failed to set aborted status: %v", setErr)
@@ -1675,7 +1687,7 @@ func (u *Updater) checkForUpdates(manual bool) {
 		u.logger.Printf("No .mender asset found for variant_id %s in release %s", variantID, release.TagName)
 	} else if !u.isUpdateNeeded(release) {
 		u.logger.Printf("No update needed for component %s", u.config.Component)
-	} else if u.backoff.ShouldSkip(release.TagName) {
+	} else if skip, _ := u.backoff.ShouldSkip(release.TagName, u.config.CheckInterval); skip {
 		u.logger.Printf("Skipping %s for %s: download backed off",
 			release.TagName, u.config.Component)
 	} else {
@@ -2129,7 +2141,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			if !u.isUpdateNeeded(latestRelease) {
 				return
 			}
-			if u.backoff.ShouldSkip(latestRelease.TagName) {
+			if skip, _ := u.backoff.ShouldSkip(latestRelease.TagName, u.config.CheckInterval); skip {
 				return
 			}
 			menderURL := u.findMenderAsset(latestRelease, variantID)
@@ -2151,7 +2163,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	// update path, which keys on release.TagName rather than the lowercased
 	// latestVersion below.
 	chainTarget := deltaChain[len(deltaChain)-1].TagName
-	if u.backoff.ShouldSkip(chainTarget) {
+	if skip, _ := u.backoff.ShouldSkip(chainTarget, u.config.CheckInterval); skip {
 		u.logger.Printf("Skipping delta chain to %s: download backed off", chainTarget)
 		return
 	}
