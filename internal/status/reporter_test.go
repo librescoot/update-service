@@ -173,3 +173,18 @@ func TestSetHeartbeat_WritesUnixSeconds(t *testing.T) {
 	}
 	t.Errorf("heartbeat:mdb = %q, want 1786298400", got)
 }
+
+func TestClearHeartbeat_ClearsField(t *testing.T) {
+	r, mr := newTestReporter(t)
+	ctx := context.Background()
+
+	if err := r.SetHeartbeat(ctx, time.Unix(1786298400, 0)); err != nil {
+		t.Fatal(err)
+	}
+	waitForField(t, mr, "heartbeat:mdb", "1786298400")
+
+	if err := r.ClearHeartbeat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForField(t, mr, "heartbeat:mdb", "")
+}

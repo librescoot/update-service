@@ -184,6 +184,16 @@ func (r *Reporter) SetHeartbeat(ctx context.Context, t time.Time) error {
 	return r.pub.Set(r.key("heartbeat"), strconv.FormatInt(t.Unix(), 10))
 }
 
+// ClearHeartbeat clears the liveness marker when a long-running operation
+// ends. Without this a stale heartbeat from a completed operation looks
+// alive to a consumer (vehicle-service seeds a watchdog flag from this field
+// at startup) until the field happens to be overwritten by some later
+// operation, which may be a long time coming or may never happen if the
+// component is downgraded to an image that no longer writes heartbeats.
+func (r *Reporter) ClearHeartbeat(ctx context.Context) error {
+	return r.pub.Set(r.key("heartbeat"), "")
+}
+
 // SetDownloading atomically sets downloading status with version, method,
 // and resets all progress to 0.
 func (r *Reporter) SetDownloading(ctx context.Context, version, method string) error {

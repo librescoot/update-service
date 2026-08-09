@@ -1486,6 +1486,17 @@ func (u *Updater) startHeartbeat() func() {
 	u.wg.Add(1)
 	go func() {
 		defer u.wg.Done()
+		// A plain defer at goroutine scope, not tied to which branch below
+		// triggers the return: it fires exactly once per goroutine on any
+		// exit path, including shutdown via u.ctx.Done(), which the stop
+		// func returned below cannot observe if it is never called (the
+		// process is going down regardless of whether the caller gets a
+		// chance to run its own defer).
+		defer func() {
+			if err := u.status.ClearHeartbeat(u.ctx); err != nil {
+				u.logger.Printf("Failed to clear heartbeat: %v", err)
+			}
+		}()
 		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 		for {
