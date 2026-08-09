@@ -38,6 +38,12 @@ type Config struct {
 	MdbRebootCheckInterval time.Duration // How often to check if MDB can be rebooted
 	UpdateRetryInterval    time.Duration // How often to retry updates if conditions aren't met
 
+	// Download budget. Each bounds a single attempt; 0 disables that bound.
+	// A budget abort keeps the partial file, so the next attempt resumes.
+	DownloadMaxDuration   time.Duration // Wall clock cap on one download attempt
+	DownloadStallWindow   time.Duration // Rolling window the throughput floor is measured over
+	DownloadStallMinBytes int64         // Bytes that must arrive within each window
+
 	// Operational modes
 	DryRun bool // If true, don't actually reboot, just notify
 
@@ -77,6 +83,10 @@ func New(
 		// Default values for update constraints
 		MdbRebootCheckInterval: 5 * time.Minute,
 		UpdateRetryInterval:    15 * time.Minute,
+		// Default download budget
+		DownloadMaxDuration:   60 * time.Minute,
+		DownloadStallWindow:   2 * time.Minute,
+		DownloadStallMinBytes: 64 * 1024,
 		// Operational modes
 		DryRun: dryRun,
 		// Boot partition update
@@ -157,6 +167,25 @@ func (c *Config) LoadFromRedis(redis RedisSettings) error {
 		}
 	}
 
+	// Load download budget settings from Redis if available. 0 disables a
+	// bound; time.ParseDuration("0") returns 0 with no error, so no special
+	// case is needed for the disable value.
+	if v, err := redis.HGet(SettingsHashKey, prefix+"download-max-duration"); err == nil && v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.DownloadMaxDuration = d
+		}
+	}
+	if v, err := redis.HGet(SettingsHashKey, prefix+"download-stall-window"); err == nil && v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.DownloadStallWindow = d
+		}
+	}
+	if v, err := redis.HGet(SettingsHashKey, prefix+"download-stall-min-bytes"); err == nil && v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			c.DownloadStallMinBytes = n
+		}
+	}
+
 	return nil
 }
 
@@ -192,6 +221,21 @@ func (c *Config) ApplyRedisUpdate(key, value string) bool {
 	case "dry-run":
 		if dryRun, err := strconv.ParseBool(value); err == nil {
 			c.DryRun = dryRun
+			return true
+		}
+	case "download-max-duration":
+		if d, err := time.ParseDuration(value); err == nil {
+			c.DownloadMaxDuration = d
+			return true
+		}
+	case "download-stall-window":
+		if d, err := time.ParseDuration(value); err == nil {
+			c.DownloadStallWindow = d
+			return true
+		}
+	case "download-stall-min-bytes":
+		if n, err := strconv.ParseInt(value, 10, 64); err == nil && n >= 0 {
+			c.DownloadStallMinBytes = n
 			return true
 		}
 	}

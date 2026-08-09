@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestInferChannelFromVersion(t *testing.T) {
 	cases := []struct {
@@ -45,5 +48,58 @@ func TestIsValidChannel(t *testing.T) {
 		if IsValidChannel(ch) {
 			t.Errorf("IsValidChannel(%q) = true, want false", ch)
 		}
+	}
+}
+
+func TestConfig_BudgetDefaults(t *testing.T) {
+	c := New("localhost:6379", "https://example.invalid", time.Hour, "mdb", "stable", "/data/ota/mdb", false, false, "/uboot", "", "", 2)
+	if c.DownloadMaxDuration != 60*time.Minute {
+		t.Errorf("DownloadMaxDuration = %v, want 60m", c.DownloadMaxDuration)
+	}
+	if c.DownloadStallWindow != 2*time.Minute {
+		t.Errorf("DownloadStallWindow = %v, want 2m", c.DownloadStallWindow)
+	}
+	if c.DownloadStallMinBytes != 65536 {
+		t.Errorf("DownloadStallMinBytes = %d, want 65536", c.DownloadStallMinBytes)
+	}
+}
+
+func TestConfig_ApplyRedisUpdate_Budget(t *testing.T) {
+	c := New("localhost:6379", "https://example.invalid", time.Hour, "mdb", "stable", "/data/ota/mdb", false, false, "/uboot", "", "", 2)
+
+	if !c.ApplyRedisUpdate("updates.mdb.download-max-duration", "30m") {
+		t.Fatal("download-max-duration should be recognised")
+	}
+	if c.DownloadMaxDuration != 30*time.Minute {
+		t.Errorf("DownloadMaxDuration = %v, want 30m", c.DownloadMaxDuration)
+	}
+
+	if !c.ApplyRedisUpdate("updates.mdb.download-stall-min-bytes", "4096") {
+		t.Fatal("download-stall-min-bytes should be recognised")
+	}
+	if c.DownloadStallMinBytes != 4096 {
+		t.Errorf("DownloadStallMinBytes = %d, want 4096", c.DownloadStallMinBytes)
+	}
+
+	// 0 disables a budget, matching how check-interval treats 0.
+	if !c.ApplyRedisUpdate("updates.mdb.download-max-duration", "0") {
+		t.Fatal("0 should be accepted")
+	}
+	if c.DownloadMaxDuration != 0 {
+		t.Errorf("DownloadMaxDuration = %v, want 0 (disabled)", c.DownloadMaxDuration)
+	}
+
+	// Garbage must be ignored rather than zeroing the budget.
+	c.DownloadStallWindow = 2 * time.Minute
+	if c.ApplyRedisUpdate("updates.mdb.download-stall-window", "not-a-duration") {
+		t.Error("invalid duration should not be applied")
+	}
+	if c.DownloadStallWindow != 2*time.Minute {
+		t.Errorf("DownloadStallWindow = %v, want the previous value retained", c.DownloadStallWindow)
+	}
+
+	// Another component's setting must not leak across.
+	if c.ApplyRedisUpdate("updates.dbc.download-max-duration", "5m") {
+		t.Error("a dbc setting must not apply to the mdb config")
 	}
 }

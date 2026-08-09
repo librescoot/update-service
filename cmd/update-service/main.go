@@ -34,6 +34,10 @@ var (
 	bootDevice     = flag.String("boot-device", "", "U-Boot device path (auto-detected from mount if empty)")
 	bootDTB        = flag.String("boot-dtb", "", "DTB filename (default: librescoot-{component}.dtb)")
 	bootUBootSeek  = flag.Int64("boot-uboot-seek", 2, "512-byte blocks to seek before writing U-Boot")
+
+	downloadMaxDuration   = flag.Duration("download-max-duration", 60*time.Minute, "Wall clock cap on a single download attempt (0 to disable)")
+	downloadStallWindow   = flag.Duration("download-stall-window", 2*time.Minute, "Rolling window for the download throughput floor (0 to disable)")
+	downloadStallMinBytes = flag.Int64("download-stall-min-bytes", 64*1024, "Bytes that must arrive within each stall window")
 )
 
 func main() {
@@ -90,6 +94,11 @@ func main() {
 	cliCheckIntervalSet := flag.Lookup("check-interval").Value.String() != flag.Lookup("check-interval").DefValue
 	cliReleasesURLSet := flag.Lookup("releases-url").Value.String() != flag.Lookup("releases-url").DefValue
 	cliDryRunSet := flag.Lookup("dry-run").Value.String() != flag.Lookup("dry-run").DefValue
+	cliBudgetSet := map[string]bool{
+		"download-max-duration":    flag.Lookup("download-max-duration").Value.String() != flag.Lookup("download-max-duration").DefValue,
+		"download-stall-window":    flag.Lookup("download-stall-window").Value.String() != flag.Lookup("download-stall-window").DefValue,
+		"download-stall-min-bytes": flag.Lookup("download-stall-min-bytes").Value.String() != flag.Lookup("download-stall-min-bytes").DefValue,
+	}
 
 	// Detect channel from installed version
 	detectedChannel := ""
@@ -154,6 +163,15 @@ func main() {
 	if cliDryRunSet {
 		cfg.DryRun = cliDryRun
 	}
+	if cliBudgetSet["download-max-duration"] {
+		cfg.DownloadMaxDuration = *downloadMaxDuration
+	}
+	if cliBudgetSet["download-stall-window"] {
+		cfg.DownloadStallWindow = *downloadStallWindow
+	}
+	if cliBudgetSet["download-stall-min-bytes"] {
+		cfg.DownloadStallMinBytes = *downloadStallMinBytes
+	}
 
 	// Refuse to run without a usable channel. This guards custom-nightly and
 	// other off-stream builds from being silently treated as nightly.
@@ -199,7 +217,7 @@ func main() {
 	// Start watching for settings changes in the background. Must be after
 	// updater.Start so the watcher can notify the updater when check-interval
 	// changes at runtime.
-	go watchSettingsChanges(ctx, redisClient, cfg, logger, updater, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet)
+	go watchSettingsChanges(ctx, redisClient, cfg, logger, updater, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet, cliBudgetSet)
 
 	// Log configuration summary
 	channelSource := "default"
@@ -216,6 +234,8 @@ func main() {
 	} else {
 		logger.Printf("Config: %s on %s (%s), manual checks only", cfg.Component, cfg.Channel, channelSource)
 	}
+	logger.Printf("Config: download budget max=%v stall=%v/%d bytes",
+		cfg.DownloadMaxDuration, cfg.DownloadStallWindow, cfg.DownloadStallMinBytes)
 
 	// Wait for context cancellation
 	<-ctx.Done()
@@ -223,7 +243,7 @@ func main() {
 }
 
 // watchSettingsChanges monitors Redis for settings changes and applies them to the config
-func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger, upd *updater.Updater, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet bool) {
+func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger, upd *updater.Updater, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet bool, cliBudgetSet map[string]bool) {
 	// Use HashWatcher to monitor settings hash
 	watcher := redisClient.NewSettingsWatcher()
 	watcher.OnAny(func(settingKey, value string) error {
@@ -252,6 +272,21 @@ func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *c
 			case "dry-run":
 				if cliDryRunSet {
 					logger.Printf("Ignoring Redis update for dry-run (overridden by CLI flag)")
+					return nil
+				}
+			case "download-max-duration":
+				if cliBudgetSet["download-max-duration"] {
+					logger.Printf("Ignoring Redis update for download-max-duration (overridden by CLI flag)")
+					return nil
+				}
+			case "download-stall-window":
+				if cliBudgetSet["download-stall-window"] {
+					logger.Printf("Ignoring Redis update for download-stall-window (overridden by CLI flag)")
+					return nil
+				}
+			case "download-stall-min-bytes":
+				if cliBudgetSet["download-stall-min-bytes"] {
+					logger.Printf("Ignoring Redis update for download-stall-min-bytes (overridden by CLI flag)")
 					return nil
 				}
 			}
