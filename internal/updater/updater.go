@@ -799,6 +799,11 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		return
 	}
 
+	// Committed to work past this point (isURL delegation, lock contention and
+	// a missing file are all handled above), so the heartbeat now covers both
+	// the delta and full-image branches below.
+	defer u.startHeartbeat()()
+
 	switch {
 	case strings.HasSuffix(source, ".mender"):
 		// full image: continues with the flow below
@@ -1141,6 +1146,7 @@ func (u *Updater) handleUpdateFromURL(url string) {
 		return
 	}
 	defer u.updateOpMu.Unlock()
+	defer u.startHeartbeat()()
 
 	if checksum != "" {
 		u.logger.Printf("Checksum provided: %s", checksum)
@@ -1426,6 +1432,47 @@ func (u *Updater) recordDownloadAbort(target string, err error, bytesGained int6
 	if setErr := u.status.SetAborted(u.ctx, reason, retryAfter); setErr != nil {
 		u.logger.Printf("Failed to set aborted status: %v", setErr)
 	}
+}
+
+// heartbeatInterval is how often a long operation proves it is still alive.
+// Comfortably under vehicle-service's short watchdog so a single missed tick
+// is not fatal.
+const heartbeatInterval = 30 * time.Second
+
+// startHeartbeat publishes a liveness marker for the whole duration of a long
+// operation, including the quiet stretches: the delta retry wait and the
+// connect-retry backoff both go minutes without writing anything else.
+//
+// Without it a consumer cannot tell an update that is wedged from one that is
+// legitimately between attempts, and has to assume the generous case.
+func (u *Updater) startHeartbeat() func() {
+	done := make(chan struct{})
+	var once sync.Once
+
+	if err := u.status.SetHeartbeat(u.ctx, time.Now()); err != nil {
+		u.logger.Printf("Failed to write initial heartbeat: %v", err)
+	}
+
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-u.ctx.Done():
+				return
+			case <-ticker.C:
+				if err := u.status.SetHeartbeat(u.ctx, time.Now()); err != nil {
+					u.logger.Printf("Failed to write heartbeat: %v", err)
+				}
+			}
+		}
+	}()
+
+	return func() { once.Do(func() { close(done) }) }
 }
 
 // holdSuspend takes the suspend inhibit for the duration of a transfer and
@@ -1802,6 +1849,11 @@ func (u *Updater) performUpdate(release Release, assetURL string, manual bool) {
 // updateOpMu — internal callers inside performDeltaUpdate / fallbackToFullUpdate
 // run under the same lock and use this entry directly to avoid deadlock.
 func (u *Updater) performUpdateLocked(release Release, assetURL string, manual bool) {
+	// No early-exit guard here: the caller (performUpdate, or a delta path
+	// falling back to a full update) already holds updateOpMu, so every call
+	// is committed to doing work.
+	defer u.startHeartbeat()()
+
 	u.logger.Printf("Starting update process for %s to version %s", u.config.Component, release.TagName)
 
 	var version string
@@ -2028,14 +2080,23 @@ const deltaMaxAge = 30 * 24 * time.Hour
 
 func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string, isRecheck, manual bool) {
 	// The recursive re-check call at the end of this function runs inside the
-	// same goroutine that already holds updateOpMu — skip TryLock in that case
+	// same goroutine that already holds updateOpMu, skip TryLock in that case
 	// to avoid self-deadlocking on the non-reentrant mutex.
+	//
+	// Guard the heartbeat the same way, for a different reason: an
+	// unconditional defer here would start a second goroutine ticking the
+	// same field every 30s while the outer one is still running. Harmless to
+	// the reader of the field, but wasted work and confusing in logs. This is
+	// not the same tradeoff as the suspend inhibit, which the recursive call
+	// is allowed to take again: that one is an idempotent HSET, this one is a
+	// goroutine.
 	if !isRecheck {
 		if !u.updateOpMu.TryLock() {
 			u.logger.Printf("Update already in progress, skipping delta update")
 			return
 		}
 		defer u.updateOpMu.Unlock()
+		defer u.startHeartbeat()()
 	}
 
 	// Step 0: Determine the base version to start from
