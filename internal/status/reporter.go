@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
+	"time"
 
 	ipc "github.com/librescoot/redis-ipc"
 )
@@ -141,19 +143,62 @@ func (r *Reporter) SetIdle(ctx context.Context) error {
 	return nil
 }
 
+// SetAborted returns the component to idle after a download was abandoned for
+// being too slow, recording why and when it may be retried.
+//
+// This is deliberately not SetIdle plus two writes: SetIdle clears
+// download-bytes and download-total, which are exactly the fields an abort
+// wants to preserve so the partial's progress stays visible. It is also a
+// single SetMany so no consumer sees idle-without-a-reason.
+//
+// A zero retryAfter clears the field, meaning no backoff applies.
+func (r *Reporter) SetAborted(ctx context.Context, reason string, retryAfter time.Time) error {
+	retry := ""
+	if !retryAfter.IsZero() {
+		retry = strconv.FormatInt(retryAfter.Unix(), 10)
+	}
+	m := map[string]any{
+		r.key("status"):                string(StatusIdle),
+		r.key("update-version"):        "",
+		r.key("update-method"):         "",
+		r.key("install-progress"):      "",
+		r.key("error"):                 "",
+		r.key("error-message"):         "",
+		r.key("download-abort-reason"): reason,
+		r.key("download-retry-after"):  retry,
+	}
+	r.addFlat(m, StatusIdle)
+	if err := r.pub.SetMany(m, ipc.Sync()); err != nil {
+		return fmt.Errorf("set aborted for %s: %w", r.component, err)
+	}
+	r.logger.Printf("Download abandoned for %s (%s), retry after %q", r.component, reason, retry)
+	return nil
+}
+
+// SetHeartbeat records that a long-running operation is still alive. Written
+// periodically for the whole duration of downloading, retry waits, preparing
+// and installing, so vehicle-service can tell a wedged DBC update from one
+// that is merely between retries. Async on purpose: it is frequent and the
+// next tick corrects any staleness.
+func (r *Reporter) SetHeartbeat(ctx context.Context, t time.Time) error {
+	return r.pub.Set(r.key("heartbeat"), strconv.FormatInt(t.Unix(), 10))
+}
+
 // SetDownloading atomically sets downloading status with version, method,
 // and resets all progress to 0.
 func (r *Reporter) SetDownloading(ctx context.Context, version, method string) error {
 	m := map[string]any{
-		r.key("status"):            string(StatusDownloading),
-		r.key("update-version"):    version,
-		r.key("update-method"):     method,
-		r.key("download-progress"): 0,
-		r.key("download-bytes"):    0,
-		r.key("download-total"):    0,
-		r.key("install-progress"):  0,
-		r.key("error"):             "",
-		r.key("error-message"):     "",
+		r.key("status"):                string(StatusDownloading),
+		r.key("update-version"):        version,
+		r.key("update-method"):         method,
+		r.key("download-progress"):     0,
+		r.key("download-bytes"):        0,
+		r.key("download-total"):        0,
+		r.key("install-progress"):      0,
+		r.key("error"):                 "",
+		r.key("error-message"):         "",
+		r.key("download-abort-reason"): "",
+		r.key("download-retry-after"):  "",
 	}
 	r.addFlat(m, StatusDownloading)
 	err := r.pub.SetMany(m, ipc.Sync())
@@ -279,6 +324,11 @@ func (r *Reporter) SetUpdateVersion(ctx context.Context, version string) error {
 
 // Initialize sets initial values for OTA keys on service startup.
 func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
+	// download-abort-reason and download-retry-after are deliberately absent:
+	// they mirror on-disk backoff state that outlives the process. Initialize
+	// runs on every service start, which for the DBC is every dashboard
+	// power-on, so clearing them here would wipe the orchestrator's backoff
+	// gate on every ride.
 	m := map[string]any{
 		r.key("status"):            string(StatusIdle),
 		r.key("update-method"):     updateMethod,
