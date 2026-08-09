@@ -1,8 +1,13 @@
 // Package backoff persists how often a component has abandoned a download of a
 // given target, so a scooter on a hopeless link stops retrying every check.
 //
-// The state lives on /data rather than in Redis because Redis is wiped on every
-// MDB reboot, and a ladder that resets on each boot never actually backs off.
+// The state lives on /data rather than in Redis because Redis is wiped on
+// every MDB reboot, and a ladder that resets on each boot never actually
+// backs off. The ladder counts checks skipped rather than a wall-clock
+// deadline, which additionally makes it immune to a wrong clock: a stale RTC
+// reporting a plausible-but-wrong date used to make a stored deadline look
+// far-future and wedge the ladder shut. There is no clock read anywhere in
+// this package.
 package backoff
 
 import (
@@ -22,16 +27,14 @@ const stateFileName = ".download-state.json"
 // punishing it would park a link that is plainly working.
 const ProgressResetBytes int64 = 1 << 20
 
-// sanityEpoch guards against honouring a retry deadline on a boot where the
-// clock has not been set yet. Mirrors deltaSanityEpoch in internal/mender.
-var sanityEpoch = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+// fallbackCheckInterval is substituted when the configured check interval is
+// zero or negative (automatic checks disabled), purely to give the rung ->
+// check-count conversion something sane to divide by. Only manual checks
+// will decrement the resulting count in that case.
+const fallbackCheckInterval = 6 * time.Hour
 
-// rungs is the escalation ladder. The last entry is the cap.
-//
-// Note these are a floor, not a schedule: retries only happen when a check
-// runs, so the effective cadence is max(check-interval, rung). Under the 6h
-// default check interval the first two rungs are inert; they exist for
-// deployments that shorten it.
+// rungs is the escalation ladder, expressed as durations and converted to a
+// count of checks to skip at record time. The last entry is the cap.
 var rungs = []time.Duration{
 	1 * time.Hour,
 	3 * time.Hour,
@@ -44,7 +47,7 @@ var rungs = []time.Duration{
 type State struct {
 	Target     string `json:"target"`
 	Aborts     int    `json:"aborts"`
-	RetryAfter int64  `json:"retry_after"`
+	SkipChecks int    `json:"skip_checks"`
 }
 
 type Store struct {
@@ -78,27 +81,51 @@ func (s *Store) load() State {
 	return st
 }
 
-// ShouldSkip reports whether an attempt at target should be deferred, and until
-// when. A different target is never skipped: a new release deserves a fresh try.
-func (s *Store) ShouldSkip(target string, now time.Time) (bool, time.Time) {
-	if now.Before(sanityEpoch) {
-		s.logger.Printf("Clock is before %s, ignoring download backoff", sanityEpoch.Format("2006-01-02"))
-		return false, time.Time{}
-	}
+// ShouldSkip reports whether an attempt at target should be deferred. Serving
+// the backoff is a side effect of asking: when it returns true it has also
+// decremented and persisted the remaining count, so each check spends exactly
+// one skip. Call it at most once per check per target, or it will spend two.
+//
+// A different target is never skipped: a new release deserves a fresh try.
+func (s *Store) ShouldSkip(target string) bool {
 	st := s.load()
-	if st.Target != target || st.RetryAfter == 0 {
-		return false, time.Time{}
+	if st.Target != target || st.SkipChecks <= 0 {
+		return false
 	}
-	until := time.Unix(st.RetryAfter, 0)
-	if now.Before(until) {
-		return true, until
+	st.SkipChecks--
+	if err := s.write(st); err != nil {
+		s.logger.Printf("Failed to persist decremented backoff state: %v", err)
 	}
-	return false, time.Time{}
+	s.logger.Printf("Skipping check for %s: download backed off, %d check(s) remaining", target, st.SkipChecks)
+	return true
 }
 
-// RecordAbort notes an abandoned attempt and returns when the next one may
-// start. A zero return means no backoff applies.
-func (s *Store) RecordAbort(target string, bytesGained int64, now time.Time) (time.Time, error) {
+// checksFor converts a rung duration into a count of checks to skip, given
+// the cadence checks actually run at. checkInterval <= 0 means automatic
+// checks are disabled, so only manual checks will ever decrement the count;
+// fallbackCheckInterval is substituted so the conversion still yields a sane
+// number instead of dividing by zero.
+//
+// The division rounds up: a rung that doesn't divide evenly into the
+// interval must still be covered by the last check inside it, not left one
+// check short. Duration is already integer nanoseconds, so this is plain
+// integer ceiling division. checks is at least 1 for any positive rung.
+func checksFor(rung, checkInterval time.Duration) int {
+	if checkInterval <= 0 {
+		checkInterval = fallbackCheckInterval
+	}
+	checks := (rung + checkInterval - 1) / checkInterval
+	if checks < 1 {
+		checks = 1
+	}
+	return int(checks)
+}
+
+// RecordAbort notes an abandoned attempt and returns how many subsequent
+// checks to skip. A zero return means no backoff applies. checkInterval is
+// the configured check cadence, used to convert the rung duration into a
+// count of checks.
+func (s *Store) RecordAbort(target string, bytesGained int64, checkInterval time.Duration) (int, error) {
 	st := s.load()
 	if st.Target != target {
 		st = State{Target: target}
@@ -107,24 +134,23 @@ func (s *Store) RecordAbort(target string, bytesGained int64, now time.Time) (ti
 	if bytesGained >= ProgressResetBytes {
 		s.logger.Printf("Attempt for %s aborted but gained %d bytes, resetting backoff", target, bytesGained)
 		st.Aborts = 0
-		st.RetryAfter = 0
+		st.SkipChecks = 0
 		if err := s.write(st); err != nil {
-			return time.Time{}, err
+			return 0, err
 		}
-		return time.Time{}, nil
+		return 0, nil
 	}
 
 	st.Aborts++
 	idx := min(st.Aborts-1, len(rungs)-1)
-	retryAfter := now.Add(rungs[idx])
-	st.RetryAfter = retryAfter.Unix()
+	st.SkipChecks = checksFor(rungs[idx], checkInterval)
 
 	if err := s.write(st); err != nil {
-		return time.Time{}, err
+		return 0, err
 	}
-	s.logger.Printf("Attempt %d for %s abandoned, next attempt no earlier than %s",
-		st.Aborts, target, retryAfter.Format(time.RFC3339))
-	return retryAfter, nil
+	s.logger.Printf("Attempt %d for %s abandoned, skipping the next %d check(s)",
+		st.Aborts, target, st.SkipChecks)
+	return st.SkipChecks, nil
 }
 
 // Clear removes the state after a successful download.

@@ -144,18 +144,18 @@ func (r *Reporter) SetIdle(ctx context.Context) error {
 }
 
 // SetAborted returns the component to idle after a download was abandoned for
-// being too slow, recording why and when it may be retried.
+// being too slow, recording why and how many subsequent checks to skip.
 //
 // This is deliberately not SetIdle plus two writes: SetIdle clears
 // download-bytes and download-total, which are exactly the fields an abort
 // wants to preserve so the partial's progress stays visible. It is also a
 // single SetMany so no consumer sees idle-without-a-reason.
 //
-// A zero retryAfter clears the field, meaning no backoff applies.
-func (r *Reporter) SetAborted(ctx context.Context, reason string, retryAfter time.Time) error {
-	retry := ""
-	if !retryAfter.IsZero() {
-		retry = strconv.FormatInt(retryAfter.Unix(), 10)
+// A zero skipChecks clears the field, meaning no backoff applies.
+func (r *Reporter) SetAborted(ctx context.Context, reason string, skipChecks int) error {
+	skip := ""
+	if skipChecks > 0 {
+		skip = strconv.Itoa(skipChecks)
 	}
 	m := map[string]any{
 		r.key("status"):                string(StatusIdle),
@@ -165,13 +165,13 @@ func (r *Reporter) SetAborted(ctx context.Context, reason string, retryAfter tim
 		r.key("error"):                 "",
 		r.key("error-message"):         "",
 		r.key("download-abort-reason"): reason,
-		r.key("download-retry-after"):  retry,
+		r.key("download-skip-checks"):  skip,
 	}
 	r.addFlat(m, StatusIdle)
 	if err := r.pub.SetMany(m, ipc.Sync()); err != nil {
 		return fmt.Errorf("set aborted for %s: %w", r.component, err)
 	}
-	r.logger.Printf("Download abandoned for %s (%s), retry after %q", r.component, reason, retry)
+	r.logger.Printf("Download abandoned for %s (%s), skip_checks=%q", r.component, reason, skip)
 	return nil
 }
 
@@ -198,7 +198,7 @@ func (r *Reporter) SetDownloading(ctx context.Context, version, method string) e
 		r.key("error"):                 "",
 		r.key("error-message"):         "",
 		r.key("download-abort-reason"): "",
-		r.key("download-retry-after"):  "",
+		r.key("download-skip-checks"):  "",
 	}
 	r.addFlat(m, StatusDownloading)
 	err := r.pub.SetMany(m, ipc.Sync())
@@ -324,7 +324,7 @@ func (r *Reporter) SetUpdateVersion(ctx context.Context, version string) error {
 
 // Initialize sets initial values for OTA keys on service startup.
 func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
-	// download-abort-reason and download-retry-after are deliberately absent:
+	// download-abort-reason and download-skip-checks are deliberately absent:
 	// they mirror on-disk backoff state that outlives the process. Initialize
 	// runs on every service start, which for the DBC is every dashboard
 	// power-on, so clearing them here would wipe the orchestrator's backoff

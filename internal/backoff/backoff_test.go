@@ -16,89 +16,143 @@ func newTestStore(t *testing.T) (*Store, string) {
 
 func TestStore_NoStateMeansNoSkip(t *testing.T) {
 	s, _ := newTestStore(t)
-	skip, _ := s.ShouldSkip("v1.0.0", time.Now())
-	if skip {
+	if s.ShouldSkip("v1.0.0") {
 		t.Fatal("a component with no recorded aborts must not be skipped")
 	}
 }
 
-func TestStore_LadderProgression(t *testing.T) {
+func TestStore_LadderProgressionSixHourInterval(t *testing.T) {
 	s, _ := newTestStore(t)
-	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
-
-	want := []time.Duration{time.Hour, 3 * time.Hour, 6 * time.Hour, 24 * time.Hour, 24 * time.Hour}
+	// Under the 6h default check interval, the 1h/3h/6h rungs all convert to
+	// a single skipped check and only the 24h cap converts to more than one.
+	want := []int{1, 1, 1, 4, 4}
 	for i, expected := range want {
-		got, err := s.RecordAbort("v1.0.0", 0, now)
+		got, err := s.RecordAbort("v1.0.0", 0, 6*time.Hour)
 		if err != nil {
 			t.Fatalf("abort %d: %v", i+1, err)
 		}
-		if diff := got.Sub(now); diff != expected {
-			t.Errorf("abort %d: retry after %v, want %v", i+1, diff, expected)
+		if got != expected {
+			t.Errorf("abort %d: skip_checks = %d, want %d", i+1, got, expected)
 		}
 	}
 }
 
-func TestStore_SkipsUntilRetryAfter(t *testing.T) {
+func TestStore_LadderProgressionThirtyMinuteInterval(t *testing.T) {
 	s, _ := newTestStore(t)
-	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
-	if _, err := s.RecordAbort("v1.0.0", 0, now); err != nil {
-		t.Fatal(err)
-	}
-
-	if skip, _ := s.ShouldSkip("v1.0.0", now.Add(30*time.Minute)); !skip {
-		t.Error("must skip inside the backoff window")
-	}
-	if skip, _ := s.ShouldSkip("v1.0.0", now.Add(2*time.Hour)); skip {
-		t.Error("must not skip once the window has passed")
+	// A shortened check interval must still honour the intended wall-clock
+	// delay: each rung converts to more checks, not the same count.
+	want := []int{2, 6, 12, 48}
+	for i, expected := range want {
+		got, err := s.RecordAbort("v1.0.0", 0, 30*time.Minute)
+		if err != nil {
+			t.Fatalf("abort %d: %v", i+1, err)
+		}
+		if got != expected {
+			t.Errorf("abort %d: skip_checks = %d, want %d", i+1, got, expected)
+		}
 	}
 }
 
-func TestStore_NewTargetResetsLadder(t *testing.T) {
+func TestStore_CheckIntervalZeroFallsBackToSixHours(t *testing.T) {
 	s, _ := newTestStore(t)
-	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
-	for range 3 {
-		if _, err := s.RecordAbort("v1.0.0", 0, now); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	if skip, _ := s.ShouldSkip("v2.0.0", now); skip {
-		t.Error("a different target must not inherit the old backoff")
-	}
-	got, err := s.RecordAbort("v2.0.0", 0, now)
+	// checkInterval 0 means automatic checks are disabled; the conversion
+	// must still produce a sane count rather than dividing by zero.
+	got, err := s.RecordAbort("v1.0.0", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if diff := got.Sub(now); diff != time.Hour {
-		t.Errorf("new target starts at rung 1, got %v", diff)
+	if got != 1 {
+		t.Errorf("skip_checks = %d, want 1 (the 6h fallback conversion of the 1h rung)", got)
+	}
+}
+
+func TestStore_ShouldSkipDecrementsThenStops(t *testing.T) {
+	s, _ := newTestStore(t)
+	for i := 0; i < 3; i++ {
+		if _, err := s.RecordAbort("v1.0.0", 0, 6*time.Hour); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 4th abort lands on the 24h rung, which converts to 4 skipped checks
+	// under a 6h interval.
+	got, err := s.RecordAbort("v1.0.0", 0, 6*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 4 {
+		t.Fatalf("setup: skip_checks = %d, want 4", got)
+	}
+
+	for i := 0; i < 4; i++ {
+		if !s.ShouldSkip("v1.0.0") {
+			t.Fatalf("check %d: expected a skip", i+1)
+		}
+	}
+	if s.ShouldSkip("v1.0.0") {
+		t.Error("expected no more skips once the count is exhausted")
+	}
+}
+
+func TestStore_ShouldSkipPersistsAcrossInstances(t *testing.T) {
+	s, dir := newTestStore(t)
+	if _, err := s.RecordAbort("v1.0.0", 0, 6*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if !s.ShouldSkip("v1.0.0") {
+		t.Fatal("expected a skip")
+	}
+	// A fresh Store pointed at the same file must see the decrement, not the
+	// original count: that is what makes the ladder survive a process
+	// restart, which is the entire reason state lives on /data.
+	s2 := NewStore(dir, log.New(os.Stdout, "test: ", 0))
+	if s2.ShouldSkip("v1.0.0") {
+		t.Error("expected the single skip_checks to already be exhausted")
 	}
 }
 
 func TestStore_ProgressResetsLadder(t *testing.T) {
 	s, _ := newTestStore(t)
-	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
-	for range 3 {
-		if _, err := s.RecordAbort("v1.0.0", 0, now); err != nil {
+	for i := 0; i < 3; i++ {
+		if _, err := s.RecordAbort("v1.0.0", 0, 6*time.Hour); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	retryAfter, err := s.RecordAbort("v1.0.0", ProgressResetBytes, now)
+	got, err := s.RecordAbort("v1.0.0", ProgressResetBytes, 6*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !retryAfter.IsZero() {
-		t.Errorf("an attempt that made progress must impose no backoff, got %v", retryAfter)
+	if got != 0 {
+		t.Errorf("an attempt that made progress must impose no backoff, got %d", got)
 	}
-	if skip, _ := s.ShouldSkip("v1.0.0", now); skip {
+	if s.ShouldSkip("v1.0.0") {
 		t.Error("must not skip after a productive attempt")
+	}
+}
+
+func TestStore_NewTargetResetsLadder(t *testing.T) {
+	s, _ := newTestStore(t)
+	for i := 0; i < 3; i++ {
+		if _, err := s.RecordAbort("v1.0.0", 0, 6*time.Hour); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if s.ShouldSkip("v2.0.0") {
+		t.Error("a different target must not inherit the old backoff")
+	}
+	got, err := s.RecordAbort("v2.0.0", 0, 6*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 {
+		t.Errorf("new target starts at rung 1, got %d", got)
 	}
 }
 
 func TestStore_ClearRemovesState(t *testing.T) {
 	s, dir := newTestStore(t)
-	now := time.Now()
-	if _, err := s.RecordAbort("v1.0.0", 0, now); err != nil {
+	if _, err := s.RecordAbort("v1.0.0", 0, 6*time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Clear(); err != nil {
@@ -107,7 +161,7 @@ func TestStore_ClearRemovesState(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, stateFileName)); !os.IsNotExist(err) {
 		t.Errorf("expected state file to be gone, got %v", err)
 	}
-	if skip, _ := s.ShouldSkip("v1.0.0", now); skip {
+	if s.ShouldSkip("v1.0.0") {
 		t.Error("cleared state must not skip")
 	}
 }
@@ -124,14 +178,14 @@ func TestStore_TornFileFailsOpen(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, stateFileName), []byte(`{"target":"v1.0.0","abo`), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if skip, _ := s.ShouldSkip("v1.0.0", time.Now()); skip {
+	if s.ShouldSkip("v1.0.0") {
 		t.Error("unparseable state must fail open, not block updates")
 	}
 }
 
 func TestStore_WriteIsAtomic(t *testing.T) {
 	s, dir := newTestStore(t)
-	if _, err := s.RecordAbort("v1.0.0", 0, time.Now()); err != nil {
+	if _, err := s.RecordAbort("v1.0.0", 0, 6*time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(dir)
@@ -142,19 +196,5 @@ func TestStore_WriteIsAtomic(t *testing.T) {
 		if e.Name() != stateFileName {
 			t.Errorf("temp file %q left behind; write must rename into place", e.Name())
 		}
-	}
-}
-
-func TestStore_IgnoresBackoffWhenClockIsUnset(t *testing.T) {
-	s, _ := newTestStore(t)
-	real := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
-	if _, err := s.RecordAbort("v1.0.0", 0, real); err != nil {
-		t.Fatal(err)
-	}
-	// A boot before NTP sync. Honouring retry_after here could park updates
-	// forever, so the guard must ignore it.
-	unsynced := time.Date(1970, 1, 2, 0, 0, 0, 0, time.UTC)
-	if skip, _ := s.ShouldSkip("v1.0.0", unsynced); skip {
-		t.Error("backoff must be ignored when the clock is clearly unset")
 	}
 }

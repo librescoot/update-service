@@ -59,11 +59,22 @@ func (u *Updater) orchestrateDBC(releases []Release) {
 	// Best effort: this field lives in MDB Redis and is wiped on an MDB
 	// reboot, so a read error must not block DBC updates. Proceed and let
 	// the DBC's own persisted state be the real enforcement.
-	if retryAfter, err := u.redis.GetDBCDownloadRetryAfter(); err != nil {
+	//
+	// The MDB decrements the count itself when it skips. The DBC only checks
+	// when powered, and the MDB powers it in order to check: if the count
+	// were only ever decremented by the DBC, a DBC skipped here would never
+	// be powered on to check, never decrement, and stay backed off forever.
+	// So this orchestration pass, which is the MDB's own check cadence, is
+	// what drives the countdown. A write failure here must not block the
+	// skip decision already made; it only means the persisted decrement is
+	// lost and the next pass reads the same count again.
+	if skipChecks, err := u.redis.GetDBCDownloadSkipChecks(); err != nil {
 		u.logger.Printf("[dbc-orchestrate] Could not read DBC download backoff: %v, proceeding", err)
-	} else if retryAfter > 0 && time.Now().Before(time.Unix(retryAfter, 0)) {
-		u.logger.Printf("[dbc-orchestrate] DBC download backed off until %s, not powering on",
-			time.Unix(retryAfter, 0).Format(time.RFC3339))
+	} else if skipChecks > 0 {
+		if err := u.redis.SetDBCDownloadSkipChecks(skipChecks - 1); err != nil {
+			u.logger.Printf("[dbc-orchestrate] Failed to persist decremented DBC download backoff: %v", err)
+		}
+		u.logger.Printf("[dbc-orchestrate] DBC download backed off, %d check(s) remaining, not powering on", skipChecks-1)
 		return
 	}
 

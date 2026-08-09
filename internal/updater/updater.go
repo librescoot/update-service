@@ -1420,16 +1420,16 @@ func abortReasonFor(err error) string {
 }
 
 // recordDownloadAbort persists the abort against target and publishes the
-// resulting retry deadline. bytesGained is how much this attempt actually
+// resulting skip count. bytesGained is how much this attempt actually
 // transferred; an attempt that moved a meaningful amount resets the ladder
 // rather than advancing it, because it was interrupted rather than hopeless.
 func (u *Updater) recordDownloadAbort(target string, err error, bytesGained int64) {
 	reason := abortReasonFor(err)
-	retryAfter, recErr := u.backoff.RecordAbort(target, bytesGained, time.Now())
+	skipChecks, recErr := u.backoff.RecordAbort(target, bytesGained, u.config.CheckInterval)
 	if recErr != nil {
 		u.logger.Printf("Failed to persist download backoff: %v", recErr)
 	}
-	if setErr := u.status.SetAborted(u.ctx, reason, retryAfter); setErr != nil {
+	if setErr := u.status.SetAborted(u.ctx, reason, skipChecks); setErr != nil {
 		u.logger.Printf("Failed to set aborted status: %v", setErr)
 	}
 }
@@ -1675,9 +1675,9 @@ func (u *Updater) checkForUpdates(manual bool) {
 		u.logger.Printf("No .mender asset found for variant_id %s in release %s", variantID, release.TagName)
 	} else if !u.isUpdateNeeded(release) {
 		u.logger.Printf("No update needed for component %s", u.config.Component)
-	} else if skip, until := u.backoff.ShouldSkip(release.TagName, time.Now()); skip {
-		u.logger.Printf("Skipping %s for %s: download backed off until %s",
-			release.TagName, u.config.Component, until.Format(time.RFC3339))
+	} else if u.backoff.ShouldSkip(release.TagName) {
+		u.logger.Printf("Skipping %s for %s: download backed off",
+			release.TagName, u.config.Component)
 	} else {
 		u.logger.Printf("Update needed for %s: %s (using full update)", u.config.Component, release.TagName)
 		u.wg.Add(1)
@@ -2144,9 +2144,8 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	// update path, which keys on release.TagName rather than the lowercased
 	// latestVersion below.
 	chainTarget := deltaChain[len(deltaChain)-1].TagName
-	if skip, until := u.backoff.ShouldSkip(chainTarget, time.Now()); skip {
-		u.logger.Printf("Skipping delta chain to %s: download backed off until %s",
-			chainTarget, until.Format(time.RFC3339))
+	if u.backoff.ShouldSkip(chainTarget) {
+		u.logger.Printf("Skipping delta chain to %s: download backed off", chainTarget)
 		return
 	}
 

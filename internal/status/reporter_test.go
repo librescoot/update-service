@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"os"
-	"strconv"
 	"testing"
 	"time"
 
@@ -36,8 +35,7 @@ func TestSetAborted_PreservesProgressAndRecordsReason(t *testing.T) {
 	mr.HSet("ota", "download-bytes:mdb", "5000000")
 	mr.HSet("ota", "download-total:mdb", "10000000")
 
-	retryAfter := time.Date(2026, 8, 9, 18, 0, 0, 0, time.UTC)
-	if err := r.SetAborted(ctx, "stalled", retryAfter); err != nil {
+	if err := r.SetAborted(ctx, "stalled", 4); err != nil {
 		t.Fatal(err)
 	}
 
@@ -54,23 +52,22 @@ func TestSetAborted_PreservesProgressAndRecordsReason(t *testing.T) {
 	if got := mr.HGet("ota", "download-abort-reason:mdb"); got != "stalled" {
 		t.Errorf("download-abort-reason:mdb = %q, want stalled", got)
 	}
-	wantRetry := strconv.FormatInt(retryAfter.Unix(), 10)
-	if got := mr.HGet("ota", "download-retry-after:mdb"); got != wantRetry {
-		t.Errorf("download-retry-after:mdb = %q, want %q", got, wantRetry)
+	if got := mr.HGet("ota", "download-skip-checks:mdb"); got != "4" {
+		t.Errorf("download-skip-checks:mdb = %q, want 4", got)
 	}
 	if got := mr.HGet("ota", "error:mdb"); got != "" {
 		t.Errorf("error:mdb = %q, want cleared", got)
 	}
 }
 
-func TestSetAborted_ZeroRetryAfterClearsTheField(t *testing.T) {
+func TestSetAborted_ZeroSkipChecksClearsTheField(t *testing.T) {
 	r, mr := newTestReporter(t)
 	ctx := context.Background()
-	if err := r.SetAborted(ctx, "stalled", time.Time{}); err != nil {
+	if err := r.SetAborted(ctx, "stalled", 0); err != nil {
 		t.Fatal(err)
 	}
-	if got := mr.HGet("ota", "download-retry-after:mdb"); got != "" {
-		t.Errorf("download-retry-after:mdb = %q, want empty when no backoff applies", got)
+	if got := mr.HGet("ota", "download-skip-checks:mdb"); got != "" {
+		t.Errorf("download-skip-checks:mdb = %q, want empty when no backoff applies", got)
 	}
 }
 
@@ -78,8 +75,7 @@ func TestInitialize_LeavesAbortFieldsIntact(t *testing.T) {
 	r, mr := newTestReporter(t)
 	ctx := context.Background()
 
-	retryAfter := time.Date(2026, 8, 9, 18, 0, 0, 0, time.UTC)
-	if err := r.SetAborted(ctx, "budget-exceeded", retryAfter); err != nil {
+	if err := r.SetAborted(ctx, "budget-exceeded", 4); err != nil {
 		t.Fatal(err)
 	}
 	// Initialize runs on every service start, which for the DBC is every
@@ -92,16 +88,15 @@ func TestInitialize_LeavesAbortFieldsIntact(t *testing.T) {
 	if got := mr.HGet("ota", "download-abort-reason:mdb"); got != "budget-exceeded" {
 		t.Errorf("download-abort-reason:mdb = %q, want it to survive Initialize", got)
 	}
-	wantRetry := strconv.FormatInt(retryAfter.Unix(), 10)
-	if got := mr.HGet("ota", "download-retry-after:mdb"); got != wantRetry {
-		t.Errorf("download-retry-after:mdb = %q, want it to survive Initialize", got)
+	if got := mr.HGet("ota", "download-skip-checks:mdb"); got != "4" {
+		t.Errorf("download-skip-checks:mdb = %q, want it to survive Initialize", got)
 	}
 }
 
 func TestSetDownloading_ClearsAbortFields(t *testing.T) {
 	r, mr := newTestReporter(t)
 	ctx := context.Background()
-	if err := r.SetAborted(ctx, "stalled", time.Date(2026, 8, 9, 18, 0, 0, 0, time.UTC)); err != nil {
+	if err := r.SetAborted(ctx, "stalled", 4); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.SetDownloading(ctx, "v1.2.3", "full"); err != nil {
@@ -110,8 +105,8 @@ func TestSetDownloading_ClearsAbortFields(t *testing.T) {
 	if got := mr.HGet("ota", "download-abort-reason:mdb"); got != "" {
 		t.Errorf("download-abort-reason:mdb = %q, want cleared by a fresh attempt", got)
 	}
-	if got := mr.HGet("ota", "download-retry-after:mdb"); got != "" {
-		t.Errorf("download-retry-after:mdb = %q, want cleared by a fresh attempt", got)
+	if got := mr.HGet("ota", "download-skip-checks:mdb"); got != "" {
+		t.Errorf("download-skip-checks:mdb = %q, want cleared by a fresh attempt", got)
 	}
 }
 
