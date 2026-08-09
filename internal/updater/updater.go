@@ -2052,6 +2052,17 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		return
 	}
 
+	// chainTarget is the raw (non-lowercased) tag the chain lands on. It is the
+	// key the backoff store is consulted and recorded under, matching the full
+	// update path, which keys on release.TagName rather than the lowercased
+	// latestVersion below.
+	chainTarget := deltaChain[len(deltaChain)-1].TagName
+	if skip, until := u.backoff.ShouldSkip(chainTarget, time.Now()); skip {
+		u.logger.Printf("Skipping delta chain to %s: download backed off until %s",
+			chainTarget, until.Format(time.RFC3339))
+		return
+	}
+
 	// Get latest version from chain
 	latestVersion := strings.ToLower(deltaChain[len(deltaChain)-1].TagName)
 
@@ -2141,8 +2152,18 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		}
 	}()
 
+	// deltaProgress tracks bytes gained by the current download attempt, for
+	// the backoff ladder. It is a plain value reset by reassignment at the top
+	// of each attempt in the retry loop below: downloadProgressCallback is
+	// defined once here and shared across every delta and every retry, but a
+	// Go closure captures the variable itself, not a snapshot, so resetting
+	// deltaProgress in the loop is visible to the callback without needing a
+	// pointer or a separate Reset method.
+	var deltaProgress progressTracker
+
 	// Progress callback for downloads (we'll track total across all deltas)
 	downloadProgressCallback := func(downloaded, total int64) {
+		deltaProgress.observe(downloaded)
 		if err := u.status.SetDownloadProgress(u.ctx, downloaded, total); err != nil {
 			u.logger.Printf("Failed to set download progress: %v", err)
 		}
@@ -2196,10 +2217,22 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			if attempt > 1 {
 				u.logger.Printf("Downloading delta %d/%d: %s (retry %d)", i+1, len(deltaChain), release.TagName, attempt)
 			}
+			// Reset per attempt, not per delta: the tracker must measure what
+			// this attempt gained, since a resumed retry's first callback
+			// report already reflects the previous attempt's progress.
+			deltaProgress = progressTracker{}
 			var err error
 			deltaPath, err = u.mender.DownloadDelta(u.ctx, deltaURL, assetChecksum(release, deltaURL), downloadProgressCallback)
 			if err == nil {
 				break
+			}
+			if isDownloadBudgetAbort(err) {
+				// Do not abandonChain here. abandonChain falls back to the full
+				// image, and escalating to a larger artifact because a smaller
+				// one was too slow is exactly wrong on a starved link.
+				u.logger.Printf("Delta download for %s abandoned: %v", release.TagName, err)
+				u.recordDownloadAbort(chainTarget, err, deltaProgress.gained())
+				return
 			}
 			if errors.Is(err, mender.ErrAssetUnavailable) {
 				// The release was pruned from the host; the chain can never complete.
@@ -2273,6 +2306,10 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 
 	workingVersion := deltaVersions[len(deltaVersions)-1]
 	u.logger.Printf("Delta chain applied successfully: %d deltas, now at %s", len(downloads), workingVersion)
+
+	if err := u.backoff.Clear(); err != nil {
+		u.logger.Printf("Failed to clear download backoff after success: %v", err)
+	}
 
 	// Step 4: Check for additional deltas released during the update
 	if u.ctx.Err() != nil {
