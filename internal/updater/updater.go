@@ -202,6 +202,17 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 	// any download goroutine launches, so there is no concurrent writer.
 	u.mender.CleanupStaleDeltaFiles(deltaMaxAge)
 
+	// Release our own suspend inhibit unconditionally, before anything else
+	// in this process can take it. A prior run that crashed, was killed, or
+	// lost power mid-transfer leaves download-transfer:{component} behind:
+	// pm-service applies no TTL to Redis inhibits, so an orphaned suspend-only
+	// hold blocks MDB suspend forever. Removing a key that was never held is a
+	// harmless no-op, so this runs every startup regardless of whether the
+	// previous run actually left one behind.
+	if err := u.inhibitor.RemoveDownloadSuspendInhibit(u.config.Component); err != nil {
+		u.logger.Printf("Warning: Failed to clear stale download suspend inhibit: %v", err)
+	}
+
 	// Recover from any stuck status on startup
 	if err := u.recoverFromStuckState(menderNeedsReboot); err != nil {
 		u.logger.Printf("Warning: Failed to recover from stuck state: %v", err)
@@ -1494,7 +1505,18 @@ func (u *Updater) startHeartbeat() func() {
 // Unlike AddDownloadInhibit, this is not gated to the mdb component: the DBC
 // downloads over the MDB's modem, so the MDB must stay awake for a DBC
 // transfer too.
+//
+// download-max-duration is the wall-clock cap that bounds how long this hold
+// can possibly last; 0 disables it. Taking the inhibit anyway with no cap in
+// place would make the hold unbounded the moment a transfer stalls, which is
+// exactly the AUX drain this mechanism exists to prevent. The two ship
+// together or not at all, so a disabled cap means no hold this attempt.
 func (u *Updater) holdSuspend() func() {
+	if u.config.DownloadMaxDuration <= 0 {
+		u.logger.Printf("Warning: download-max-duration is disabled, not holding suspend for this transfer")
+		return func() {}
+	}
+
 	if err := u.inhibitor.AddDownloadSuspendInhibit(u.config.Component); err != nil {
 		u.logger.Printf("Failed to add download suspend inhibit: %v", err)
 	}
