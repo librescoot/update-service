@@ -560,22 +560,38 @@ func (u *Updater) setStandbyStartTime(t time.Time) {
 func (u *Updater) monitorVehicleState() {
 	watcher := u.redis.NewVehicleWatcher(config.VehicleHashKey)
 
-	// MDB-only: when DBC is powered off while its OTA status is stuck in
-	// "pending-reboot" (e.g. DBC finished installing but got shut down before
-	// rebooting), clear the stale state so a future orchestration cycle will
-	// power the DBC back on instead of treating it as "already updating".
+	// MDB-only: when the DBC is powered off mid-OTA its status field is left
+	// frozen at whatever it was, because the DBC process dies without writing a
+	// terminal state. Any such leftover blocks orchestrateDBC, which skips a DBC
+	// that is not idle, and the DBC cannot clear it itself because it has no
+	// power. That deadlocks until a reboot.
+	//
+	// Only clear the states the DBC's own recoverFromStuckState would clear
+	// unconditionally anyway: downloading and preparing. Their resume data lives
+	// on disk (the partial .tmp and FindMenderFileForVersion), not in this field,
+	// so dropping it loses nothing. Deliberately NOT installing: that recovery
+	// branch is conditional on menderNeedsReboot and can legitimately end at
+	// pending-reboot, which is a decision only the DBC can make. Clearing it here
+	// would make the DBC boot into idle and skip that branch. An interrupted
+	// install therefore still self-heals the slow way, when the rider next powers
+	// the scooter on.
 	if u.dbcStatus != nil {
+		staleOnPowerOff := map[string]bool{
+			string(status.StatusDownloading):   true,
+			string(status.StatusPreparing):     true,
+			string(status.StatusPendingReboot): true,
+		}
 		watcher.OnField("dashboard:power", func(power string) error {
 			if power != "off" {
 				return nil
 			}
 			dbcOTA, err := u.redis.GetDBCOTAStatus()
-			if err != nil || dbcOTA != string(status.StatusPendingReboot) {
+			if err != nil || !staleOnPowerOff[dbcOTA] {
 				return nil
 			}
-			u.logger.Printf("[dbc-orchestrate] DBC powered off while status=pending-reboot; clearing stale state")
+			u.logger.Printf("[dbc-orchestrate] DBC powered off while status=%s; clearing stale state", dbcOTA)
 			if err := u.dbcStatus.SetIdle(u.ctx); err != nil {
-				u.logger.Printf("[dbc-orchestrate] Failed to clear DBC pending-reboot state: %v", err)
+				u.logger.Printf("[dbc-orchestrate] Failed to clear DBC %s state: %v", dbcOTA, err)
 			}
 			return nil
 		})
@@ -1425,6 +1441,20 @@ func (u *Updater) checkForUpdates(manual bool) {
 	if err != nil {
 		u.logger.Printf("Failed to get current status: %v", err)
 		return
+	}
+
+	// An error from a previous attempt is not "busy", it is a finished attempt
+	// that failed. Treating it as busy latches the component: every subsequent
+	// check, periodic or manual, returns here and OTA stays dead until the
+	// service restarts. Clear it and carry on so a transient failure costs one
+	// cycle rather than all of them.
+	if currentStatus == status.StatusError {
+		u.logger.Printf("Component %s is in error state from a previous attempt, clearing it to retry", u.config.Component)
+		if err := u.status.SetIdle(u.ctx); err != nil {
+			u.logger.Printf("Failed to clear error status: %v", err)
+			return
+		}
+		currentStatus = status.StatusIdle
 	}
 
 	if currentStatus != status.StatusIdle && currentStatus != "" {
