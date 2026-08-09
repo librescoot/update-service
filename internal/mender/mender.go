@@ -26,9 +26,9 @@ type Manager struct {
 }
 
 // NewManager creates a new Mender manager with the specified download directory
-func NewManager(downloadDir string, logger *log.Logger) *Manager {
+func NewManager(downloadDir string, budget Budget, logger *log.Logger) *Manager {
 	return &Manager{
-		downloader:   NewDownloader(downloadDir, logger),
+		downloader:   NewDownloader(downloadDir, budget, logger),
 		installer:    NewInstaller(logger),
 		deltaApplier: NewDeltaApplier(logger),
 		logger:       logger,

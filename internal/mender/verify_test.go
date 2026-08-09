@@ -53,7 +53,7 @@ func TestManager_DownloadDelta_DiscardsUnverifiedFile(t *testing.T) {
 	defer server.Close()
 
 	tmpDir := t.TempDir()
-	m := NewManager(tmpDir, log.New(io.Discard, "", 0))
+	m := NewManager(tmpDir, Budget{}, log.New(io.Discard, "", 0))
 	url := server.URL + "/update.delta"
 	deltaPath := filepath.Join(tmpDir, "update.delta")
 
@@ -108,7 +108,7 @@ func TestManager_DownloadAndVerify_DiscardsUnverifiedFile(t *testing.T) {
 	defer server.Close()
 
 	tmpDir := t.TempDir()
-	m := NewManager(tmpDir, log.New(io.Discard, "", 0))
+	m := NewManager(tmpDir, Budget{}, log.New(io.Discard, "", 0))
 	url := server.URL + "/update.mender"
 	menderPath := filepath.Join(tmpDir, "update.mender")
 
@@ -143,7 +143,7 @@ func TestDownloader_SkipsOnSizeMatchAlone(t *testing.T) {
 	defer server.Close()
 
 	tmpDir := t.TempDir()
-	d := NewDownloader(tmpDir, log.New(io.Discard, "", 0))
+	d := NewDownloader(tmpDir, Budget{}, log.New(io.Discard, "", 0))
 	filePath := filepath.Join(tmpDir, "update.delta")
 	if err := os.WriteFile(filePath, bad, 0644); err != nil {
 		t.Fatalf("seeding corrupt file: %v", err)

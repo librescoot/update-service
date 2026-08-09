@@ -17,7 +17,7 @@ func TestManager_RemoveFile(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	manager := NewManager(tmpDir, logger)
+	manager := NewManager(tmpDir, Budget{}, logger)
 
 	// Create a file to remove
 	testFile := filepath.Join(tmpDir, "test.mender")
@@ -52,7 +52,7 @@ func TestManager_RemoveFile_RefusesOutsideDir(t *testing.T) {
 	defer os.RemoveAll(otherDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	manager := NewManager(tmpDir, logger)
+	manager := NewManager(tmpDir, Budget{}, logger)
 
 	// Create a file outside the download directory
 	outsideFile := filepath.Join(otherDir, "outside.mender")
@@ -81,7 +81,7 @@ func TestManager_FindMenderFileForVersion(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	manager := NewManager(tmpDir, logger)
+	manager := NewManager(tmpDir, Budget{}, logger)
 
 	// Create a mender file with version in name
 	testFile := filepath.Join(tmpDir, "librescoot-unu-dbc-nightly-20251212T024719.mender")
@@ -119,7 +119,7 @@ func TestManager_CleanupStaleMenderFiles_SemverAware(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	manager := NewManager(tmpDir, logger)
+	manager := NewManager(tmpDir, Budget{}, logger)
 
 	// v0.10.0 is the newest — lex compare would (wrongly) keep v0.7.0.
 	// Real published stable assets carry no "stable-" infix.
@@ -164,7 +164,7 @@ func TestManager_FindLatestMenderFile_MixedChannels(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	manager := NewManager(tmpDir, logger)
+	manager := NewManager(tmpDir, Budget{}, logger)
 
 	files := []string{
 		"librescoot-unu-mdb-v0.9.0.mender",
@@ -213,7 +213,7 @@ func TestManager_FindLatestMenderFile_NoMatch(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	manager := NewManager(tmpDir, logger)
+	manager := NewManager(tmpDir, Budget{}, logger)
 
 	if err := os.WriteFile(filepath.Join(tmpDir, "librescoot-unu-mdb-nightly-20260501T210243.mender"), []byte("x"), 0644); err != nil {
 		t.Fatalf("write file: %v", err)
@@ -378,7 +378,7 @@ func TestManager_CleanupStaleDeltaFiles(t *testing.T) {
 			defer os.RemoveAll(tmpDir)
 
 			logger := log.New(os.Stdout, "test: ", 0)
-			manager := NewManager(tmpDir, logger)
+			manager := NewManager(tmpDir, Budget{}, logger)
 
 			for _, f := range c.files {
 				p := filepath.Join(tmpDir, f.name)
@@ -426,7 +426,7 @@ func TestManager_CleanupStaleDeltaFiles_UnsyncedClock(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	manager := NewManager(tmpDir, logger)
+	manager := NewManager(tmpDir, Budget{}, logger)
 
 	// No reference .mender, so only the age path could reap. With the epoch in
 	// the future, the age guard suppresses it and the ancient delta survives.
@@ -454,7 +454,7 @@ func TestManager_withinDownloadDir(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	logger := log.New(os.Stdout, "test: ", 0)
-	manager := NewManager(tmpDir, logger)
+	manager := NewManager(tmpDir, Budget{}, logger)
 
 	cases := []struct {
 		name string

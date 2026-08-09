@@ -109,7 +109,7 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		redis:                redisClient,
 		inhibitor:            inhibitorClient,
 		power:                powerClient,
-		mender:               mender.NewManager(downloadDir, logger),
+		mender:               mender.NewManager(downloadDir, mender.Budget{}, logger),
 		status:               statusReporter,
 		bootUpdater:          bootUpdater,
 		bootStatus:           bootStatusReporter,

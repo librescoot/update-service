@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,6 +30,52 @@ var ErrAssetUnavailable = errors.New("release asset unavailable")
 // rather than a resume, so callers should bound how often they retry on it.
 var ErrChecksumMismatch = errors.New("checksum mismatch")
 
+// ErrDownloadStalled means the transfer failed to move StallMinBytes within
+// StallWindow. Retrying is worthwhile because the partial is kept and resumed,
+// but the caller should back off rather than retry immediately.
+var ErrDownloadStalled = errors.New("download stalled")
+
+// ErrDownloadBudgetExceeded means the attempt ran past Budget.MaxDuration.
+// Like a stall, the partial survives and the next attempt resumes it.
+var ErrDownloadBudgetExceeded = errors.New("download budget exceeded")
+
+// Budget bounds a single download attempt. A zero value imposes no limits.
+//
+// Enforcement is by cancelling the request context, not by setting read
+// deadlines on the connection: net/http treats a conn read timeout as fatal,
+// closes the connection and returns a sticky error from resp.Body, so a
+// deadline cannot be extended and the read resumed.
+type Budget struct {
+	// MaxDuration caps the whole attempt, including connect retries. 0 = no cap.
+	MaxDuration time.Duration
+	// StallWindow is the rolling window the throughput floor is measured over.
+	// 0 disables the floor.
+	StallWindow time.Duration
+	// StallMinBytes is how many bytes must arrive within each StallWindow.
+	StallMinBytes int64
+}
+
+// abortRecorder carries the reason a budget timer cancelled the request, so
+// the read error can be reported as the right sentinel. First writer wins.
+type abortRecorder struct {
+	mu     sync.Mutex
+	reason error
+}
+
+func (a *abortRecorder) set(err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.reason == nil {
+		a.reason = err
+	}
+}
+
+func (a *abortRecorder) get() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.reason
+}
+
 // ProgressCallback is called during download to report progress
 // downloaded: bytes downloaded so far
 // total: total bytes to download (0 if unknown)
@@ -37,11 +84,12 @@ type ProgressCallback func(downloaded, total int64)
 // Downloader handles downloading update files with resumable downloads and retry logic
 type Downloader struct {
 	downloadDir string
+	budget      Budget
 	logger      *log.Logger
 }
 
 // NewDownloader creates a new downloader instance
-func NewDownloader(downloadDir string, logger *log.Logger) *Downloader {
+func NewDownloader(downloadDir string, budget Budget, logger *log.Logger) *Downloader {
 	// Ensure download directory exists
 	if _, err := os.Stat(downloadDir); os.IsNotExist(err) {
 		logger.Printf("Download directory %s does not exist, creating it...", downloadDir)
@@ -52,6 +100,7 @@ func NewDownloader(downloadDir string, logger *log.Logger) *Downloader {
 
 	return &Downloader{
 		downloadDir: downloadDir,
+		budget:      budget,
 		logger:      logger,
 	}
 }
@@ -127,6 +176,21 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 		filename = "update.mender"
 	}
 
+	var abort abortRecorder
+	reqCtx, cancelReq := context.WithCancel(ctx)
+	defer cancelReq()
+
+	// The wall-clock cap covers the entire attempt, HEAD requests and connect
+	// retries included, so a link that cannot even establish a connection
+	// still terminates.
+	if d.budget.MaxDuration > 0 {
+		budgetTimer := time.AfterFunc(d.budget.MaxDuration, func() {
+			abort.set(ErrDownloadBudgetExceeded)
+			cancelReq()
+		})
+		defer budgetTimer.Stop()
+	}
+
 	// Clean up any stale .tmp files before starting download
 	if err := d.CleanupStaleTmpFiles(filename); err != nil {
 		d.logger.Printf("Warning: failed to cleanup stale tmp files: %v", err)
@@ -138,7 +202,7 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 	// Check if final file already exists - verify it's complete before skipping download
 	if finalInfo, err := os.Stat(finalPath); err == nil {
 		// File exists, but we need to verify it's complete by checking size against server
-		expectedSize, err := d.getExpectedFileSize(ctx, url)
+		expectedSize, err := d.getExpectedFileSize(reqCtx, url)
 		if err != nil {
 			d.logger.Printf("Warning: Failed to get expected file size from server: %v", err)
 			d.logger.Printf("File exists locally (%d bytes) but cannot verify completeness, renaming to .tmp for resume", finalInfo.Size())
@@ -182,7 +246,7 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 	// satisfy (HTTP 416). Mirror the finished-file check above: compare against the
 	// server's size and finalize or discard rather than emitting a bad range.
 	if fileSize > 0 {
-		if expectedSize, headErr := d.getExpectedFileSize(ctx, url); headErr != nil {
+		if expectedSize, headErr := d.getExpectedFileSize(reqCtx, url); headErr != nil {
 			d.logger.Printf("Warning: could not verify partial against server size: %v (will attempt resume)", headErr)
 		} else if fileSize == expectedSize {
 			d.logger.Printf("Partial file already complete (%d bytes), finalizing without re-download", fileSize)
@@ -202,7 +266,7 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 		}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", fmt.Errorf("error creating request: %w", err)
 	}
@@ -262,6 +326,9 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 		}
 	}
 	if err != nil {
+		if reason := abort.get(); reason != nil {
+			return "", fmt.Errorf("%w during connect: %v", reason, err)
+		}
 		return "", fmt.Errorf("error downloading file after %d attempts: %w", maxRetries, err)
 	}
 	defer resp.Body.Close()
@@ -325,6 +392,17 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 	const callbackInterval = 1 * time.Second
 	const logInterval = 5 * time.Second
 
+	var stallTimer *time.Timer
+	var progressed int64
+	stallEnabled := d.budget.StallWindow > 0 && d.budget.StallMinBytes > 0
+	if stallEnabled {
+		stallTimer = time.AfterFunc(d.budget.StallWindow, func() {
+			abort.set(ErrDownloadStalled)
+			cancelReq()
+		})
+		defer stallTimer.Stop()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -337,6 +415,14 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 					return "", fmt.Errorf("error writing to file: %w", writeErr)
 				}
 				totalRead += int64(n)
+
+				if stallEnabled {
+					progressed += int64(n)
+					if progressed >= d.budget.StallMinBytes {
+						progressed = 0
+						stallTimer.Reset(d.budget.StallWindow)
+					}
+				}
 
 				// Report progress via callback (debounced to 250ms)
 				if progressCallback != nil && time.Since(lastCallbackTime) >= callbackInterval {
@@ -380,6 +466,12 @@ func (d *Downloader) Download(ctx context.Context, url string, progressCallback 
 					}
 
 					return finalPath, nil
+				}
+				if reason := abort.get(); reason != nil {
+					return "", fmt.Errorf("%w after %s at %d bytes", reason, time.Since(start).Round(time.Second), totalRead)
+				}
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return "", ctxErr
 				}
 				return "", fmt.Errorf("error reading response: %w", err)
 			}
