@@ -56,6 +56,17 @@ func (u *Updater) orchestrateDBC(releases []Release) {
 		return
 	}
 
+	// Best effort: this field lives in MDB Redis and is wiped on an MDB
+	// reboot, so a read error must not block DBC updates. Proceed and let
+	// the DBC's own persisted state be the real enforcement.
+	if retryAfter, err := u.redis.GetDBCDownloadRetryAfter(); err != nil {
+		u.logger.Printf("[dbc-orchestrate] Could not read DBC download backoff: %v, proceeding", err)
+	} else if retryAfter > 0 && time.Now().Before(time.Unix(retryAfter, 0)) {
+		u.logger.Printf("[dbc-orchestrate] DBC download backed off until %s, not powering on",
+			time.Unix(retryAfter, 0).Format(time.RFC3339))
+		return
+	}
+
 	u.logger.Printf("[dbc-orchestrate] DBC update available, powering on dashboard")
 
 	// Power on DBC and queue the check-now command. The command goes into a

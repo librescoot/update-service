@@ -292,3 +292,19 @@ func (c *Client) GetDBCChannel() string {
 	}
 	return val
 }
+
+// GetDBCDownloadRetryAfter returns the unix time before which the DBC will not
+// attempt another download, or 0 if no backoff is recorded. Best effort: the
+// field lives in MDB Redis and is wiped on an MDB reboot, after which the DBC's
+// own persisted state is what actually stops the transfer.
+//
+// A missing field is not an error, it just means the DBC has never backed
+// off: mirrors how GetOrchestrateDBC treats an absent key. The error return
+// is reserved for a field that is present but unparseable.
+func (c *Client) GetDBCDownloadRetryAfter() (int64, error) {
+	v, err := c.client.HGet("ota", "download-retry-after:dbc")
+	if err != nil || v == "" {
+		return 0, nil
+	}
+	return strconv.ParseInt(v, 10, 64)
+}
