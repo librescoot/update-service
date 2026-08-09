@@ -155,12 +155,15 @@ func (s *Store) write(st State) error {
 		}
 	}()
 
+	// Close errors on these two paths are discarded on purpose: we are already
+	// returning the error that actually matters, and the deferred Remove
+	// cleans up the temp file either way.
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("writing temp backoff state: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("syncing temp backoff state: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
