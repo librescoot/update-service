@@ -236,7 +236,7 @@ The Update Service uses Redis to track update state and communicate with other s
 | `download-progress:{component}`| Integer | Download progress percentage (0-100)                 | `0` to `100`                                  |
 | `download-bytes:{component}`   | Integer | Bytes downloaded so far                              | Byte count (e.g., `12582912`)                 |
 | `download-total:{component}`   | Integer | Total download size in bytes                         | Byte count (e.g., `104857600`)                |
-| `error:{component}`            | String  | Error type when status is `error`                    | `invalid-release-tag`, `download-failed`, `install-failed`, `reboot-failed` |
+| `error:{component}`            | String  | Error type when status is `error`                    | `download-failed`, `checksum-mismatch`, `file-not-found`, `invalid-file`, `image-too-large`, `install-failed`, `no-base-image`, `delta-rejected`, `delta-apply-failed`, `delta-failed`, `reboot-failed` |
 | `error-message:{component}`    | String  | Human-readable error message when status is `error`  | Detailed error message                        |
 
 **Status Meanings:**
