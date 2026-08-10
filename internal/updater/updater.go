@@ -790,6 +790,17 @@ func assetChecksum(release Release, url string) string {
 	return ""
 }
 
+// installErrorCode classifies a mender install failure for the ota hash. An
+// artifact too large for its slot is refused before anything is written, which
+// is a different situation for whoever reads the hash than a failure partway
+// through, so it gets its own code.
+func installErrorCode(err error) string {
+	if errors.Is(err, mender.ErrArtifactTooLarge) {
+		return "image-too-large"
+	}
+	return "install-failed"
+}
+
 // isURL checks if the given string is a URL
 func (u *Updater) isURL(source string) bool {
 	return strings.HasPrefix(source, "http://") ||
@@ -799,6 +810,13 @@ func (u *Updater) isURL(source string) bool {
 
 // handleUpdateFromFile processes an update from a local file path
 // Supports format: /path/to/file.mender or /path/to/file.mender:sha256:checksum
+//
+// Unlike the release path this does no variant matching, because there is no
+// release asset name to match against: the file is whatever was staged. The
+// artifact still carries artifact_depends.device_type in its header, and
+// mender-update checks that against /var/lib/mender/device_type before it
+// touches a partition, so a DBC image staged on an MDB is refused there rather
+// than here. Size is the case mender does not cover, see checkArtifactFits.
 func (u *Updater) handleUpdateFromFile(filePath string) {
 	source, checksum, _ := u.parseUpdateSource(filePath)
 	isURL := u.isURL(filePath)
@@ -928,7 +946,7 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 			}
 		}
 
-		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update from file %s: %v", source, err)); err != nil {
+		if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install update from file %s: %v", source, err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
@@ -1132,7 +1150,7 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 	// image, so there is no corruption-retry path here (unlike raw downloads).
 	if err := u.mender.Install(newMenderPath, u.menderInstallProgressCb()); err != nil {
 		u.logger.Printf("Failed to install assembled delta update %s: %v", newMenderPath, err)
-		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update from file %s: %v", newMenderPath, err)); err != nil {
+		if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install update from file %s: %v", newMenderPath, err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
@@ -1289,7 +1307,7 @@ func (u *Updater) handleUpdateFromURL(url string) {
 				}
 			}
 
-			if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update: %v", err)); err != nil {
+			if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install update: %v", err)); err != nil {
 				u.logger.Printf("Failed to set error status: %v", err)
 			}
 			return
@@ -2087,7 +2105,7 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string, manual b
 			}
 		}
 
-		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install update: %v", err)); err != nil {
+		if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install update: %v", err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
@@ -2644,7 +2662,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			}
 		}
 
-		if err := u.status.SetError(u.ctx, "install-failed", fmt.Sprintf("Failed to install delta-generated update: %v", err)); err != nil {
+		if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install delta-generated update: %v", err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return

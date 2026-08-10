@@ -29,6 +29,11 @@ const (
 // Installer handles Mender update installation and commit operations
 type Installer struct {
 	logger *log.Logger
+
+	// menderConfPaths and deviceSize let tests drive the fit check against a
+	// temp dir. Nil means the production defaults.
+	menderConfPaths []string
+	deviceSize      func(string) (int64, error)
 }
 
 // NewInstaller creates a new installer instance
@@ -57,8 +62,16 @@ func (i *Installer) Rollback() error {
 // Install installs the update from the given file path.
 // If progressCb is non-nil, it receives progress updates (0-100) parsed from
 // mender-update's stderr output (format: "\r<percent>%").
+//
+// An artifact whose rootfs payload is larger than the target slot is refused
+// with ErrArtifactTooLarge before mender-update runs, so nothing is written.
 func (i *Installer) Install(filePath string, progressCb InstallProgressCallback) error {
 	i.logger.Printf("Installing update from %s", filePath)
+
+	if err := i.checkArtifactFits(filePath); err != nil {
+		return err
+	}
+
 	cmd := exec.Command("mender-update", "install", filePath)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
