@@ -32,9 +32,10 @@ type Updater struct {
 	mender           *mender.Manager
 	backoff          *backoff.Store
 	status           *status.Reporter
-	bootUpdater      *boot.BootUpdater // nil if --boot-update not set
-	bootStatus       *status.Reporter  // reporter for "{component}-boot" keys
-	dbcStatus        *status.Reporter  // reporter for "dbc" keys (MDB-only, for clearing stale DBC state)
+	bootUpdater      *boot.BootUpdater  // nil if --boot-update not set
+	bootStatus       *status.Reporter   // reporter for "{component}-boot" keys
+	dbcStatus        *status.Reporter   // reporter for "dbc" keys (MDB-only, for clearing stale DBC state)
+	flatMirror       *status.FlatMirror // mirrors mdb+dbc status into the flat pair (MDB-only)
 	githubAPI        *GitHubAPI
 	logger           *log.Logger
 	ctx              context.Context
@@ -102,16 +103,17 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 	}
 
 	var dbcStatusReporter *status.Reporter
+	var flatMirror *status.FlatMirror
 	if cfg.Component == "mdb" {
 		dbcStatusReporter = status.NewReporter(redisClient.GetClient(), "dbc", logger)
+		// The MDB instance mirrors both components into the flat status pair:
+		// it already watches the ota hash and holds a dbc-scoped reporter, and
+		// an MDB update reboots the whole vehicle just like a DBC one, so the
+		// flat pair needs to reflect either.
+		flatMirror = status.NewFlatMirror(redisClient.GetClient(), logger)
 	}
 
 	statusReporter := status.NewReporter(redisClient.GetClient(), cfg.Component, logger)
-	if cfg.Component == "dbc" {
-		// DBC owns the start-dbc/complete-dbc lifecycle, which lines up with
-		// the `blocking` semantic on the flat status fields.
-		statusReporter.EnableFlatStatus()
-	}
 
 	u := &Updater{
 		config:    cfg,
@@ -135,6 +137,7 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		bootUpdater:          bootUpdater,
 		bootStatus:           bootStatusReporter,
 		dbcStatus:            dbcStatusReporter,
+		flatMirror:           flatMirror,
 		githubAPI:            NewGitHubAPI(updaterCtx, cfg.ReleasesURL, logger),
 		logger:               logger,
 		ctx:                  updaterCtx,
@@ -230,6 +233,13 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 	// Recover from any stuck status on startup
 	if err := u.recoverFromStuckState(menderNeedsReboot); err != nil {
 		u.logger.Printf("Warning: Failed to recover from stuck state: %v", err)
+	}
+
+	// MDB-only: mirror both components' statuses into the flat status pair.
+	// Runs after recoverFromStuckState so a stuck local status is already
+	// cleared to idle by the time the watcher's startup sync reads it.
+	if u.flatMirror != nil {
+		go u.monitorFlatStatus()
 	}
 
 	// Publish installed boot version to Redis on startup
@@ -360,13 +370,8 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 		return fmt.Errorf("failed to get current status: %w", err)
 	}
 
-	// Nothing to recover if already idle or empty. Defensively clear flat
-	// status fields though — a previous run may have crashed mid-update
-	// and left stale `status` / `update-type` values behind.
+	// Nothing to recover if already idle or empty.
 	if currentStatus == status.StatusIdle || currentStatus == "" {
-		if err := u.status.ClearFlat(u.ctx); err != nil {
-			u.logger.Printf("Warning: Failed to clear flat status on startup: %v", err)
-		}
 		return nil
 	}
 

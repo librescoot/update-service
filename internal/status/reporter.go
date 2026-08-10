@@ -37,13 +37,12 @@ const (
 // are frequent and eventually consistent: the next update corrects any
 // staleness.
 //
-// When flat-status mode is enabled (see EnableFlatStatus), state transitions
-// also mirror into the flat `status` and `update-type` fields on the same
-// hash, for consumers that follow the stock convention.
+// The flat `status` and `update-type` fields on the same hash, for consumers
+// that follow the stock convention, are not written here: see FlatFor and
+// FlatMirror for how the two components' statuses combine into that pair.
 type Reporter struct {
 	pub       *ipc.HashPublisher
 	component string
-	writeFlat bool
 	logger    *log.Logger
 }
 
@@ -54,53 +53,6 @@ func NewReporter(client *ipc.Client, component string, logger *log.Logger) *Repo
 		component: component,
 		logger:    logger,
 	}
-}
-
-// EnableFlatStatus turns on mirroring of state transitions into the flat
-// `status` and `update-type` fields. Only one reporter in the system should
-// have this enabled to avoid two writers racing on the same fields.
-func (r *Reporter) EnableFlatStatus() {
-	r.writeFlat = true
-}
-
-// flatFor returns the flat (status, update-type) values for a given local
-// state. Empty strings clear the field, which stock-style consumers treat
-// as undefined / not-updating.
-func flatFor(s Status) (flatStatus, updateType string) {
-	switch s {
-	case StatusDownloading:
-		return "downloading-updates", "blocking"
-	case StatusPreparing, StatusInstalling:
-		return "installing-updates", "blocking"
-	case StatusPendingReboot:
-		return "installation-complete-waiting-reboot", "blocking"
-	default:
-		return "", ""
-	}
-}
-
-// addFlat augments a state-transition map with flat status / update-type
-// entries when flat mode is enabled. No-op otherwise.
-func (r *Reporter) addFlat(m map[string]any, s Status) {
-	if !r.writeFlat {
-		return
-	}
-	flatStatus, updateType := flatFor(s)
-	m["status"] = flatStatus
-	m["update-type"] = updateType
-}
-
-// ClearFlat clears the flat `status` and `update-type` fields. Used on
-// startup when there is no active update to make sure stale values from a
-// previous crashed run don't linger. No-op if flat mode is disabled.
-func (r *Reporter) ClearFlat(ctx context.Context) error {
-	if !r.writeFlat {
-		return nil
-	}
-	return r.pub.SetMany(map[string]any{
-		"status":      "",
-		"update-type": "",
-	}, ipc.Sync())
 }
 
 // key returns a namespaced Redis hash field for this component.
@@ -134,7 +86,6 @@ func (r *Reporter) SetIdle(ctx context.Context) error {
 		r.key("error"):             "",
 		r.key("error-message"):     "",
 	}
-	r.addFlat(m, StatusIdle)
 	err := r.pub.SetMany(m, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set idle for %s: %w", r.component, err)
@@ -167,7 +118,6 @@ func (r *Reporter) SetAborted(ctx context.Context, reason string, skipChecks int
 		r.key("download-abort-reason"): reason,
 		r.key("download-skip-checks"):  skip,
 	}
-	r.addFlat(m, StatusIdle)
 	if err := r.pub.SetMany(m, ipc.Sync()); err != nil {
 		return fmt.Errorf("set aborted for %s: %w", r.component, err)
 	}
@@ -210,7 +160,6 @@ func (r *Reporter) SetDownloading(ctx context.Context, version, method string) e
 		r.key("download-abort-reason"): "",
 		r.key("download-skip-checks"):  "",
 	}
-	r.addFlat(m, StatusDownloading)
 	err := r.pub.SetMany(m, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set downloading for %s: %w", r.component, err)
@@ -229,7 +178,6 @@ func (r *Reporter) SetPreparing(ctx context.Context) error {
 		r.key("download-total"):    "",
 		r.key("install-progress"):  0,
 	}
-	r.addFlat(m, StatusPreparing)
 	err := r.pub.SetMany(m, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set preparing for %s: %w", r.component, err)
@@ -248,7 +196,6 @@ func (r *Reporter) SetInstalling(ctx context.Context) error {
 		r.key("download-total"):    "",
 		r.key("install-progress"):  0,
 	}
-	r.addFlat(m, StatusInstalling)
 	err := r.pub.SetMany(m, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set installing for %s: %w", r.component, err)
@@ -267,7 +214,6 @@ func (r *Reporter) SetPendingReboot(ctx context.Context) error {
 		r.key("download-total"):    "",
 		r.key("install-progress"):  "",
 	}
-	r.addFlat(m, StatusPendingReboot)
 	err := r.pub.SetMany(m, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set pending-reboot for %s: %w", r.component, err)
@@ -288,7 +234,6 @@ func (r *Reporter) SetError(ctx context.Context, errorType, errorMessage string)
 		r.key("download-total"):    "",
 		r.key("install-progress"):  "",
 	}
-	r.addFlat(m, StatusError)
 	err := r.pub.SetMany(m, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("set error for %s: %w", r.component, err)
@@ -365,7 +310,6 @@ func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
 		r.key("error"):             "",
 		r.key("error-message"):     "",
 	}
-	r.addFlat(m, StatusIdle)
 	err := r.pub.SetMany(m, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("initialize OTA keys for %s: %w", r.component, err)
