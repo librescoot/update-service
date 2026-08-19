@@ -139,6 +139,7 @@ The update service listens for commands on the `scooter:update` list. Commands c
 
 #### Standard Commands
 - `check-now` - Immediately trigger an update check, bypassing the configured check interval
+- `preview-channel:<channel>` - Report what a switch to `<channel>` would fetch, without changing any setting or starting a download. The answer lands in the `preview-*` fields of the `ota` hash (see [Redis Schema](#redis-schema))
 
 #### Custom Update Sources
 - `update-from-file:/path/to/file.mender` - Update from a local Mender file
@@ -148,10 +149,14 @@ The update service listens for commands on the `scooter:update` list. Commands c
 
 **Examples:**
 ```bash
-# Force an immediate update check
-redis-cli LPUSH scooter:update check-now
+# Force an immediate update check on each component
+redis-cli LPUSH scooter:update:mdb check-now
+redis-cli LPUSH scooter:update:dbc check-now
 
-# This triggers update checks for all running update-service instances (both MDB and DBC)
+# Ask both components what switching to stable would cost
+redis-cli LPUSH scooter:update:mdb preview-channel:stable
+redis-cli LPUSH scooter:update:dbc preview-channel:stable
+redis-cli HMGET ota preview-status:mdb preview-version:mdb preview-size:mdb
 
 # Update from a local file (auto-detects checksum if provided)
 redis-cli LPUSH scooter:update:dbc "update-from-file:/data/ota/librescoot-unu-dbc-nightly-20251212T024719.mender"
@@ -189,6 +194,37 @@ redis-cli LPUSH scooter:update:mdb "update-from-file:/data/ota/librescoot-unu-md
 - Installing updates from alternative sources
 - Development and debugging scenarios
 - Manual update deployment with specific files
+
+### Channel Previews
+
+`preview-channel:<channel>` answers "what would switching to this channel
+fetch" before anything is committed to. It reads the release index for
+`<channel>`, resolves the latest release carrying a `.mender` artifact for this
+component's `variant_id`, and publishes the tag and artifact size to the `ota`
+hash. It changes no setting, starts no download, and never touches the update
+status fields, so it is safe to issue while an update is in flight.
+
+The size reported is the full artifact, which is what a channel switch actually
+downloads: there is no delta base across channels, so a switch forces a full
+update regardless of `updates.{component}.method`.
+
+Each component answers for itself. A consumer that wants the total cost of a
+scooter-wide switch asks both and adds the two sizes up. This is what the
+dashboard's Settings > System > Updates > Channel entry does before it prompts.
+
+Preview statuses:
+
+| Status        | Meaning                                                              |
+|---------------|----------------------------------------------------------------------|
+| `checking`    | Request accepted, release index fetch in flight                      |
+| `ready`       | A release was found; `preview-version` and `preview-size` are set    |
+| `unavailable` | The channel has no release with a `.mender` for this `variant_id`    |
+| `error`       | Invalid channel, or the release index could not be fetched in time   |
+
+A preview is bounded at 20 seconds end to end, rather than running the full
+retry ladder a background check uses, because a rider is waiting on the answer.
+The fields are cleared on service start: a preview from before a restart is not
+an answer to anything currently being asked.
 
 ## Component-Specific Update Constraints
 
@@ -238,6 +274,10 @@ The Update Service uses Redis to track update state and communicate with other s
 | `download-total:{component}`   | Integer | Total download size in bytes                         | Byte count (e.g., `104857600`)                |
 | `error:{component}`            | String  | Error type when status is `error`                    | `download-failed`, `checksum-mismatch`, `file-not-found`, `invalid-file`, `image-too-large`, `install-failed`, `no-base-image`, `delta-rejected`, `delta-apply-failed`, `delta-failed`, `reboot-failed` |
 | `error-message:{component}`    | String  | Human-readable error message when status is `error`  | Detailed error message                        |
+| `preview-channel:{component}`  | String  | Channel the last preview was asked about             | `stable`, `testing`, `nightly`                |
+| `preview-status:{component}`   | String  | Outcome of the last preview                          | `checking`, `ready`, `unavailable`, `error`   |
+| `preview-version:{component}`  | String  | Release tag the preview resolved to (`ready` only)   | Version string (e.g. `v1.3.0`)                |
+| `preview-size:{component}`     | Integer | Size in bytes of the full `.mender` artifact for that release (`ready` only) | Byte count (e.g. `401234432`) |
 
 **Status Meanings:**
 - `rebooting`: Update is installed and will be applied on next reboot/power cycle

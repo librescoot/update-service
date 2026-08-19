@@ -300,6 +300,10 @@ func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
 	// runs on every service start, which for the DBC is every dashboard
 	// power-on, so clearing them here would wipe the orchestrator's backoff
 	// gate on every ride.
+	//
+	// The preview-* fields are cleared: a preview answers "what would a switch
+	// to this channel fetch right now", so one left over from before a restart
+	// is not an answer, it is a guess with a plausible shape.
 	m := map[string]any{
 		r.key("status"):            string(StatusIdle),
 		r.key("update-method"):     updateMethod,
@@ -309,11 +313,68 @@ func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
 		r.key("install-progress"):  "",
 		r.key("error"):             "",
 		r.key("error-message"):     "",
+		r.key("preview-channel"):   "",
+		r.key("preview-status"):    "",
+		r.key("preview-version"):   "",
+		r.key("preview-size"):      "",
 	}
 	err := r.pub.SetMany(m, ipc.Sync())
 	if err != nil {
 		return fmt.Errorf("initialize OTA keys for %s: %w", r.component, err)
 	}
 	r.logger.Printf("Initialized OTA keys for %s (status: idle, method: %s)", r.component, updateMethod)
+	return nil
+}
+
+// --- Channel preview ---
+//
+// A preview answers "what would switching to this channel cost" without
+// touching the update state machine: it only ever writes preview-* fields, so
+// a preview issued while an update is downloading cannot disturb it. The
+// channel is echoed back on every write so a consumer can tell the answer it
+// is reading apart from a stale one for a channel it no longer cares about.
+
+// PreviewStatus values published in preview-status:{component}.
+const (
+	PreviewChecking    = "checking"
+	PreviewReady       = "ready"
+	PreviewUnavailable = "unavailable"
+	PreviewError       = "error"
+)
+
+// SetPreviewChecking marks a preview of channel as in flight and clears the
+// result fields of whatever the previous preview left behind.
+func (r *Reporter) SetPreviewChecking(ctx context.Context, channel string) error {
+	m := map[string]any{
+		r.key("preview-channel"): channel,
+		r.key("preview-status"):  PreviewChecking,
+		r.key("preview-version"): "",
+		r.key("preview-size"):    "",
+	}
+	if err := r.pub.SetMany(m, ipc.Sync()); err != nil {
+		return fmt.Errorf("set preview checking for %s: %w", r.component, err)
+	}
+	r.logger.Printf("Preview for %s: checking %s", r.component, channel)
+	return nil
+}
+
+// SetPreviewResult publishes a finished preview. version and size are only
+// meaningful for PreviewReady; the other statuses pass them empty and zero.
+func (r *Reporter) SetPreviewResult(ctx context.Context, channel, previewStatus, version string, size int64) error {
+	sizeStr := ""
+	if size > 0 {
+		sizeStr = strconv.FormatInt(size, 10)
+	}
+	m := map[string]any{
+		r.key("preview-channel"): channel,
+		r.key("preview-status"):  previewStatus,
+		r.key("preview-version"): version,
+		r.key("preview-size"):    sizeStr,
+	}
+	if err := r.pub.SetMany(m, ipc.Sync()); err != nil {
+		return fmt.Errorf("set preview result for %s: %w", r.component, err)
+	}
+	r.logger.Printf("Preview for %s: channel=%s status=%s version=%s size=%s",
+		r.component, channel, previewStatus, version, sizeStr)
 	return nil
 }

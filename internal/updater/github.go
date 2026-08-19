@@ -62,6 +62,16 @@ func NewGitHubAPI(ctx context.Context, baseURL string, logger Logger) *GitHubAPI
 // The channel is passed per-call rather than cached so runtime channel switches via
 // Redis settings take effect on the next check without restarting the service.
 func (g *GitHubAPI) GetReleases(channel string) ([]Release, error) {
+	return g.GetReleasesContext(g.ctx, channel)
+}
+
+// GetReleasesContext is GetReleases bounded by a caller-supplied context.
+// The retry ladder runs to five attempts and can take over two minutes to
+// give up, which is right for a background update check and wrong for
+// anything a rider is waiting on: a caller with a deadline passes it here and
+// gets an error as soon as the deadline passes rather than when the ladder
+// runs out.
+func (g *GitHubAPI) GetReleasesContext(ctx context.Context, channel string) ([]Release, error) {
 	var (
 		resp      *http.Response
 		err       error
@@ -74,7 +84,7 @@ func (g *GitHubAPI) GetReleases(channel string) ([]Release, error) {
 	// Create the request outside the retry loop
 	url := g.baseURL + "/" + channel + ".json"
 
-	req, err := http.NewRequestWithContext(g.ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -85,8 +95,8 @@ func (g *GitHubAPI) GetReleases(channel string) ([]Release, error) {
 	// Retry loop with exponential backoff
 	for retries <= maxRetries {
 		// Check if context is canceled before making the request
-		if g.ctx.Err() != nil {
-			return nil, fmt.Errorf("context canceled: %w", g.ctx.Err())
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("context canceled: %w", ctx.Err())
 		}
 
 		// Make the request
@@ -140,8 +150,8 @@ func (g *GitHubAPI) GetReleases(channel string) ([]Release, error) {
 		select {
 		case <-time.After(actualBackoff):
 			// Continue with retry
-		case <-g.ctx.Done():
-			return nil, fmt.Errorf("context canceled during backoff: %w", g.ctx.Err())
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context canceled during backoff: %w", ctx.Err())
 		}
 
 		// Increase backoff for next attempt (with cap)

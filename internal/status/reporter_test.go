@@ -188,3 +188,65 @@ func TestClearHeartbeat_ClearsField(t *testing.T) {
 	}
 	waitForField(t, mr, "heartbeat:mdb", "")
 }
+
+func TestSetPreviewChecking_ClearsPreviousResult(t *testing.T) {
+	r, mr := newTestReporter(t)
+	ctx := context.Background()
+
+	if err := r.SetPreviewResult(ctx, "stable", PreviewReady, "v1.3.0", 401234432); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetPreviewChecking(ctx, "nightly"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := mr.HGet("ota", "preview-channel:mdb"); got != "nightly" {
+		t.Errorf("preview-channel:mdb = %q, want nightly", got)
+	}
+	if got := mr.HGet("ota", "preview-status:mdb"); got != PreviewChecking {
+		t.Errorf("preview-status:mdb = %q, want %q", got, PreviewChecking)
+	}
+	// The stable answer must not stay visible under the nightly channel label.
+	if got := mr.HGet("ota", "preview-version:mdb"); got != "" {
+		t.Errorf("preview-version:mdb = %q, want cleared", got)
+	}
+	if got := mr.HGet("ota", "preview-size:mdb"); got != "" {
+		t.Errorf("preview-size:mdb = %q, want cleared", got)
+	}
+}
+
+func TestSetPreviewResult_OmitsSizeWhenUnknown(t *testing.T) {
+	r, mr := newTestReporter(t)
+
+	if err := r.SetPreviewResult(context.Background(), "testing", PreviewUnavailable, "", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := mr.HGet("ota", "preview-status:mdb"); got != PreviewUnavailable {
+		t.Errorf("preview-status:mdb = %q, want %q", got, PreviewUnavailable)
+	}
+	// Not "0": a zero-byte download and an unknown size are different claims.
+	if got := mr.HGet("ota", "preview-size:mdb"); got != "" {
+		t.Errorf("preview-size:mdb = %q, want empty", got)
+	}
+}
+
+// A preview left over from before a restart is not an answer to any question
+// the UI is currently asking.
+func TestInitialize_ClearsPreviewFields(t *testing.T) {
+	r, mr := newTestReporter(t)
+	ctx := context.Background()
+
+	if err := r.SetPreviewResult(ctx, "stable", PreviewReady, "v1.3.0", 401234432); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Initialize(ctx, "delta"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, field := range []string{"preview-channel:mdb", "preview-status:mdb", "preview-version:mdb", "preview-size:mdb"} {
+		if got := mr.HGet("ota", field); got != "" {
+			t.Errorf("%s = %q, want cleared after Initialize", field, got)
+		}
+	}
+}

@@ -50,6 +50,12 @@ type Updater struct {
 	// Prevent concurrent update checks
 	updateCheckMu sync.Mutex
 
+	// Serializes channel previews. TryLock, not Lock: a preview is a question
+	// about a channel the user is looking at right now, and queueing several
+	// behind a GetReleases retry ladder would answer with stale channels long
+	// after the screen moved on.
+	previewMu sync.Mutex
+
 	// Serializes every long-running update operation (file install, URL install,
 	// full, delta). Held for the full duration of the operation — startup's
 	// pending-file install used to race with a concurrent `check-now` delta, and
@@ -735,6 +741,18 @@ func (u *Updater) handleCommand(command string) {
 		go func() {
 			defer u.wg.Done()
 			u.checkForUpdates(true)
+		}()
+
+	case strings.HasPrefix(command, "preview-channel:"):
+		channel := strings.TrimSpace(strings.TrimPrefix(command, "preview-channel:"))
+		if channel == "" {
+			u.logger.Printf("Received preview-channel command with empty channel")
+			return
+		}
+		u.wg.Add(1)
+		go func() {
+			defer u.wg.Done()
+			u.previewChannel(channel)
 		}()
 
 	case strings.HasPrefix(command, "update-from-file:"):
@@ -1809,6 +1827,85 @@ func (u *Updater) checkForUpdates(manual bool) {
 		}()
 	}
 
+}
+
+// previewTimeout bounds a channel preview end to end. Long enough for one
+// retry on a slow cellular link, short enough that the confirm screen reports
+// a failure while the rider is still looking at it.
+const previewTimeout = 20 * time.Second
+
+// previewChannel answers what a switch to channel would fetch for this
+// component, without changing any configuration or starting a download. The
+// answer lands in the preview-* fields of the ota hash; scootui-qt asks both
+// components and adds the sizes up before prompting the rider.
+//
+// The size reported is the full .mender artifact, which is what a channel
+// switch actually downloads: checkForUpdates forces updateMethod to "full"
+// whenever the installed version's channel differs from the configured one,
+// because there is no delta base across channels.
+func (u *Updater) previewChannel(channel string) {
+	if !u.previewMu.TryLock() {
+		u.logger.Printf("Channel preview already in progress for %s, ignoring request for %s",
+			u.config.Component, channel)
+		return
+	}
+	defer u.previewMu.Unlock()
+
+	if !config.IsValidChannel(channel) {
+		u.logger.Printf("Ignoring preview request for invalid channel %q", channel)
+		if err := u.status.SetPreviewResult(u.ctx, channel, status.PreviewError, "", 0); err != nil {
+			u.logger.Printf("Failed to publish preview result: %v", err)
+		}
+		return
+	}
+
+	if err := u.status.SetPreviewChecking(u.ctx, channel); err != nil {
+		u.logger.Printf("Failed to publish preview status: %v", err)
+	}
+
+	publish := func(previewStatus, version string, size int64) {
+		if err := u.status.SetPreviewResult(u.ctx, channel, previewStatus, version, size); err != nil {
+			u.logger.Printf("Failed to publish preview result: %v", err)
+		}
+	}
+
+	// Someone is standing at the dashboard waiting for this answer, so the
+	// preview gets a deadline rather than the full retry ladder a background
+	// check is happy to sit through.
+	ctx, cancel := context.WithTimeout(u.ctx, previewTimeout)
+	defer cancel()
+
+	releases, err := u.githubAPI.GetReleasesContext(ctx, channel)
+	if err != nil {
+		u.logger.Printf("Preview for %s failed to fetch %s releases: %v", u.config.Component, channel, err)
+		publish(status.PreviewError, "", 0)
+		return
+	}
+
+	variantID, err := u.redis.GetVariantID(u.config.Component)
+	if err != nil {
+		u.logger.Printf("Preview failed to get variant_id for %s: %v (falling back to component name)",
+			u.config.Component, err)
+		variantID = u.config.Component
+	}
+
+	release, found := u.findLatestRelease(releases, variantID, channel)
+	if !found {
+		u.logger.Printf("Preview: no %s release for variant_id %s", channel, variantID)
+		publish(status.PreviewUnavailable, "", 0)
+		return
+	}
+
+	asset, ok := releaseAsset(release, variantID, ".mender")
+	if !ok {
+		// findLatestRelease already required a .mender asset for this variant,
+		// so this only fires if the index changed underneath us.
+		u.logger.Printf("Preview: release %s has no .mender asset for variant_id %s", release.TagName, variantID)
+		publish(status.PreviewUnavailable, "", 0)
+		return
+	}
+
+	publish(status.PreviewReady, release.TagName, asset.Size)
 }
 
 // inferChannelFromVersion attempts to infer the channel from the version string
