@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -102,6 +101,17 @@ func VerifyPayloadAgainstManifest(outputDir, rootfsChecksum string) error {
 // the rootfs checksum (SHA256 of the first file inside the tar) in a single
 // pass. Returns the rootfs checksum. This avoids reading the ~1GB payload
 // twice (once for gzip, once for checksum).
+//
+// archive/tar does the header parsing rather than the size being read out of
+// the first 512-byte block by hand. A payload is not necessarily plain ustar:
+// pax and GNU both put an extra member ahead of the real one to carry a name
+// over 100 bytes, and encode a size over 8GB outside the twelve octal digits
+// the fixed header allows. Parsing those by hand hashes the wrong bytes and
+// fails later as a rootfs checksum mismatch, blaming the payload.
+//
+// Every byte the parse consumes is teed into gzip, so gzip still receives the
+// payload verbatim and the output is byte for byte what streaming it straight
+// through would produce.
 func CompressPayloadAndHash(payloadTarPath, compressedPath string, tracker *progressTracker) (rootfsChecksum string, err error) {
 	inFile, err := os.Open(payloadTarPath)
 	if err != nil {
@@ -126,64 +136,37 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, tracker *prog
 		return "", fmt.Errorf("start gzip: %w", err)
 	}
 
-	// Wrap input with byte tracking
-	inReader := tracker.reader(inFile, "compressing")
-
-	// Read the tar header (first 512 bytes) to get the inner file size
-	const tarBlock = 512
-	header := make([]byte, tarBlock)
-	if _, err := io.ReadFull(inReader, header); err != nil {
+	// Closing the pipe releases gzip, which is otherwise left blocked on a
+	// stdin that never ends.
+	abort := func(cause error) (string, error) {
 		_ = gzipIn.Close()
 		_ = gzipCmd.Wait()
-		return "", fmt.Errorf("read tar header: %w", err)
+		return "", cause
 	}
 
-	// Write header to gzip
-	if _, err := gzipIn.Write(header); err != nil {
-		_ = gzipIn.Close()
-		_ = gzipCmd.Wait()
-		return "", fmt.Errorf("write header to gzip: %w", err)
+	tee := io.TeeReader(tracker.reader(inFile, "compressing"), gzipIn)
+	tr := tar.NewReader(tee)
+
+	if _, err := tr.Next(); err != nil {
+		return abort(fmt.Errorf("read payload tar: %w", err))
 	}
 
-	// Parse inner file size from UStar header (bytes 124-136, null-padded octal)
-	sizeField := header[124:136]
-	// Trim null bytes and spaces
-	sizeStr := strings.TrimRight(string(sizeField), "\x00 ")
-	innerSize, _ := strconv.ParseInt(sizeStr, 8, 64)
-
-	// Stream remaining data through gzip while hashing the inner file content
 	innerHasher := sha256.New()
-	innerRemaining := innerSize
-	buf := make([]byte, 64*1024)
-
-	for {
-		n, readErr := inReader.Read(buf)
-		if n > 0 {
-			// Write to gzip
-			if _, err := gzipIn.Write(buf[:n]); err != nil {
-				_ = gzipIn.Close()
-				_ = gzipCmd.Wait()
-				return "", fmt.Errorf("write to gzip: %w", err)
-			}
-
-			// Hash the inner file portion
-			if innerRemaining > 0 {
-				usable := min(int64(n), innerRemaining)
-				innerHasher.Write(buf[:usable])
-				innerRemaining -= usable
-			}
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			_ = gzipIn.Close()
-			_ = gzipCmd.Wait()
-			return "", fmt.Errorf("read payload: %w", readErr)
-		}
+	if _, err := io.Copy(innerHasher, tr); err != nil {
+		return abort(fmt.Errorf("hash payload: %w", err))
 	}
 
-	_ = gzipIn.Close()
+	// The tar reader stops at the end of the first member's content. Drain
+	// what follows (its padding, any later members, the end-of-archive
+	// blocks) straight through the tee, since only gzip needs those.
+	if _, err := io.Copy(io.Discard, tee); err != nil {
+		return abort(fmt.Errorf("copy payload: %w", err))
+	}
+
+	if err := gzipIn.Close(); err != nil {
+		_ = gzipCmd.Wait()
+		return "", fmt.Errorf("close gzip stdin: %w", err)
+	}
 	if err := gzipCmd.Wait(); err != nil {
 		return "", fmt.Errorf("gzip failed: %w", err)
 	}
