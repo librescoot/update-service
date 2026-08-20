@@ -16,6 +16,14 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 		return fmt.Errorf("no deltas provided")
 	}
 
+	// Reject a chain that was built against a different base before touching
+	// the base at all: unpacking it and decompressing its payload is a minute
+	// of CPU and several hundred megabytes of eMMC writes on the target, and
+	// xdelta3 would only reject it afterwards.
+	if err := a.verifyChainApplies(oldMenderPath, deltaPaths); err != nil {
+		return err
+	}
+
 	workDir, err := os.MkdirTemp(a.tempDir, "delta-chain-*")
 	if err != nil {
 		return fmt.Errorf("create work dir: %w", err)
@@ -190,21 +198,8 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 // decompressedSizeFromDelta extracts the old decompressed payload size from a
 // delta's metadata.json, if available (v3+ with size fields).
 func decompressedSizeFromDelta(deltaPath string) int64 {
-	tmpDir, err := os.MkdirTemp("", "delta-peek-*")
+	meta, err := ReadMetadata(deltaPath)
 	if err != nil {
-		return 0
-	}
-	defer os.RemoveAll(tmpDir)
-
-	if err := ShellTarExtract(deltaPath, tmpDir); err != nil {
-		return 0
-	}
-	data, err := os.ReadFile(filepath.Join(tmpDir, "metadata.json"))
-	if err != nil {
-		return 0
-	}
-	var meta DeltaMetadata
-	if err := json.Unmarshal(data, &meta); err != nil {
 		return 0
 	}
 	for _, change := range meta.Changes {

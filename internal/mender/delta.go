@@ -12,6 +12,11 @@ import (
 
 const defaultTempDir = "/data/ota/tmp"
 
+// ErrDeltaBaseMismatch reports a delta built against a different base image
+// than the one on disk. Callers distinguish it from a delta that failed while
+// being applied: nothing was attempted, so the staged base is untouched.
+var ErrDeltaBaseMismatch = delta.ErrBaseMismatch
+
 // DeltaApplier handles applying delta updates to generate new mender files
 type DeltaApplier struct {
 	logger  *log.Logger

@@ -1142,7 +1142,12 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 			return
 		}
 		u.logger.Printf("Delta apply failed: %v", err)
-		if err := u.status.SetError(u.ctx, "delta-apply-failed", fmt.Sprintf("delta apply failed: %v", err)); err != nil {
+		errType, errMsg := "delta-apply-failed", fmt.Sprintf("delta apply failed: %v", err)
+		if errors.Is(err, mender.ErrDeltaBaseMismatch) {
+			// Short on purpose: relayed to the phone through the ota hash.
+			errType, errMsg = "delta-base-mismatch", "delta built for a different base image"
+		}
+		if err := u.status.SetError(u.ctx, errType, errMsg); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
