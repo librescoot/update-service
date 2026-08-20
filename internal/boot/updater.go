@@ -226,14 +226,50 @@ func writeFileVerified(dst, src string) error {
 	return nil
 }
 
-// writeUBoot unlocks force_ro, seeks to ubootSeek*512 bytes, writes imx data,
-// reads back and verifies sha256, then re-locks force_ro.
+// ubootMatches reports whether the target region already holds exactly want.
+// Read-only: force_ro does not need unlocking to read, so this cannot itself
+// put the boot region at risk.
+func (b *BootUpdater) ubootMatches(want []byte) (bool, error) {
+	f, err := os.Open(b.bootDevice)
+	if err != nil {
+		return false, fmt.Errorf("open %s: %w", b.bootDevice, err)
+	}
+	defer f.Close()
+
+	offset := b.ubootSeek * 512
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return false, fmt.Errorf("seek %s to %d: %w", b.bootDevice, offset, err)
+	}
+	existing := make([]byte, len(want))
+	if _, err := io.ReadFull(f, existing); err != nil {
+		return false, fmt.Errorf("read %s: %w", b.bootDevice, err)
+	}
+	return sha256sum(existing) == sha256sum(want), nil
+}
+
+// writeUBoot validates the image, skips the write when the target already
+// matches, then unlocks force_ro, seeks to ubootSeek*512 bytes, writes imx
+// data, reads back and verifies sha256, and re-locks force_ro.
 func (b *BootUpdater) writeUBoot(imxPath string) error {
 	imxData, err := os.ReadFile(imxPath)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", imxPath, err)
 	}
+	if err := validateIMX(imxData); err != nil {
+		return fmt.Errorf("refusing to write %s: %w", imxPath, err)
+	}
 	expectedHash := sha256sum(imxData)
+
+	// Nothing to do if the target already holds exactly this image. Writing
+	// over a live bootloader is the one operation here with no cheap recovery,
+	// so the normal case — an update that does not change U-Boot — should not
+	// touch the region at all.
+	if same, err := b.ubootMatches(imxData); err != nil {
+		b.logger.Printf("[boot] could not compare existing U-Boot, writing anyway: %v", err)
+	} else if same {
+		b.logger.Printf("[boot] U-Boot already at %s, not rewriting", expectedHash)
+		return nil
+	}
 
 	// Unlock
 	if err := os.WriteFile(b.forceROPath, []byte("0\n"), 0200); err != nil {
@@ -285,6 +321,34 @@ func (b *BootUpdater) writeUBoot(imxPath string) error {
 	}
 
 	b.logger.Printf("[boot] U-Boot written and verified (%d bytes at offset %d)", len(imxData), offset)
+	return nil
+}
+
+// validateIMX sanity-checks that data really is an i.MX bootable image before
+// it is written over a live bootloader.
+//
+// The readback verify below proves the bytes landed; it cannot tell whether
+// they were the right bytes. Without this a truncated or wrong-architecture
+// artifact writes cleanly, verifies cleanly, and bricks the board on the next
+// power cycle.
+//
+// The i.MX Image Vector Table starts the file: tag 0xD1, a big-endian length,
+// then the header version. This is the same signature used to establish which
+// eMMC region the DBC actually boots from (bytes d1 00 20 40 at offset 1024).
+func validateIMX(data []byte) error {
+	const ivtHeaderLen = 32
+	if len(data) < ivtHeaderLen {
+		return fmt.Errorf("too short for an IVT header: %d bytes", len(data))
+	}
+	if data[0] != 0xD1 {
+		return fmt.Errorf("not an i.MX image: IVT tag is 0x%02x, expected 0xd1", data[0])
+	}
+	if v := data[3]; v != 0x40 && v != 0x41 {
+		return fmt.Errorf("unexpected IVT header version 0x%02x, expected 0x40 or 0x41", v)
+	}
+	if l := int(data[1])<<8 | int(data[2]); l < ivtHeaderLen {
+		return fmt.Errorf("IVT declares length %d, expected at least %d", l, ivtHeaderLen)
+	}
 	return nil
 }
 
