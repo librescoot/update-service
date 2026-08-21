@@ -2,8 +2,6 @@ package boot
 
 import (
 	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -82,78 +80,6 @@ tmpfs /tmp tmpfs rw 0 0
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestWriteFileVerified(t *testing.T) {
-	dir := t.TempDir()
-	src := filepath.Join(dir, "src.bin")
-	dst := filepath.Join(dir, "dst.bin")
-
-	data := []byte("hello boot world")
-	if err := os.WriteFile(src, data, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := writeFileVerified(dst, src); err != nil {
-		t.Fatalf("writeFileVerified failed: %v", err)
-	}
-
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != string(data) {
-		t.Errorf("dst content mismatch: got %q, want %q", got, data)
-	}
-}
-
-func TestGetInstalledVersion(t *testing.T) {
-	dir := t.TempDir()
-	b := &BootUpdater{
-		versionFile: filepath.Join(dir, "boot-version"),
-	}
-
-	// Missing file → ""
-	ver, err := b.GetInstalledVersion()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ver != "" {
-		t.Errorf("expected empty version, got %q", ver)
-	}
-
-	// Write a version
-	if err := os.WriteFile(b.versionFile, []byte("nightly-20260301T013104\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	ver, err = b.GetInstalledVersion()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ver != "nightly-20260301T013104" {
-		t.Errorf("unexpected version: %q", ver)
-	}
-}
-
-func TestWriteVersionFile(t *testing.T) {
-	dir := t.TempDir()
-	b := &BootUpdater{
-		mountPoint:  dir,
-		versionFile: filepath.Join(dir, "boot-version"),
-	}
-
-	if err := b.WriteVersionFile("nightly-20260301T013104"); err != nil {
-		t.Fatal(err)
-	}
-
-	data, err := os.ReadFile(b.versionFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(data), "nightly-20260301T013104") {
-		t.Errorf("version file content unexpected: %q", string(data))
 	}
 }
 

@@ -248,18 +248,6 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 		go u.monitorFlatStatus()
 	}
 
-	// Publish installed boot version to Redis on startup
-	if u.bootUpdater != nil && u.bootStatus != nil {
-		if bootVer, err := u.bootUpdater.GetInstalledVersion(); err != nil {
-			u.logger.Printf("Warning: Failed to read boot version: %v", err)
-		} else if bootVer != "" {
-			if err := u.bootStatus.SetUpdateVersion(u.ctx, bootVer); err != nil {
-				u.logger.Printf("Warning: Failed to publish boot version to Redis: %v", err)
-			} else {
-				u.logger.Printf("Boot version: %s", bootVer)
-			}
-		}
-	}
 
 	// Standby tracking must be live before performLocalBootUpdate: it seeds the
 	// standby timer that the backgrounded reboot wait polls. checkInitialStandbyState
@@ -3025,27 +3013,26 @@ func (u *Updater) performLocalBootUpdate() {
 		return
 	}
 
-	localVersion, err := u.bootUpdater.CheckLocalAssets()
-	if err != nil {
-		u.logger.Printf("[boot-local] failed to check local boot assets: %v", err)
-		return
-	}
-	if localVersion == "" {
+	if !boot.HasLocalAssets() {
 		u.logger.Printf("[boot-local] no local boot assets found")
 		return
 	}
 
-	installedVersion, err := u.bootUpdater.GetInstalledVersion()
+	// Ask the hardware, not a version file. The old boot-version file hashed
+	// the whole asset bundle, so a kernel-only change asked for a U-Boot
+	// rewrite that changed nothing — and it could report an install that never
+	// reached anything the board reads.
+	upToDate, err := u.bootUpdater.UpToDate(boot.LocalAssetsPath)
 	if err != nil {
-		u.logger.Printf("[boot-local] failed to read installed version: %v", err)
+		u.logger.Printf("[boot-local] could not compare U-Boot against the boot region: %v", err)
 		return
 	}
-	if installedVersion == localVersion {
-		u.logger.Printf("[boot-local] boot already at %s", localVersion)
+	if upToDate {
+		u.logger.Printf("[boot-local] U-Boot already matches the local assets")
 		return
 	}
 
-	u.logger.Printf("[boot-local] local boot assets differ (installed=%s, local=%s), applying", installedVersion, localVersion)
+	u.logger.Printf("[boot-local] U-Boot differs from the local assets, applying")
 
 	bootComp := bootComponent(u.config.Component)
 
@@ -3081,10 +3068,6 @@ func (u *Updater) performLocalBootUpdate() {
 			}
 		}
 		return
-	}
-
-	if err := u.bootUpdater.WriteVersionFile(localVersion); err != nil {
-		u.logger.Printf("[boot-local] failed to write version file: %v", err)
 	}
 
 	if err := u.inhibitor.RemoveInstallInhibit(bootComp); err != nil {

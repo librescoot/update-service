@@ -17,17 +17,15 @@ const LocalAssetsPath = "/usr/share/boot-assets"
 
 // BootUpdater manages boot partition updates (zImage, DTB, U-Boot).
 type BootUpdater struct {
-	mountPoint  string // e.g. /uboot
+	mountPoint  string // e.g. /uboot — retained only to locate the eMMC device
 	bootDevice  string // e.g. /dev/mmcblk3boot0
 	forceROPath string // e.g. /sys/block/mmcblk3boot0/force_ro
-	dtbFile     string // e.g. librescoot-dbc.dtb
-	versionFile string // e.g. /uboot/boot-version
 	ubootSeek   int64  // 512-byte blocks to skip before writing U-Boot (default 2)
 	logger      *log.Logger
 }
 
 // New creates a BootUpdater from the given parameters.
-func New(mountPoint, bootDevice, dtbFile string, ubootSeek int64, logger *log.Logger) *BootUpdater {
+func New(mountPoint, bootDevice string, ubootSeek int64, logger *log.Logger) *BootUpdater {
 	forceROPath := ""
 	if bootDevice != "" {
 		// /dev/mmcblk3boot0 → /sys/block/mmcblk3boot0/force_ro
@@ -38,8 +36,6 @@ func New(mountPoint, bootDevice, dtbFile string, ubootSeek int64, logger *log.Lo
 		mountPoint:  mountPoint,
 		bootDevice:  bootDevice,
 		forceROPath: forceROPath,
-		dtbFile:     dtbFile,
-		versionFile: mountPoint + "/boot-version",
 		ubootSeek:   ubootSeek,
 		logger:      logger,
 	}
@@ -95,134 +91,50 @@ func detectFromReader(r io.Reader, mountPoint string) (string, error) {
 	return "", fmt.Errorf("no device found mounted at %s", mountPoint)
 }
 
-// CheckLocalAssets reads the version file from local boot assets baked into the rootfs.
-// Returns ("", nil) if local assets are not available.
-func (b *BootUpdater) CheckLocalAssets() (string, error) {
-	data, err := os.ReadFile(LocalAssetsPath + "/version")
+// UBootPath is the U-Boot image inside a boot-asset bundle.
+const UBootPath = "u-boot-dtb.imx"
+
+// HasLocalAssets reports whether a boot-asset bundle is baked into this rootfs.
+func HasLocalAssets() bool {
+	_, err := os.Stat(LocalAssetsPath + "/" + UBootPath)
+	return err == nil
+}
+
+// UpToDate reports whether the boot region already holds the U-Boot image in
+// assetDir, so there is nothing to do.
+//
+// This replaces the boot-version file. That file recorded a hash over the whole
+// bundle — kernel, dtb and U-Boot — yet gated a write of U-Boot alone, so a
+// kernel-only change triggered a pointless rewrite of the boot region. It was
+// also bookkeeping that could disagree with the hardware, and did: it recorded
+// success for writes that never reached anything the board reads.
+//
+// The device is its own source of truth, so there is no file left to drift.
+func (b *BootUpdater) UpToDate(assetDir string) (bool, error) {
+	imxData, err := os.ReadFile(assetDir + "/" + UBootPath)
 	if os.IsNotExist(err) {
-		return "", nil
+		return false, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("read local boot version: %w", err)
+		return false, fmt.Errorf("read %s: %w", assetDir+"/"+UBootPath, err)
 	}
-	return strings.TrimSpace(string(data)), nil
+	return b.ubootMatches(imxData)
 }
 
-// GetInstalledVersion reads the version file; returns "" if absent.
-func (b *BootUpdater) GetInstalledVersion() (string, error) {
-	data, err := os.ReadFile(b.versionFile)
-	if os.IsNotExist(err) {
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", b.versionFile, err)
-	}
-	return strings.TrimSpace(string(data)), nil
-}
-
-// WriteVersionFile writes the version string to the version file.
-// Remounts the boot partition read-write if the initial write fails.
-func (b *BootUpdater) WriteVersionFile(version string) error {
-	data := []byte(version + "\n")
-	err := os.WriteFile(b.versionFile, data, 0644)
-	if err != nil {
-		remountRO, rerr := b.remountRW()
-		if rerr != nil {
-			return fmt.Errorf("remount rw for version file: %w", rerr)
-		}
-		defer remountRO()
-		err = os.WriteFile(b.versionFile, data, 0644)
-	}
-	if err != nil {
-		return fmt.Errorf("write %s: %w", b.versionFile, err)
-	}
-	return nil
-}
-
-// Apply extracts tarball contents and writes all boot assets with verification.
-// Order: zImage → DTB → sync → U-Boot (write to hardware last).
+// Apply writes the U-Boot image from a boot-asset bundle to the boot region.
+//
+// U-Boot only. The kernel and dtb in the bundle are deliberately not written:
+// U-Boot loads both from /boot inside the rootfs — confirmed on both boards,
+// bootcmd resolves ${mender_uboot_root} to the rootfs partition — and the
+// mender rootfs artifact already delivers them there. Writing them to the FAT
+// at mountPoint produced byte-identical copies that nothing ever read.
 func (b *BootUpdater) Apply(ctx context.Context, extractDir string) error {
-	remountRO, err := b.remountRW()
-	if err != nil {
-		return fmt.Errorf("remount rw: %w", err)
-	}
-	defer remountRO()
-
-	zImageSrc := extractDir + "/zImage"
-	zImageDst := b.mountPoint + "/zImage"
-	b.logger.Printf("[boot] writing zImage: %s → %s", zImageSrc, zImageDst)
-	if err := writeFileVerified(zImageDst, zImageSrc); err != nil {
-		return fmt.Errorf("write zImage: %w", err)
-	}
-
-	dtbSrc := extractDir + "/" + b.dtbFile
-	dtbDst := b.mountPoint + "/" + b.dtbFile
-	b.logger.Printf("[boot] writing DTB: %s → %s", dtbSrc, dtbDst)
-	if err := writeFileVerified(dtbDst, dtbSrc); err != nil {
-		return fmt.Errorf("write DTB: %w", err)
-	}
-
-	syscall.Sync()
-
-	imxPath := extractDir + "/u-boot-dtb.imx"
+	imxPath := extractDir + "/" + UBootPath
 	b.logger.Printf("[boot] writing U-Boot: %s → %s", imxPath, b.bootDevice)
 	if err := b.writeUBoot(imxPath); err != nil {
 		return fmt.Errorf("write U-Boot: %w", err)
 	}
-
 	syscall.Sync()
-	return nil
-}
-
-// remountRW remounts the mountPoint read-write and returns a function that
-// remounts it read-only again.
-func (b *BootUpdater) remountRW() (func(), error) {
-	b.logger.Printf("[boot] remounting %s read-write", b.mountPoint)
-	if err := syscall.Mount("", b.mountPoint, "", syscall.MS_REMOUNT, ""); err != nil {
-		return nil, fmt.Errorf("remount rw %s: %w", b.mountPoint, err)
-	}
-	return func() {
-		b.logger.Printf("[boot] remounting %s read-only", b.mountPoint)
-		if err := syscall.Mount("", b.mountPoint, "", syscall.MS_REMOUNT|syscall.MS_RDONLY, ""); err != nil {
-			b.logger.Printf("[boot] warning: failed to remount %s read-only: %v", b.mountPoint, err)
-		}
-	}, nil
-}
-
-// writeFileVerified copies src → dst, syncs, reads back and compares sha256.
-func writeFileVerified(dst, src string) error {
-	srcData, err := os.ReadFile(src)
-	if err != nil {
-		return fmt.Errorf("read src %s: %w", src, err)
-	}
-
-	expectedHash := sha256sum(srcData)
-
-	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("open dst %s: %w", dst, err)
-	}
-	if _, err := f.Write(srcData); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("write dst %s: %w", dst, err)
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("sync dst %s: %w", dst, err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close dst %s: %w", dst, err)
-	}
-
-	// Read back and verify
-	dstData, err := os.ReadFile(dst)
-	if err != nil {
-		return fmt.Errorf("read back %s: %w", dst, err)
-	}
-	actualHash := sha256sum(dstData)
-	if actualHash != expectedHash {
-		return fmt.Errorf("verify %s: sha256 mismatch (expected %s, got %s)", dst, expectedHash, actualHash)
-	}
 	return nil
 }
 

@@ -53,7 +53,7 @@ func TestIsValidChannel(t *testing.T) {
 }
 
 func TestConfig_BudgetDefaults(t *testing.T) {
-	c := New("localhost:6379", "https://example.invalid", time.Hour, "mdb", "stable", "/data/ota/mdb", false, false, "/uboot", "", "", 2)
+	c := New("localhost:6379", "https://example.invalid", time.Hour, "mdb", "stable", "/data/ota/mdb", false, false, "/uboot", "", 2)
 	if c.DownloadMaxDuration != 60*time.Minute {
 		t.Errorf("DownloadMaxDuration = %v, want 60m", c.DownloadMaxDuration)
 	}
@@ -66,7 +66,7 @@ func TestConfig_BudgetDefaults(t *testing.T) {
 }
 
 func TestConfig_ApplyRedisUpdate_Budget(t *testing.T) {
-	c := New("localhost:6379", "https://example.invalid", time.Hour, "mdb", "stable", "/data/ota/mdb", false, false, "/uboot", "", "", 2)
+	c := New("localhost:6379", "https://example.invalid", time.Hour, "mdb", "stable", "/data/ota/mdb", false, false, "/uboot", "", 2)
 
 	if !c.ApplyRedisUpdate("updates.mdb.download-max-duration", "30m") {
 		t.Fatal("download-max-duration should be recognised")
@@ -112,7 +112,7 @@ func TestConfig_ApplyRedisUpdate_Budget(t *testing.T) {
 // rewrites it via ApplyRedisUpdate (standing in for the settings-watcher
 // goroutine). Run with -race: budgetMu is what makes this safe.
 func TestDownloadBudget_ConcurrentWithApplyRedisUpdate(t *testing.T) {
-	c := New("localhost:6379", "https://example.invalid", time.Hour, "mdb", "stable", "/data/ota/mdb", false, false, "/uboot", "", "", 2)
+	c := New("localhost:6379", "https://example.invalid", time.Hour, "mdb", "stable", "/data/ota/mdb", false, false, "/uboot", "", 2)
 
 	const iterations = 2000
 	var wg sync.WaitGroup

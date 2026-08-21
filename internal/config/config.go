@@ -61,7 +61,6 @@ type Config struct {
 	BootEnabled    bool   // Enable boot partition updates
 	BootMountPoint string // Boot partition mount point (default: /uboot)
 	BootDevice     string // U-Boot device path (auto-detected from mount if empty)
-	BootDTBFile    string // DTB filename (default: librescoot-{component}.dtb)
 	BootUBootSeek  int64  // 512-byte blocks to seek before writing U-Boot (default: 2)
 }
 
@@ -77,12 +76,8 @@ func New(
 	bootEnabled bool,
 	bootMountPoint string,
 	bootDevice string,
-	bootDTBFile string,
 	bootUBootSeek int64,
 ) *Config {
-	if bootDTBFile == "" {
-		bootDTBFile = "librescoot-" + component + ".dtb"
-	}
 	return &Config{
 		RedisAddr:     redisAddr,
 		ReleasesURL:   releasesURL,
@@ -103,7 +98,6 @@ func New(
 		BootEnabled:    bootEnabled,
 		BootMountPoint: bootMountPoint,
 		BootDevice:     bootDevice,
-		BootDTBFile:    bootDTBFile,
 		BootUBootSeek:  bootUBootSeek,
 	}
 }

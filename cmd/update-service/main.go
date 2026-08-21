@@ -33,7 +33,6 @@ var (
 	bootUpdate     = flag.Bool("boot-update", false, "Enable boot partition updates")
 	bootMountPoint = flag.String("boot-mount", "/uboot", "Boot partition mount point")
 	bootDevice     = flag.String("boot-device", "", "U-Boot device path (auto-detected from mount if empty)")
-	bootDTB        = flag.String("boot-dtb", "", "DTB filename (default: librescoot-{component}.dtb)")
 	bootUBootSeek  = flag.Int64("boot-uboot-seek", 2, "512-byte blocks to seek before writing U-Boot")
 
 	downloadMaxDuration   = flag.Duration("download-max-duration", 60*time.Minute, "Wall clock cap on a single download attempt (0 to disable)")
@@ -128,7 +127,6 @@ func main() {
 		*bootUpdate,
 		*bootMountPoint,
 		*bootDevice,
-		*bootDTB,
 		*bootUBootSeek,
 	)
 
@@ -197,8 +195,8 @@ func main() {
 			}
 			cfg.BootDevice = detected
 		}
-		bootUpdater = boot.New(cfg.BootMountPoint, cfg.BootDevice, cfg.BootDTBFile, cfg.BootUBootSeek, logger)
-		logger.Printf("Boot updater: device=%s, dtb=%s", cfg.BootDevice, cfg.BootDTBFile)
+		bootUpdater = boot.New(cfg.BootMountPoint, cfg.BootDevice, cfg.BootUBootSeek, logger)
+		logger.Printf("Boot updater: device=%s (U-Boot only; kernel and dtb ship in the rootfs)", cfg.BootDevice)
 
 		// Report what the boot ROM actually reads, next to what we write to.
 		// The two disagree on the DBC: its fuses select the eMMC user area
