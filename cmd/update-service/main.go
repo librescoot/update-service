@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -198,27 +197,6 @@ func main() {
 		bootUpdater = boot.New(cfg.BootMountPoint, cfg.BootDevice, cfg.BootUBootSeek, logger)
 		logger.Printf("Boot updater: device=%s (U-Boot only; kernel and dtb ship in the rootfs)", cfg.BootDevice)
 
-		// Report what the boot ROM actually reads, next to what we write to.
-		// The two disagree on the DBC: its fuses select the eMMC user area
-		// while the updater writes to the boot partition, so every DBC U-Boot
-		// update is written, reported as applied, and never executed
-		// (librescoot-tlv6). Diagnostic only — the write target is unchanged
-		// until retargeting has been verified, because switching it turns a
-		// harmless no-op into a write over a live bootloader.
-		if target, terr := boot.ReadBootTarget(); terr != nil {
-			logger.Printf("Boot updater: could not read boot target from fuses: %v", terr)
-		} else {
-			base := strings.TrimSuffix(cfg.BootDevice, "boot0")
-			want := target.Device(base)
-			if want == cfg.BootDevice {
-				logger.Printf("Boot updater: fuses select %s (%s), matching the write target",
-					target, want)
-			} else {
-				logger.Printf("Boot updater: WARNING fuses select %s (%s) but U-Boot is written to %s — "+
-					"bootloader updates on this board are inert",
-					target, want, cfg.BootDevice)
-			}
-		}
 	}
 
 	// Initialize updater
