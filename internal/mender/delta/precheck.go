@@ -10,6 +10,8 @@ import (
 	"os"
 	"path"
 	"strings"
+
+	"github.com/librescoot/update-service/internal/version"
 )
 
 // ErrBaseMismatch reports a delta that was built against a different base image
@@ -123,6 +125,8 @@ func (a *Applier) verifyChainApplies(baseMenderPath string, deltaPaths []string)
 		return nil
 	}
 
+	have := version.FromFilename(baseMenderPath)
+
 	for i, deltaPath := range deltaPaths {
 		meta, err := ReadMetadata(deltaPath)
 		if err != nil {
@@ -135,13 +139,46 @@ func (a *Applier) verifyChainApplies(baseMenderPath string, deltaPaths []string)
 		case want == "":
 			a.logger.Printf("[Delta %d/%d] previous delta declared no new_payload_checksum, cannot check base", i+1, len(deltaPaths))
 		case meta.OldPayloadChecksum != want:
-			return fmt.Errorf("%w: delta %d/%d expects base rootfs %s, have %s",
-				ErrBaseMismatch, i+1, len(deltaPaths), meta.OldPayloadChecksum, want)
+			// Name the versions rather than only their rootfs digests. Whoever
+			// reads this next has to find the delta that does apply, and a
+			// digest does not say which one that is. This reaches the phone
+			// verbatim over BLE, where it is the only diagnostic available.
+			return fmt.Errorf("%w: delta %d/%d (%s) needs base %s, have %s",
+				ErrBaseMismatch, i+1, len(deltaPaths),
+				artifactLabel(meta.NewArtifactName, version.FromFilename(deltaPath), meta.NewPayloadChecksum),
+				artifactLabel(meta.OldArtifactName, "", meta.OldPayloadChecksum),
+				artifactLabel("", have, want))
 		}
 
 		want = meta.NewPayloadChecksum
+		if meta.NewArtifactName != "" {
+			have = strings.TrimPrefix(meta.NewArtifactName, artifactNamePrefix)
+		}
 	}
 
 	a.logger.Printf("Delta chain applies to base (%d deltas)", len(deltaPaths))
 	return nil
+}
+
+// artifactNamePrefix is what mender-delta-create.py writes in front of the
+// version in old_artifact_name and new_artifact_name.
+const artifactNamePrefix = "release-"
+
+// artifactLabel picks the most useful identifier available for one end of a
+// delta: the recorded artifact name, else a version parsed from a filename,
+// else a short rootfs digest for deltas predating the artifact-name fields.
+func artifactLabel(artifactName, fallbackVersion, checksum string) string {
+	if artifactName != "" {
+		return strings.TrimPrefix(artifactName, artifactNamePrefix)
+	}
+	if fallbackVersion != "" {
+		return fallbackVersion
+	}
+	if len(checksum) >= 12 {
+		return "rootfs " + checksum[:12]
+	}
+	if checksum != "" {
+		return "rootfs " + checksum
+	}
+	return "unknown"
 }

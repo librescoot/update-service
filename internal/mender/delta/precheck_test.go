@@ -280,3 +280,71 @@ func TestApplyChainRejectsBeforeUnpacking(t *testing.T) {
 		t.Fatalf("got %v, want ErrBaseMismatch", err)
 	}
 }
+
+// makeNamedDelta is makeDelta with the artifact-name fields set, which is what
+// lets the mismatch error name versions instead of digests.
+func makeNamedDelta(t *testing.T, path, oldSum, newSum, oldName, newName string) string {
+	t.Helper()
+	meta := DeltaMetadata{
+		OldArtifactName:    oldName,
+		NewArtifactName:    newName,
+		OldPayloadChecksum: oldSum,
+		NewPayloadChecksum: newSum,
+		Version:            3,
+		Changes: map[string]ChangeInfo{
+			"data/0000.tar.gz": {Type: "modified", Patch: "data_0000.tar.gz.xdelta"},
+		},
+	}
+	body, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	return writeTar(t, path, true, []tarEntry{{name: "./metadata.json", body: body}})
+}
+
+// The 2026-08-24 chain hole, as the BLE path hits it: a phone pushes the delta
+// published on the 133115 release to a scooter running 082958. The delta was
+// built against 123219, so it cannot apply, and the message has to say which
+// delta would, because it is all the phone shows.
+func TestVerifyChainAppliesNamesTheVersions(t *testing.T) {
+	dir := t.TempDir()
+	base := makeMender(t, filepath.Join(dir, "librescoot-unu-mdb-nightly-20260823T082958.mender"), sumA)
+	d := makeNamedDelta(t,
+		filepath.Join(dir, "librescoot-unu-mdb-nightly-20260824T133115.delta"),
+		sumB, sumC,
+		"release-nightly-20260824T123219",
+		"release-nightly-20260824T133115")
+
+	err := testApplier().verifyChainApplies(base, []string{d})
+	if !errors.Is(err, ErrBaseMismatch) {
+		t.Fatalf("got %v, want ErrBaseMismatch", err)
+	}
+	for _, want := range []string{
+		"delta 1/1 (nightly-20260824T133115)",
+		"needs base nightly-20260824T123219",
+		"have nightly-20260823T082958",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err.Error(), want)
+		}
+	}
+}
+
+// Deltas predating the artifact-name fields still have to say something useful,
+// so the digest remains the fallback rather than an empty label.
+func TestVerifyChainAppliesFallsBackToDigest(t *testing.T) {
+	dir := t.TempDir()
+	base := makeMender(t, filepath.Join(dir, "base.mender"), sumA)
+	d := makeDelta(t, filepath.Join(dir, "unnamed.delta"), sumB, sumC)
+
+	err := testApplier().verifyChainApplies(base, []string{d})
+	if !errors.Is(err, ErrBaseMismatch) {
+		t.Fatalf("got %v, want ErrBaseMismatch", err)
+	}
+	if !strings.Contains(err.Error(), "rootfs "+sumB[:12]) {
+		t.Errorf("error %q does not name the wanted base digest", err.Error())
+	}
+	if !strings.Contains(err.Error(), "rootfs "+sumA[:12]) {
+		t.Errorf("error %q does not name the base digest we have", err.Error())
+	}
+}
