@@ -3113,8 +3113,11 @@ func (u *Updater) performLocalBootUpdate() {
 	}()
 }
 
-// buildDeltaChain builds a complete chain of deltas from currentVersion to the latest release
-// Returns nil if already at latest version, or error if chain cannot be built
+// buildDeltaChain builds a complete chain of deltas from currentVersion to the
+// latest release on the channel. Every release in between must carry a delta
+// for the variant; one that does not breaks the chain and is reported as an
+// error so the caller falls back to a full update. Returns nil when the base is
+// already the latest release.
 func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, variantID string) ([]Release, error) {
 	// Filter and sort releases for our channel and variant
 	var candidateReleases []Release
@@ -3137,12 +3140,7 @@ func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, v
 			continue
 		}
 
-		// Check if the release has delta assets for the specified variant
-		_, hasDelta := releaseAsset(release, variantID, ".delta")
-
-		if hasDelta {
-			candidateReleases = append(candidateReleases, release)
-		}
+		candidateReleases = append(candidateReleases, release)
 	}
 
 	// Sort releases ascending. Stable tags (vX.Y.Z) need numeric comparison
@@ -3181,6 +3179,16 @@ func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, v
 			newer = strings.ToLower(release.TagName) > currentTag
 		}
 		if foundCurrent && newer {
+			// A release carrying no delta is a hole in the chain, not a release
+			// to step over. The next release's delta is built against it, so a
+			// chain that skips it has a link whose source is an image no earlier
+			// delta produces. xdelta3 rejects that only after the base has been
+			// unpacked and every earlier delta applied, so refuse it here where
+			// the caller can still fall back to a full update for free.
+			if _, ok := releaseAsset(release, variantID, ".delta"); !ok {
+				return nil, fmt.Errorf("%s has no delta asset for %s, chain from %s cannot reach the latest release",
+					release.TagName, variantID, currentVersion)
+			}
 			deltaChain = append(deltaChain, release)
 		}
 	}
