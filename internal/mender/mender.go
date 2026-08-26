@@ -156,35 +156,96 @@ func (m *Manager) cleanupOldFiles(currentURL string) error {
 	return nil
 }
 
-// CleanupStaleMenderFiles removes all but the newest .mender file in the download directory.
-// This is intended to be called on startup to reclaim disk space from old downloads.
+// artifactNamePrefix is what mender puts in front of the version in the
+// artifact name reported by "mender-update show-artifact".
+const artifactNamePrefix = "release-"
+
+// CleanupStaleMenderFiles removes all but one .mender file from the download
+// directory. Intended to be called on startup to reclaim disk space from old
+// downloads.
 func (m *Manager) CleanupStaleMenderFiles() {
+	m.cleanupStaleMenderFiles(m.runningVersion())
+}
+
+// runningVersion returns the version token of the committed artifact, or "" if
+// mender cannot be asked.
+func (m *Manager) runningVersion() string {
+	artifact, err := m.GetCurrentArtifact()
+	if err != nil {
+		m.logger.Printf("Cannot determine running artifact: %v", err)
+		return ""
+	}
+	return strings.TrimPrefix(artifact, artifactNamePrefix)
+}
+
+// cleanupStaleMenderFiles keeps the artifact for runningVersion and removes the
+// rest.
+//
+// The keeper is anchored on what the board runs rather than ranked, because a
+// directory can hold artifacts from more than one channel and across channels
+// version.Compare has only a lexicographic tiebreak to offer. That puts any
+// "v..." tag above any "nightly-..." one on the first byte alone, so ranking a
+// mixed directory reaped the artifact for the running nightly and kept a stale
+// stable one, leaving the next delta update with no base to apply against.
+//
+// Two fallbacks, in order, so that a base is always left behind: the newest
+// artifact on the running channel, for when the running one was installed from
+// elsewhere or already reaped, then the newest of all of them, for when mender
+// could not be asked at all.
+func (m *Manager) cleanupStaleMenderFiles(runningVersion string) {
 	pattern := filepath.Join(m.downloader.downloadDir, "*.mender")
 	files, err := filepath.Glob(pattern)
 	if err != nil || len(files) <= 1 {
 		return
 	}
 
-	// Find the newest file by version embedded in filename. Comparison is
-	// semver-aware so v0.10.0 sorts above v0.7.0 (lex would invert that).
-	var newestFile string
-	var newestVersion string
-	for _, file := range files {
-		ver := version.FromFilename(file)
-		if newestFile == "" || version.Compare(ver, newestVersion) > 0 {
-			newestVersion = ver
-			newestFile = file
+	var keep string
+	if runningVersion != "" {
+		for _, file := range files {
+			if strings.EqualFold(version.FromFilename(file), runningVersion) {
+				keep = file
+				break
+			}
 		}
 	}
 
+	if keep == "" && runningVersion != "" {
+		keep = newestMenderFile(files, func(ver string) bool {
+			return version.SameChannel(ver, runningVersion)
+		})
+	}
+
+	if keep == "" {
+		keep = newestMenderFile(files, nil)
+	}
+
+	m.logger.Printf("Keeping mender file %s (running %q)", filepath.Base(keep), runningVersion)
 	for _, file := range files {
-		if file != newestFile {
+		if file != keep {
 			m.logger.Printf("Removing stale mender file: %s", file)
 			if err := os.Remove(file); err != nil {
 				m.logger.Printf("Warning: failed to remove stale mender file %s: %v", file, err)
 			}
 		}
 	}
+}
+
+// newestMenderFile returns the highest-versioned of the files accept passes, or
+// "" if it passes none. Comparison is semver-aware so v0.10.0 sorts above
+// v0.7.0 (lex would invert that); it is only meaningful within one channel, so
+// accept is where the caller confines it to one.
+func newestMenderFile(files []string, accept func(ver string) bool) string {
+	var newestFile, newestVersion string
+	for _, file := range files {
+		ver := version.FromFilename(file)
+		if accept != nil && !accept(ver) {
+			continue
+		}
+		if newestFile == "" || version.Compare(ver, newestVersion) > 0 {
+			newestVersion, newestFile = ver, file
+		}
+	}
+	return newestFile
 }
 
 // CleanupStaleDeltaFiles removes obsolete delta artifacts from the download
@@ -207,7 +268,6 @@ func (m *Manager) CleanupStaleDeltaFiles(maxAge time.Duration) {
 			referenceVersion = ver
 		}
 	}
-	referenceChannel := version.Channel(referenceVersion)
 
 	// Include the resumable .delta.tmp partials: both call sites run with no
 	// concurrent download writer, so reaping a dead partial promptly is safe.
@@ -225,8 +285,7 @@ func (m *Manager) CleanupStaleDeltaFiles(maxAge time.Duration) {
 		reap := false
 
 		dv := version.FromFilename(file)
-		dChan := version.Channel(dv)
-		if referenceVersion != "" && dv != "" && dChan == referenceChannel && version.Compare(dv, referenceVersion) <= 0 {
+		if version.SameChannel(dv, referenceVersion) && version.Compare(dv, referenceVersion) <= 0 {
 			reap = true
 		}
 

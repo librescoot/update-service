@@ -49,6 +49,34 @@ func TestFromFilename(t *testing.T) {
 	}
 }
 
+func TestSameChannel(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"v1.0.0", "v0.7.0", true},
+		{"nightly-20260101T120000", "nightly-20260415T120000", true},
+		{"testing-20260101T120000", "testing-20260415T120000", true},
+
+		// The pairing that made CleanupStaleMenderFiles delete the running
+		// artifact: Compare ranks these, but the ranking means nothing.
+		{"v1.2.1", "nightly-20260826T021727", false},
+		{"nightly-20260826T021727", "v1.2.1", false},
+		{"nightly-20260101T120000", "testing-20260101T120000", false},
+
+		// An unrecognized channel is not comparable with anything, including
+		// another unrecognized one.
+		{"garbage", "v1.0.0", false},
+		{"garbage", "garbage", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		if got := SameChannel(c.a, c.b); got != c.want {
+			t.Errorf("SameChannel(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
 func TestChannel(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"v1.0.0", "stable"},

@@ -50,6 +50,17 @@ func Channel(version string) string {
 	return ""
 }
 
+// SameChannel reports whether two version tokens are on the same channel, and
+// so can be meaningfully ranked against each other. Compare falls back to
+// lexicographic order across channels, which sorts every "v..." tag above
+// every "nightly-..." one on the first byte alone, so a caller picking the
+// newest out of a directory that may hold several channels has to gate on this
+// first. An unrecognized channel matches nothing, itself included.
+func SameChannel(a, b string) bool {
+	channel := Channel(a)
+	return channel != "" && channel == Channel(b)
+}
+
 // Compare compares two version strings as produced by FromFilename.
 //
 // When both versions share the same channel and both tokens parse as

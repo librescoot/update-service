@@ -111,45 +111,122 @@ func TestManager_FindMenderFileForVersion(t *testing.T) {
 	}
 }
 
-func TestManager_CleanupStaleMenderFiles_SemverAware(t *testing.T) {
+// runMenderCleanup lays out a download directory, runs the cleanup against the
+// given running version, and reports which files survived.
+func runMenderCleanup(t *testing.T, runningVersion string, files ...string) map[string]bool {
+	t.Helper()
+
 	tmpDir, err := os.MkdirTemp("", "mender_test")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	t.Cleanup(func() { os.RemoveAll(tmpDir) })
 
 	logger := log.New(os.Stdout, "test: ", 0)
 	manager := NewManager(tmpDir, func() Budget { return Budget{} }, logger)
 
-	// v0.10.0 is the newest — lex compare would (wrongly) keep v0.7.0.
-	// Real published stable assets carry no "stable-" infix.
-	files := []string{
-		"librescoot-unu-mdb-v0.7.0.mender",
-		"librescoot-unu-mdb-v0.8.0.mender",
-		"librescoot-unu-mdb-v0.10.0.mender",
-	}
 	for _, f := range files {
-		p := filepath.Join(tmpDir, f)
-		if err := os.WriteFile(p, []byte("x"), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(tmpDir, f), []byte("x"), 0644); err != nil {
 			t.Fatalf("Failed to create %s: %v", f, err)
 		}
 	}
 
-	manager.CleanupStaleMenderFiles()
+	manager.cleanupStaleMenderFiles(runningVersion)
 
-	kept := filepath.Join(tmpDir, "librescoot-unu-mdb-v0.10.0.mender")
-	if _, err := os.Stat(kept); err != nil {
-		t.Errorf("expected v0.10.0 to be kept, got error: %v", err)
-	}
-	for _, f := range []string{
-		"librescoot-unu-mdb-v0.7.0.mender",
-		"librescoot-unu-mdb-v0.8.0.mender",
-	} {
-		p := filepath.Join(tmpDir, f)
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Errorf("expected %s to be removed, got err=%v", f, err)
+	survived := make(map[string]bool, len(files))
+	for _, f := range files {
+		_, err := os.Stat(filepath.Join(tmpDir, f))
+		switch {
+		case err == nil:
+			survived[f] = true
+		case os.IsNotExist(err):
+			survived[f] = false
+		default:
+			t.Fatalf("Failed to stat %s: %v", f, err)
 		}
 	}
+	return survived
+}
+
+// checkKept asserts that exactly the named file survived.
+func checkKept(t *testing.T, survived map[string]bool, want string) {
+	t.Helper()
+	for f, ok := range survived {
+		if f == want && !ok {
+			t.Errorf("expected %s to be kept, it was removed", f)
+		}
+		if f != want && ok {
+			t.Errorf("expected %s to be removed, it survived", f)
+		}
+	}
+}
+
+// Observed on hardware 2026-08-26: an MDB running a nightly, with a leftover
+// stable artifact in /data/ota/mdb, had the nightly artifact reaped right
+// after commit and the stable one kept. Cross-channel version.Compare only
+// offers a lexicographic tiebreak, and 'v' > 'n'. The kept artifact is the
+// delta base, so the next OTA fell back to a full download.
+func TestManager_CleanupStaleMenderFiles_KeepsRunningArtifact(t *testing.T) {
+	survived := runMenderCleanup(t, "nightly-20260826T021727",
+		"librescoot-unu-mdb-v1.2.1.mender",
+		"librescoot-unu-mdb-nightly-20260826T021727.mender")
+
+	checkKept(t, survived, "librescoot-unu-mdb-nightly-20260826T021727.mender")
+}
+
+// The running artifact outranks a newer one on its own channel: the newer file
+// is a staged download, not the base for what is installed.
+func TestManager_CleanupStaleMenderFiles_RunningBeatsNewerSameChannel(t *testing.T) {
+	survived := runMenderCleanup(t, "v1.2.1",
+		"librescoot-unu-mdb-v1.2.1.mender",
+		"librescoot-unu-mdb-v1.3.0.mender")
+
+	checkKept(t, survived, "librescoot-unu-mdb-v1.2.1.mender")
+}
+
+// Filenames carry the timestamp token verbatim while Redis and the release
+// tags carry it lowercased, so the anchor match has to ignore case.
+func TestManager_CleanupStaleMenderFiles_RunningVersionCaseInsensitive(t *testing.T) {
+	survived := runMenderCleanup(t, "nightly-20260826t021727",
+		"librescoot-unu-mdb-v1.2.1.mender",
+		"librescoot-unu-mdb-nightly-20260826T021727.mender")
+
+	checkKept(t, survived, "librescoot-unu-mdb-nightly-20260826T021727.mender")
+}
+
+// Running artifact absent (installed from elsewhere, or already reaped): keep
+// the newest on the running channel so a base survives, and do not let the
+// other channel win on lexicographic order.
+func TestManager_CleanupStaleMenderFiles_FallsBackToRunningChannel(t *testing.T) {
+	survived := runMenderCleanup(t, "nightly-20260826T021727",
+		"librescoot-unu-mdb-v1.2.1.mender",
+		"librescoot-unu-mdb-nightly-20260101T000000.mender",
+		"librescoot-unu-mdb-nightly-20260601T000000.mender")
+
+	checkKept(t, survived, "librescoot-unu-mdb-nightly-20260601T000000.mender")
+}
+
+// Nothing on the running channel at all: keep the newest of what is there
+// rather than emptying the directory, which would leave no base for the
+// pending install to build on.
+func TestManager_CleanupStaleMenderFiles_RunningChannelAbsent(t *testing.T) {
+	survived := runMenderCleanup(t, "v1.2.1",
+		"librescoot-unu-mdb-nightly-20260101T000000.mender",
+		"librescoot-unu-mdb-nightly-20260601T000000.mender")
+
+	checkKept(t, survived, "librescoot-unu-mdb-nightly-20260601T000000.mender")
+}
+
+// mender could not be asked, so ranking is all that is left. v0.10.0 is the
+// newest and lex compare would (wrongly) keep v0.7.0. Real published stable
+// assets carry no "stable-" infix.
+func TestManager_CleanupStaleMenderFiles_UnknownRunningVersionIsSemverAware(t *testing.T) {
+	survived := runMenderCleanup(t, "",
+		"librescoot-unu-mdb-v0.7.0.mender",
+		"librescoot-unu-mdb-v0.8.0.mender",
+		"librescoot-unu-mdb-v0.10.0.mender")
+
+	checkKept(t, survived, "librescoot-unu-mdb-v0.10.0.mender")
 }
 
 // Real published stable assets are "librescoot-unu-mdb-v1.0.0.mender" — no
