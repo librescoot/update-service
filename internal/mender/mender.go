@@ -23,6 +23,8 @@ type Manager struct {
 	installer    *Installer
 	deltaApplier *DeltaApplier
 	logger       *log.Logger
+	// osReleasePath is defaultOsReleasePath unless a test points it elsewhere.
+	osReleasePath string
 }
 
 // NewManager creates a new Mender manager with the specified download
@@ -167,31 +169,101 @@ func (m *Manager) CleanupStaleMenderFiles() {
 	m.cleanupStaleMenderFiles(m.runningVersion())
 }
 
-// runningVersion returns the version token of the committed artifact, or "" if
-// mender cannot be asked.
+// defaultOsReleasePath is the os-release of the running rootfs. Overridable so
+// the lookup can be exercised against a fixture.
+const defaultOsReleasePath = "/etc/os-release"
+
+// runningVersion returns the version token of the running image.
+//
+// os-release is the source of truth here because it is the key the rest of the
+// service looks artifacts up BY. performDeltaUpdate and applyDelta both resolve
+// the delta base with FindMenderFileForVersion(getCurrentVersion()), and
+// getCurrentVersion reads version:<component>[version_id] out of Redis, which
+// version-service copies verbatim from /etc/os-release. Reading os-release
+// directly gets the same token without depending on Redis being populated,
+// which on the DBC means not depending on another board.
+//
+// "mender-update show-artifact" is deliberately NOT used for this. It reports
+// the committed artifact, LMDB key "artifact-name", which is a different fact:
+// while an update is installed but not yet committed it legitimately still
+// names the PREVIOUS version, and it stays there if the commit fails
+// (CheckAndCommitPendingUpdate logs and startup continues regardless). Keying
+// the cleanup on it meant keeping the file nothing would ever look up while
+// deleting the one that would.
+//
+// It stays as the fallback for the case os-release cannot be read at all.
 func (m *Manager) runningVersion() string {
-	artifact, err := m.GetCurrentArtifact()
-	if err != nil {
-		m.logger.Printf("Cannot determine running artifact: %v", err)
+	osVersion, osErr := m.osReleaseVersion()
+	if osErr == nil {
+		return osVersion
+	}
+	m.logger.Printf("Cannot read os-release (%v), falling back to the committed mender artifact", osErr)
+	artifact, menderErr := m.GetCurrentArtifact()
+	if menderErr != nil {
+		m.logger.Printf("Cannot determine running version: %v", menderErr)
 		return ""
 	}
 	return strings.TrimPrefix(artifact, artifactNamePrefix)
 }
 
-// cleanupStaleMenderFiles keeps the artifact for runningVersion and removes the
-// rest.
+// osReleaseVersion reads VERSION_ID out of the running rootfs's os-release.
+// The value is lowercased by the image build, so every comparison against it
+// has to be case-insensitive; the artifact filenames keep the original case.
+func (m *Manager) osReleaseVersion() (string, error) {
+	path := m.osReleasePath
+	if path == "" {
+		path = defaultOsReleasePath
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "VERSION_ID=")
+		if !ok {
+			continue
+		}
+		version := strings.Trim(strings.TrimSpace(rest), `"'`)
+		if version == "" {
+			return "", fmt.Errorf("%s has an empty VERSION_ID", path)
+		}
+		return version, nil
+	}
+	return "", fmt.Errorf("%s has no VERSION_ID", path)
+}
+
+// cleanupStaleMenderFiles keeps the artifacts that something will actually ask
+// for, and removes the rest.
 //
-// The keeper is anchored on what the board runs rather than ranked, because a
+// Two files are worth keeping, because two are used:
+//
+//   - the artifact for the running version, which is the delta base.
+//     performDeltaUpdate and applyDelta resolve it by exactly this token, and
+//     without it applyDelta fails with "no-base-image" and a delta update
+//     degrades to a full download.
+//   - the newest artifact on the running channel that is NEWER than the running
+//     version. That is a target already downloaded but not yet installed, left
+//     behind by a power cut or a failed install. Downloader.Download stats the
+//     final path, verifies its size against the server and skips the transfer
+//     when it is complete, so keeping it turns a resumed update into a zero-byte
+//     one instead of re-fetching ~170 MB. Once installed it becomes the next
+//     base, so it is never wasted.
+//
+// Everything else goes. An artifact older than the running version is not
+// reachable: there is no backwards delta, and a rollback is a mender partition
+// operation that needs no artifact. One on another channel is neither a valid
+// base (deltas are published per channel) nor a plausible target.
+//
+// The keeper is anchored on the running version rather than ranked, because a
 // directory can hold artifacts from more than one channel and across channels
 // version.Compare has only a lexicographic tiebreak to offer. That puts any
 // "v..." tag above any "nightly-..." one on the first byte alone, so ranking a
 // mixed directory reaped the artifact for the running nightly and kept a stale
-// stable one, leaving the next delta update with no base to apply against.
+// stable one.
 //
-// Two fallbacks, in order, so that a base is always left behind: the newest
-// artifact on the running channel, for when the running one was installed from
-// elsewhere or already reaped, then the newest of all of them, for when mender
-// could not be asked at all.
+// Two fallbacks, in order, for when the running version is unknown or its
+// artifact is gone, so that a base is always left behind: the newest on the
+// running channel, then the newest of all of them.
 func (m *Manager) cleanupStaleMenderFiles(runningVersion string) {
 	pattern := filepath.Join(m.downloader.downloadDir, "*.mender")
 	files, err := filepath.Glob(pattern)
@@ -199,33 +271,43 @@ func (m *Manager) cleanupStaleMenderFiles(runningVersion string) {
 		return
 	}
 
-	var keep string
+	keep := make(map[string]string, 2)
 	if runningVersion != "" {
 		for _, file := range files {
 			if strings.EqualFold(version.FromFilename(file), runningVersion) {
-				keep = file
+				keep[file] = "delta base"
 				break
 			}
 		}
+		if staged := newestMenderFile(files, func(ver string) bool {
+			return version.SameChannel(ver, runningVersion) && version.Compare(ver, runningVersion) > 0
+		}); staged != "" {
+			keep[staged] = "staged target"
+		}
 	}
 
-	if keep == "" && runningVersion != "" {
-		keep = newestMenderFile(files, func(ver string) bool {
+	if len(keep) == 0 && runningVersion != "" {
+		if fallback := newestMenderFile(files, func(ver string) bool {
 			return version.SameChannel(ver, runningVersion)
-		})
+		}); fallback != "" {
+			keep[fallback] = "newest on the running channel"
+		}
+	}
+	if len(keep) == 0 {
+		if fallback := newestMenderFile(files, nil); fallback != "" {
+			keep[fallback] = "newest overall"
+		}
 	}
 
-	if keep == "" {
-		keep = newestMenderFile(files, nil)
-	}
-
-	m.logger.Printf("Keeping mender file %s (running %q)", filepath.Base(keep), runningVersion)
+	// Iterate files, not the map, so the log order is deterministic.
 	for _, file := range files {
-		if file != keep {
-			m.logger.Printf("Removing stale mender file: %s", file)
-			if err := os.Remove(file); err != nil {
-				m.logger.Printf("Warning: failed to remove stale mender file %s: %v", file, err)
-			}
+		if why, ok := keep[file]; ok {
+			m.logger.Printf("Keeping mender file %s (%s; running %q)", filepath.Base(file), why, runningVersion)
+			continue
+		}
+		m.logger.Printf("Removing stale mender file: %s", file)
+		if err := os.Remove(file); err != nil {
+			m.logger.Printf("Warning: failed to remove stale mender file %s: %v", file, err)
 		}
 	}
 }

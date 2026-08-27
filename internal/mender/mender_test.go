@@ -149,13 +149,17 @@ func runMenderCleanup(t *testing.T, runningVersion string, files ...string) map[
 }
 
 // checkKept asserts that exactly the named file survived.
-func checkKept(t *testing.T, survived map[string]bool, want string) {
+func checkKept(t *testing.T, survived map[string]bool, want ...string) {
 	t.Helper()
+	wanted := make(map[string]bool, len(want))
+	for _, w := range want {
+		wanted[w] = true
+	}
 	for f, ok := range survived {
-		if f == want && !ok {
+		if wanted[f] && !ok {
 			t.Errorf("expected %s to be kept, it was removed", f)
 		}
-		if f != want && ok {
+		if !wanted[f] && ok {
 			t.Errorf("expected %s to be removed, it survived", f)
 		}
 	}
@@ -174,14 +178,58 @@ func TestManager_CleanupStaleMenderFiles_KeepsRunningArtifact(t *testing.T) {
 	checkKept(t, survived, "librescoot-unu-mdb-nightly-20260826T021727.mender")
 }
 
-// The running artifact outranks a newer one on its own channel: the newer file
-// is a staged download, not the base for what is installed.
-func TestManager_CleanupStaleMenderFiles_RunningBeatsNewerSameChannel(t *testing.T) {
+// A newer artifact on the running channel is a target that was downloaded but
+// not installed, left by a power cut or a failed install. It is kept alongside
+// the base: Downloader.Download skips the transfer when the complete file is
+// already there, so keeping it makes the retry free, and once installed it
+// becomes the next base.
+//
+// This inverts an earlier expectation that the newer file was reaped as a mere
+// "staged download". Reaping it cost a full re-download for no gain.
+func TestManager_CleanupStaleMenderFiles_KeepsRunningAndStagedNewer(t *testing.T) {
 	survived := runMenderCleanup(t, "v1.2.1",
 		"librescoot-unu-mdb-v1.2.1.mender",
 		"librescoot-unu-mdb-v1.3.0.mender")
 
+	checkKept(t, survived,
+		"librescoot-unu-mdb-v1.2.1.mender",
+		"librescoot-unu-mdb-v1.3.0.mender")
+}
+
+// Only the newest of several newer ones earns the staged slot. Intermediates
+// never need to be on disk: ApplyDeltaChain takes one base plus N deltas and
+// produces the final image in flight.
+func TestManager_CleanupStaleMenderFiles_KeepsOnlyNewestStaged(t *testing.T) {
+	survived := runMenderCleanup(t, "nightly-20260801T000000",
+		"librescoot-unu-mdb-nightly-20260801T000000.mender",
+		"librescoot-unu-mdb-nightly-20260802T000000.mender",
+		"librescoot-unu-mdb-nightly-20260803T000000.mender")
+
+	checkKept(t, survived,
+		"librescoot-unu-mdb-nightly-20260801T000000.mender",
+		"librescoot-unu-mdb-nightly-20260803T000000.mender")
+}
+
+// Older than running is unreachable: there is no backwards delta, and a
+// rollback is a mender partition operation that needs no artifact.
+func TestManager_CleanupStaleMenderFiles_ReapsOlderThanRunning(t *testing.T) {
+	survived := runMenderCleanup(t, "v1.2.1",
+		"librescoot-unu-mdb-v1.1.0.mender",
+		"librescoot-unu-mdb-v1.2.1.mender")
+
 	checkKept(t, survived, "librescoot-unu-mdb-v1.2.1.mender")
+}
+
+// A newer artifact on another channel is neither a valid base (deltas are
+// published per channel) nor a plausible target, so the staged slot must not
+// take it. v9.9.9 also outranks any nightly on a lexicographic compare, so this
+// covers that trap too.
+func TestManager_CleanupStaleMenderFiles_ReapsNewerOnOtherChannel(t *testing.T) {
+	survived := runMenderCleanup(t, "nightly-20260801T000000",
+		"librescoot-unu-mdb-nightly-20260801T000000.mender",
+		"librescoot-unu-mdb-v9.9.9.mender")
+
+	checkKept(t, survived, "librescoot-unu-mdb-nightly-20260801T000000.mender")
 }
 
 // Filenames carry the timestamp token verbatim while Redis and the release
