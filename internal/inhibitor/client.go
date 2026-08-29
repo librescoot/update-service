@@ -168,3 +168,13 @@ func (c *Client) RemoveInstallInhibit(componentID string) error {
 	id := fmt.Sprintf("install:%s", componentID)
 	return c.RemoveInhibit(id)
 }
+
+// AddDBCInstallInhibit blocks power transitions during a DBC rootfs write.
+func (c *Client) AddDBCInstallInhibit() error {
+	return c.AddInhibit("install:dbc", "update-service", "power-state-change",
+		"installing update for dbc", TypeBlock, 0)
+}
+
+func (c *Client) RemoveDBCInstallInhibit() error {
+	return c.RemoveInhibit("install:dbc")
+}

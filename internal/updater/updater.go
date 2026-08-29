@@ -23,6 +23,11 @@ import (
 	"github.com/librescoot/update-service/internal/version"
 )
 
+type dbcInstallGuard interface {
+	AddDBCInstallInhibit() error
+	RemoveDBCInstallInhibit() error
+}
+
 // Updater represents the component-aware update orchestrator
 type Updater struct {
 	config           *config.Config
@@ -30,6 +35,8 @@ type Updater struct {
 	inhibitor        *inhibitor.Client
 	power            *power.Client
 	mender           *mender.Manager
+	installArtifact  func(string, mender.InstallProgressCallback) error
+	dbcInstallGuard  dbcInstallGuard
 	backoff          *backoff.Store
 	status           *status.Reporter
 	bootUpdater      *boot.BootUpdater  // nil if --boot-update not set
@@ -84,13 +91,28 @@ type Updater struct {
 
 // menderInstallProgressCb returns a callback that reports mender-update install
 // progress (parsed from stderr) to the status reporter as 0-100%.
-// Used for full (non-delta) updates where mender install is the entire install phase.
 func (u *Updater) menderInstallProgressCb() mender.InstallProgressCallback {
 	return func(percent int) {
 		if err := u.status.SetInstallProgress(u.ctx, percent); err != nil {
 			u.logger.Printf("Failed to set install progress: %v", err)
 		}
 	}
+}
+
+// installMender blocks power transitions during every DBC rootfs write.
+func (u *Updater) installMender(path string) error {
+	if u.config.Component == "dbc" {
+		if err := u.dbcInstallGuard.AddDBCInstallInhibit(); err != nil {
+			return fmt.Errorf("add DBC install inhibit: %w", err)
+		}
+		defer func() {
+			if err := u.dbcInstallGuard.RemoveDBCInstallInhibit(); err != nil {
+				u.logger.Printf("Failed to remove DBC install inhibit: %v", err)
+			}
+		}()
+	}
+
+	return u.installArtifact(path, u.menderInstallProgressCb())
 }
 
 // New creates a new component-aware updater
@@ -121,23 +143,26 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 
 	statusReporter := status.NewReporter(redisClient.GetClient(), cfg.Component, logger)
 
+	// A closure, not a snapshot: cfg.DownloadBudget() is called fresh at
+	// the top of every download attempt, so a runtime settings change takes
+	// effect on the next attempt without reconstructing the Manager.
+	manager := mender.NewManager(downloadDir, func() mender.Budget {
+		maxDuration, stallWindow, stallMinBytes := cfg.DownloadBudget()
+		return mender.Budget{
+			MaxDuration:   maxDuration,
+			StallWindow:   stallWindow,
+			StallMinBytes: stallMinBytes,
+		}
+	}, logger)
+
 	u := &Updater{
-		config:    cfg,
-		redis:     redisClient,
-		inhibitor: inhibitorClient,
-		power:     powerClient,
-		// A closure, not a snapshot: cfg.DownloadBudget() is called fresh at
-		// the top of every download attempt, so a runtime settings change
-		// (e.g. download-max-duration edited mid-campaign) takes effect on
-		// the next attempt without needing to reconstruct the Manager.
-		mender: mender.NewManager(downloadDir, func() mender.Budget {
-			maxDuration, stallWindow, stallMinBytes := cfg.DownloadBudget()
-			return mender.Budget{
-				MaxDuration:   maxDuration,
-				StallWindow:   stallWindow,
-				StallMinBytes: stallMinBytes,
-			}
-		}, logger),
+		config:               cfg,
+		redis:                redisClient,
+		inhibitor:            inhibitorClient,
+		power:                powerClient,
+		mender:               manager,
+		installArtifact:      manager.Install,
+		dbcInstallGuard:      inhibitorClient,
 		backoff:              backoff.NewStore(downloadDir, logger),
 		status:               statusReporter,
 		bootUpdater:          bootUpdater,
@@ -236,6 +261,13 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 		u.logger.Printf("Warning: Failed to clear stale download suspend inhibit: %v", err)
 	}
 
+	// Clear a DBC install block left by an unclean exit.
+	if u.config.Component == "dbc" {
+		if err := u.inhibitor.RemoveDBCInstallInhibit(); err != nil {
+			u.logger.Printf("Warning: Failed to clear stale DBC install inhibit: %v", err)
+		}
+	}
+
 	// Recover from any stuck status on startup
 	if err := u.recoverFromStuckState(menderNeedsReboot); err != nil {
 		u.logger.Printf("Warning: Failed to recover from stuck state: %v", err)
@@ -247,7 +279,6 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 	if u.flatMirror != nil {
 		go u.monitorFlatStatus()
 	}
-
 
 	// Standby tracking must be live before performLocalBootUpdate: it seeds the
 	// standby timer that the backgrounded reboot wait polls. checkInitialStandbyState
@@ -937,7 +968,7 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		}
 	}
 
-	if err := u.mender.Install(source, u.menderInstallProgressCb()); err != nil {
+	if err := u.installMender(source); err != nil {
 		u.logger.Printf("Failed to install update from file %s: %v", source, err)
 
 		errStr := err.Error()
@@ -1164,7 +1195,7 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 
 	// The applier verified the per-file and rootfs checksums of the assembled
 	// image, so there is no corruption-retry path here (unlike raw downloads).
-	if err := u.mender.Install(newMenderPath, u.menderInstallProgressCb()); err != nil {
+	if err := u.installMender(newMenderPath); err != nil {
 		u.logger.Printf("Failed to install assembled delta update %s: %v", newMenderPath, err)
 		if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install update from file %s: %v", newMenderPath, err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
@@ -1303,7 +1334,7 @@ func (u *Updater) handleUpdateFromURL(url string) {
 			}
 		}
 
-		if err := u.mender.Install(filePath, u.menderInstallProgressCb()); err != nil {
+		if err := u.installMender(filePath); err != nil {
 			u.logger.Printf("Failed to install update: %v", err)
 
 			errStr := err.Error()
@@ -2179,7 +2210,7 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string, manual b
 	}
 
 	// Step 4: Install the update
-	if err := u.mender.Install(filePath, u.menderInstallProgressCb()); err != nil {
+	if err := u.installMender(filePath); err != nil {
 		u.logger.Printf("Failed to install update: %v", err)
 
 		// Check if this is a corruption error (gzip decompression, checksum failure, etc.)
@@ -2736,7 +2767,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			u.logger.Printf("Failed to remove preparing inhibit: %v", err)
 		}
 	}
-	if err := u.mender.Install(finalMenderPath, u.menderInstallProgressCb()); err != nil {
+	if err := u.installMender(finalMenderPath); err != nil {
 		u.logger.Printf("Failed to install delta-generated update: %v", err)
 
 		// Check if this is a corruption error (gzip decompression, checksum failure, etc.)

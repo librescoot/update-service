@@ -1,10 +1,17 @@
 package updater
 
 import (
+	"errors"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+
+	"github.com/librescoot/update-service/internal/config"
+	"github.com/librescoot/update-service/internal/mender"
 )
 
 func TestRemoveLegacyOtaFiles(t *testing.T) {
@@ -74,6 +81,110 @@ func TestRemoveLegacyOtaFiles_SkipsActiveDownloadDir(t *testing.T) {
 
 	if _, err := os.Stat(live); err != nil {
 		t.Errorf("expected live download %s to survive, got err=%v", live, err)
+	}
+}
+
+type fakeDBCInstallGuard struct {
+	events    *[]string
+	addErr    error
+	removeErr error
+}
+
+func (g *fakeDBCInstallGuard) AddDBCInstallInhibit() error {
+	*g.events = append(*g.events, "add")
+	return g.addErr
+}
+
+func (g *fakeDBCInstallGuard) RemoveDBCInstallInhibit() error {
+	*g.events = append(*g.events, "remove")
+	return g.removeErr
+}
+
+func newInstallGateTestUpdater(component string, guard dbcInstallGuard, installErr error, events *[]string) *Updater {
+	return &Updater{
+		config:          &config.Config{Component: component},
+		dbcInstallGuard: guard,
+		installArtifact: func(path string, progress mender.InstallProgressCallback) error {
+			*events = append(*events, "install:"+path)
+			if progress == nil {
+				panic("install progress callback is nil")
+			}
+			return installErr
+		},
+		logger: log.New(io.Discard, "", 0),
+	}
+}
+
+func TestInstallMenderDBCOrdersBlockAroundInstall(t *testing.T) {
+	var events []string
+	guard := &fakeDBCInstallGuard{events: &events}
+	u := newInstallGateTestUpdater("dbc", guard, nil, &events)
+
+	if err := u.installMender("image.mender"); err != nil {
+		t.Fatalf("installMender() failed: %v", err)
+	}
+	if got, want := strings.Join(events, ","), "add,install:image.mender,remove"; got != want {
+		t.Errorf("events = %q, want %q", got, want)
+	}
+}
+
+func TestInstallMenderDBCRejectsInstallWithoutBlock(t *testing.T) {
+	var events []string
+	blockErr := errors.New("redis unavailable")
+	guard := &fakeDBCInstallGuard{events: &events, addErr: blockErr}
+	u := newInstallGateTestUpdater("dbc", guard, nil, &events)
+
+	if err := u.installMender("image.mender"); !errors.Is(err, blockErr) {
+		t.Fatalf("installMender() error = %v, want wrapped block error", err)
+	}
+	if got, want := strings.Join(events, ","), "add"; got != want {
+		t.Errorf("events = %q, want %q (installer must not run)", got, want)
+	}
+}
+
+func TestInstallMenderDBCReleasesBlockAfterInstallFailure(t *testing.T) {
+	var events []string
+	installErr := errors.New("mender failed")
+	guard := &fakeDBCInstallGuard{events: &events}
+	u := newInstallGateTestUpdater("dbc", guard, installErr, &events)
+
+	if err := u.installMender("image.mender"); !errors.Is(err, installErr) {
+		t.Fatalf("installMender() error = %v, want install error", err)
+	}
+	if got, want := strings.Join(events, ","), "add,install:image.mender,remove"; got != want {
+		t.Errorf("events = %q, want %q", got, want)
+	}
+}
+
+func TestInstallMenderMDBDoesNotUseDBCBlock(t *testing.T) {
+	var events []string
+	guard := &fakeDBCInstallGuard{events: &events}
+	u := newInstallGateTestUpdater("mdb", guard, nil, &events)
+
+	if err := u.installMender("image.mender"); err != nil {
+		t.Fatalf("installMender() failed: %v", err)
+	}
+	if got, want := strings.Join(events, ","), "install:image.mender"; got != want {
+		t.Errorf("events = %q, want %q", got, want)
+	}
+}
+
+// Prevent new rootfs install paths from bypassing the power-safety gate.
+func TestAllMenderInstallsUseSafetyGate(t *testing.T) {
+	source, err := os.ReadFile("updater.go")
+	if err != nil {
+		t.Fatalf("ReadFile(updater.go) failed: %v", err)
+	}
+
+	text := string(source)
+	if strings.Contains(text, "u.mender.Install(") {
+		t.Fatal("found direct mender Install call outside the safety gate")
+	}
+	if got := strings.Count(text, "u.installArtifact("); got != 1 {
+		t.Fatalf("found %d low-level installer calls, want exactly one inside installMender", got)
+	}
+	if got := strings.Count(text, "u.installMender("); got != 5 {
+		t.Fatalf("found %d guarded rootfs install paths, want 5", got)
 	}
 }
 

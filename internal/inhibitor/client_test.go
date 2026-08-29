@@ -60,6 +60,35 @@ func TestAddInhibitWritesHashAndPublishes(t *testing.T) {
 	}
 }
 
+func TestDBCInstallInhibitBlocks(t *testing.T) {
+	c, raw := newTestClient(t)
+	defer raw.Close()
+	defer raw.Do("HDEL", InhibitHashKey, "install:dbc")
+
+	if err := c.AddDBCInstallInhibit(); err != nil {
+		t.Fatalf("AddDBCInstallInhibit() failed: %v", err)
+	}
+
+	stored, err := raw.HGet(InhibitHashKey, "install:dbc")
+	if err != nil {
+		t.Fatalf("HGet() failed: %v", err)
+	}
+	var got InhibitData
+	if err := json.Unmarshal([]byte(stored), &got); err != nil {
+		t.Fatalf("stored value is not InhibitData JSON: %v (%q)", err, stored)
+	}
+	if got.ID != "install:dbc" || got.Type != TypeBlock || got.Duration != 0 {
+		t.Errorf("stored = %+v, want id=install:dbc type=block duration=0", got)
+	}
+
+	if err := c.RemoveDBCInstallInhibit(); err != nil {
+		t.Fatalf("RemoveDBCInstallInhibit() failed: %v", err)
+	}
+	if _, err := raw.HGet(InhibitHashKey, "install:dbc"); err != ipc.ErrNil {
+		t.Errorf("HGet after remove = %v, want ErrNil", err)
+	}
+}
+
 func TestRemoveInhibitDeletesHashAndPublishes(t *testing.T) {
 	c, raw := newTestClient(t)
 	defer raw.Close()
