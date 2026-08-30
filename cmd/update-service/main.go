@@ -47,7 +47,6 @@ func main() {
 		return
 	}
 
-	// Validate required component flag
 	if *component == "" {
 		log.Fatal("--component flag is required (mdb or dbc)")
 	}
@@ -55,24 +54,20 @@ func main() {
 		log.Fatalf("Invalid component '%s'. Must be 'mdb' or 'dbc'", *component)
 	}
 
-	// Set default download directory if not specified
 	dlDir := *downloadDir
 	if dlDir == "" {
 		dlDir = "/data/ota/" + *component
 	}
 
-	// Set up logger
 	var logger *log.Logger
 	if os.Getenv("INVOCATION_ID") != "" {
 		logger = log.New(os.Stdout, "", 0)
 	} else {
 		logger = log.New(os.Stdout, "librescoot-update: ", log.LstdFlags|log.Lmsgprefix)
 	}
-	// Create context that can be cancelled on SIGINT or SIGTERM
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Set up signal handling
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -81,14 +76,12 @@ func main() {
 		cancel()
 	}()
 
-	// Initialize Redis client early so we can load settings from it
 	redisClient, err := redis.New(*redisAddr)
 	if err != nil {
 		logger.Fatalf("Failed to initialize Redis client: %v", err)
 	}
 	defer redisClient.Close()
 
-	// Track which CLI flags were explicitly set (non-default)
 	cliChannelSet := flag.Lookup("channel").Value.String() != flag.Lookup("channel").DefValue
 	cliCheckIntervalSet := flag.Lookup("check-interval").Value.String() != flag.Lookup("check-interval").DefValue
 	cliReleasesURLSet := flag.Lookup("releases-url").Value.String() != flag.Lookup("releases-url").DefValue
@@ -99,7 +92,6 @@ func main() {
 		"download-stall-min-bytes": flag.Lookup("download-stall-min-bytes").Value.String() != flag.Lookup("download-stall-min-bytes").DefValue,
 	}
 
-	// Detect channel from installed version
 	detectedChannel := ""
 	installedVersion, err := redisClient.GetComponentVersion(*component)
 	if err == nil && installedVersion != "" {
@@ -114,7 +106,6 @@ func main() {
 		effectiveChannel = detectedChannel
 	}
 
-	// Initialize config with CLI flags and detected/default values
 	cfg := config.New(
 		*redisAddr,
 		*releasesURL,
@@ -129,13 +120,11 @@ func main() {
 		*bootUBootSeek,
 	)
 
-	// Save CLI values if they were explicitly set
 	cliChannel := cfg.Channel
 	cliCheckInterval := cfg.CheckInterval
 	cliReleasesURL := cfg.ReleasesURL
 	cliDryRun := cfg.DryRun
 
-	// Check if channel will come from Redis settings
 	redisChannelSet := false
 	if !cliChannelSet {
 		if redisChannel, err := redisClient.HGet(config.SettingsHashKey, fmt.Sprintf("updates.%s.channel", *component)); err == nil && redisChannel != "" && config.IsValidChannel(redisChannel) {
@@ -143,12 +132,10 @@ func main() {
 		}
 	}
 
-	// Load settings from Redis (will be overridden by CLI flags if they were set)
 	if err := cfg.LoadFromRedis(redisClient); err != nil {
 		logger.Printf("Warning: Failed to load settings from Redis: %v", err)
 	}
 
-	// Override with CLI flags if they were explicitly set (CLI takes precedence)
 	if cliChannelSet {
 		cfg.Channel = cliChannel
 	}
@@ -184,7 +171,6 @@ func main() {
 	inhibitorClient := inhibitor.New(redisClient.GetClient(), logger)
 	powerClient := power.New(redisClient.GetClient(), logger)
 
-	// Initialize boot updater if enabled
 	var bootUpdater *boot.BootUpdater
 	if cfg.BootEnabled {
 		if cfg.BootDevice == "" {
@@ -199,11 +185,9 @@ func main() {
 
 	}
 
-	// Initialize updater
 	updater := updater.New(ctx, cfg, redisClient, inhibitorClient, powerClient, bootUpdater, logger)
 	defer updater.Close()
 
-	// Check if there's a pending update that needs to be committed on startup
 	menderNeedsReboot, err := updater.CheckAndCommitPendingUpdate()
 	if err != nil {
 		logger.Printf("Warning: Failed to check/commit pending update: %v", err)
@@ -218,7 +202,6 @@ func main() {
 	// changes at runtime.
 	go watchSettingsChanges(ctx, redisClient, cfg, logger, updater, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet, cliBudgetSet)
 
-	// Log configuration summary
 	channelSource := "default"
 	if cliChannelSet {
 		channelSource = "cli"
@@ -236,19 +219,15 @@ func main() {
 	logger.Printf("Config: download budget max=%v stall=%v/%d bytes",
 		cfg.DownloadMaxDuration, cfg.DownloadStallWindow, cfg.DownloadStallMinBytes)
 
-	// Wait for context cancellation
 	<-ctx.Done()
 	logger.Printf("Shutting down update service")
 }
 
-// watchSettingsChanges monitors Redis for settings changes and applies them to the config
 func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger, upd *updater.Updater, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet bool, cliBudgetSet map[string]bool) {
-	// Use HashWatcher to monitor settings hash
 	watcher := redisClient.NewSettingsWatcher()
 	watcher.OnAny(func(settingKey, value string) error {
 		logger.Printf("Settings change notification received for key: %s", settingKey)
 
-		// Skip applying settings that were overridden by CLI flags
 		prefix := "updates." + cfg.Component + "."
 		if len(settingKey) > len(prefix) && settingKey[:len(prefix)] == prefix {
 			settingName := settingKey[len(prefix):]
@@ -291,7 +270,6 @@ func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *c
 			}
 		}
 
-		// Apply the setting update
 		if cfg.ApplyRedisUpdate(settingKey, value) {
 			logger.Printf("Applied setting update: %s = %s", settingKey, value)
 
@@ -315,19 +293,15 @@ func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *c
 	}
 	defer watcher.Stop()
 
-	// Wait for context cancellation
 	<-ctx.Done()
 }
 
-// evaluateCheckIntervalChange evaluates if an update check should be triggered based on the new check interval
 func evaluateCheckIntervalChange(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger) {
-	// If automated checks are disabled (interval is 0), don't trigger a check
 	if cfg.CheckInterval == 0 {
 		logger.Printf("Check interval set to 0 (disabled), not triggering check")
 		return
 	}
 
-	// Get the last check time from Redis
 	lastCheckTime, err := redisClient.GetLastUpdateCheckTime(cfg.Component)
 	if err != nil {
 		logger.Printf("Warning: Failed to get last check time: %v. Will not trigger immediate check.", err)
@@ -341,11 +315,9 @@ func evaluateCheckIntervalChange(ctx context.Context, redisClient *redis.Client,
 		return
 	}
 
-	// Calculate time since last check
 	timeSinceLastCheck := time.Since(lastCheckTime)
 	logger.Printf("Time since last check: %v, new check interval: %v", timeSinceLastCheck, cfg.CheckInterval)
 
-	// If enough time has passed based on the new interval, trigger a check
 	if timeSinceLastCheck >= cfg.CheckInterval {
 		logger.Printf("Time since last check (%v) >= new interval (%v), triggering immediate check", timeSinceLastCheck, cfg.CheckInterval)
 		if err := redisClient.PushUpdateCommandToComponent(cfg.Component, "check-now"); err != nil {

@@ -12,21 +12,18 @@ import (
 	menderstatus "github.com/librescoot/librescoot-mender-status/mender"
 )
 
-// InstallProgressCallback is called with progress (0-100) during mender-update install
 type InstallProgressCallback func(percent int)
 
-// UpdateState represents the state of a mender update
 type UpdateState int
 
 const (
-	StateNoUpdate     UpdateState = iota // No update in progress
-	StateCommitted                       // Update successfully committed
-	StateNeedsReboot                     // Update installed, waiting for reboot
-	StateNeedsCommit                     // Rebooted into new partition, needs commit
-	StateInconsistent                    // Update failed, system inconsistent
+	StateNoUpdate     UpdateState = iota
+	StateCommitted                // Expected artifact is active and committed.
+	StateNeedsReboot              // Install succeeded in the inactive partition.
+	StateNeedsCommit              // Booted into the new partition; Mender must commit it.
+	StateInconsistent             // Mender marked the artifact failed; do not continue normally.
 )
 
-// Installer handles Mender update installation and commit operations
 type Installer struct {
 	logger *log.Logger
 
@@ -36,14 +33,13 @@ type Installer struct {
 	deviceSize      func(string) (int64, error)
 }
 
-// NewInstaller creates a new installer instance
 func NewInstaller(logger *log.Logger) *Installer {
 	return &Installer{
 		logger: logger,
 	}
 }
 
-// Rollback rolls back a pending mender update, clearing the standalone-state from LMDB.
+// Rollback asks Mender to discard the pending standalone update state.
 func (i *Installer) Rollback() error {
 	i.logger.Printf("Rolling back mender update")
 	cmd := exec.Command("mender-update", "rollback")
@@ -85,11 +81,9 @@ func (i *Installer) Install(filePath string, progressCb InstallProgressCallback)
 		return fmt.Errorf("failed to start mender-update install: %w", err)
 	}
 
-	// Read stderr, splitting on \r to parse progress lines like "\r45%"
 	var stderrBuf bytes.Buffer
 	scanner := bufio.NewScanner(stderrPipe)
 	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
-		// Split on \r or \n
 		for i := range data {
 			if data[i] == '\r' || data[i] == '\n' {
 				return i + 1, data[:i], nil
@@ -129,15 +123,13 @@ func (i *Installer) Install(filePath string, progressCb InstallProgressCallback)
 	return nil
 }
 
-// CommitResult represents the result of a mender commit operation
 type CommitResult struct {
-	Success  bool   // True if commit succeeded
-	ExitCode int    // Exit code from mender-update
-	Output   string // stdout from command
-	Error    string // stderr from command
+	Success  bool
+	ExitCode int
+	Output   string
+	Error    string
 }
 
-// Commit commits the installed update
 func (i *Installer) Commit() error {
 	result := i.CommitWithResult()
 	if !result.Success {
@@ -146,7 +138,6 @@ func (i *Installer) Commit() error {
 	return nil
 }
 
-// CommitWithResult commits the installed update and returns detailed result info
 func (i *Installer) CommitWithResult() CommitResult {
 	cmd := exec.Command("mender-update", "commit")
 	var stdout, stderr bytes.Buffer
@@ -163,8 +154,7 @@ func (i *Installer) CommitWithResult() CommitResult {
 		}
 	}
 
-	// Get exit code
-	exitCode := 1 // default
+	exitCode := 1
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		exitCode = exitErr.ExitCode()
 	}
@@ -177,7 +167,6 @@ func (i *Installer) CommitWithResult() CommitResult {
 	}
 }
 
-// GetCurrentArtifact returns the currently committed artifact name
 func (i *Installer) GetCurrentArtifact() (string, error) {
 	cmd := exec.Command("mender-update", "show-artifact")
 	var stdout, stderr bytes.Buffer
@@ -191,10 +180,8 @@ func (i *Installer) GetCurrentArtifact() (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-// CheckUpdateState checks the current mender update state relative to expected version.
-// Uses the mender-status library to read the standalone-state from Mender's LMDB database.
+// CheckUpdateState interprets Mender's LMDB standalone state relative to expectedVersion.
 func (i *Installer) CheckUpdateState(expectedVersion string) (UpdateState, error) {
-	// Read mender status from LMDB database
 	reader, err := menderstatus.NewReaderDefault()
 	if err != nil {
 		return StateNoUpdate, fmt.Errorf("failed to create mender status reader: %w", err)
@@ -205,16 +192,13 @@ func (i *Installer) CheckUpdateState(expectedVersion string) (UpdateState, error
 		return StateNoUpdate, fmt.Errorf("failed to read mender status: %w", err)
 	}
 
-	// Get committed artifact name
 	committedArtifact := status.CommittedArtifact
 
-	// Check for inconsistent state (failed update)
 	if strings.HasSuffix(committedArtifact, "_INCONSISTENT") {
 		i.logger.Printf("Mender: INCONSISTENT state (%s)", committedArtifact)
 		return StateInconsistent, nil
 	}
 
-	// Check if update is in progress
 	if status.UpdateInProgress {
 		if status.State.Failed {
 			i.logger.Printf("Mender: update failed (state=%s)", status.State.InState)
@@ -224,12 +208,10 @@ func (i *Installer) CheckUpdateState(expectedVersion string) (UpdateState, error
 			i.logger.Printf("Mender: pending commit for %s", status.State.ArtifactName)
 			return StateNeedsCommit, nil
 		}
-		// Update installed but not yet rebooted
 		i.logger.Printf("Mender: reboot pending for %s (state=%s)", status.State.ArtifactName, status.State.InState)
 		return StateNeedsReboot, nil
 	}
 
-	// No update in progress
 	if expectedVersion != "" && committedArtifact == expectedVersion {
 		i.logger.Printf("Mender: running %s (expected)", committedArtifact)
 		return StateCommitted, nil

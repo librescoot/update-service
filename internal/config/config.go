@@ -9,7 +9,6 @@ import (
 	"time"
 )
 
-// Fixed keys for Redis
 const (
 	OtaStatusHashKey = "ota"
 	OtaChannel       = "ota"
@@ -19,25 +18,19 @@ const (
 	SettingsChannel  = "settings"
 )
 
-// Config holds the configuration for the update service
 type Config struct {
-	// Redis configuration (CLI-only, never from Redis)
-	RedisAddr string
+	RedisAddr string // CLI-only; never accepted from Redis.
 
-	// GitHub Releases API configuration
 	ReleasesURL   string
 	CheckInterval time.Duration
 
-	// Component and channel configuration
-	Component string // "mdb" or "dbc" - which component this instance manages (CLI-only, never from Redis)
-	Channel   string // "stable", "testing", "nightly"
+	Component string // CLI-only target: mdb or dbc.
+	Channel   string // stable, testing, or nightly; CLI overrides Redis.
 
-	// Download directory (CLI-only, never from Redis)
-	DownloadDir string // Directory where OTA files are downloaded (default: /data/ota/{component})
+	DownloadDir string // CLI-only OTA staging directory.
 
-	// Update constraints
-	MdbRebootCheckInterval time.Duration // How often to check if MDB can be rebooted
-	UpdateRetryInterval    time.Duration // How often to retry updates if conditions aren't met
+	MdbRebootCheckInterval time.Duration
+	UpdateRetryInterval    time.Duration
 
 	// Download budget. Each bounds a single attempt; 0 disables that bound.
 	// A budget abort keeps the partial file, so the next attempt resumes.
@@ -50,21 +43,18 @@ type Config struct {
 	// lock does not attempt to fix; these three differ in having a genuine
 	// concurrent reader, so their guard has to be correct.
 	budgetMu              sync.RWMutex
-	DownloadMaxDuration   time.Duration // Wall clock cap on one download attempt
-	DownloadStallWindow   time.Duration // Rolling window the throughput floor is measured over
-	DownloadStallMinBytes int64         // Bytes that must arrive within each window
+	DownloadMaxDuration   time.Duration
+	DownloadStallWindow   time.Duration
+	DownloadStallMinBytes int64
 
-	// Operational modes
-	DryRun bool // If true, don't actually reboot, just notify
+	DryRun bool // Do not reboot; notify only.
 
-	// Boot partition update configuration (CLI-only)
-	BootEnabled    bool   // Enable boot partition updates
-	BootMountPoint string // Boot partition mount point (default: /uboot)
-	BootDevice     string // U-Boot device path (auto-detected from mount if empty)
-	BootUBootSeek  int64  // 512-byte blocks to seek before writing U-Boot (default: 2)
+	BootEnabled    bool
+	BootMountPoint string
+	BootDevice     string
+	BootUBootSeek  int64 // 512-byte blocks before the U-Boot image.
 }
 
-// New creates a new Config with the given parameters
 func New(
 	redisAddr string,
 	releasesURL string,
@@ -79,45 +69,36 @@ func New(
 	bootUBootSeek int64,
 ) *Config {
 	return &Config{
-		RedisAddr:     redisAddr,
-		ReleasesURL:   releasesURL,
-		CheckInterval: checkInterval,
-		Component:     component,
-		Channel:       channel,
-		DownloadDir:   downloadDir,
-		// Default values for update constraints
+		RedisAddr:              redisAddr,
+		ReleasesURL:            releasesURL,
+		CheckInterval:          checkInterval,
+		Component:              component,
+		Channel:                channel,
+		DownloadDir:            downloadDir,
 		MdbRebootCheckInterval: 5 * time.Minute,
 		UpdateRetryInterval:    15 * time.Minute,
-		// Default download budget
-		DownloadMaxDuration:   60 * time.Minute,
-		DownloadStallWindow:   2 * time.Minute,
-		DownloadStallMinBytes: 64 * 1024,
-		// Operational modes
-		DryRun: dryRun,
-		// Boot partition update
-		BootEnabled:    bootEnabled,
-		BootMountPoint: bootMountPoint,
-		BootDevice:     bootDevice,
-		BootUBootSeek:  bootUBootSeek,
+		DownloadMaxDuration:    60 * time.Minute,
+		DownloadStallWindow:    2 * time.Minute,
+		DownloadStallMinBytes:  64 * 1024,
+		DryRun:                 dryRun,
+		BootEnabled:            bootEnabled,
+		BootMountPoint:         bootMountPoint,
+		BootDevice:             bootDevice,
+		BootUBootSeek:          bootUBootSeek,
 	}
 }
 
-// IsValidComponent checks if the given component is valid
 func IsValidComponent(component string) bool {
 	return component == "mdb" || component == "dbc"
 }
 
-// IsValidChannel checks if the given channel is valid
 func IsValidChannel(channel string) bool {
-	// Currently supported channels
 	validChannels := []string{"stable", "testing", "nightly"}
 	return slices.Contains(validChannels, channel)
 }
 
-// InferChannelFromVersion attempts to infer the channel from a version string.
-// Returns empty string if channel cannot be determined.
+// InferChannelFromVersion maps installed artifact naming to a release channel.
 func InferChannelFromVersion(version string) string {
-	// Clean up version string (remove potential codename suffix like " (none)")
 	version = strings.Split(version, " ")[0]
 
 	if strings.HasPrefix(version, "nightly-") {
@@ -132,7 +113,6 @@ func InferChannelFromVersion(version string) string {
 	return ""
 }
 
-// RedisSettings defines the interface for reading settings from Redis
 type RedisSettings interface {
 	HGet(key, field string) (string, error)
 }
@@ -143,28 +123,24 @@ type RedisSettings interface {
 func (c *Config) LoadFromRedis(redis RedisSettings) error {
 	prefix := fmt.Sprintf("updates.%s.", c.Component)
 
-	// Load channel from Redis if available
 	if channel, err := redis.HGet(SettingsHashKey, prefix+"channel"); err == nil && channel != "" {
 		if IsValidChannel(channel) {
 			c.Channel = channel
 		}
 	}
 
-	// Load check-interval from Redis if available
 	if intervalStr, err := redis.HGet(SettingsHashKey, prefix+"check-interval"); err == nil && intervalStr != "" {
 		if intervalStr == "never" {
-			c.CheckInterval = 0 // 0 means disabled
+			c.CheckInterval = 0 // Zero disables automatic update checks.
 		} else if duration, err := time.ParseDuration(intervalStr); err == nil {
 			c.CheckInterval = duration
 		}
 	}
 
-	// Load releases-url from Redis if available
 	if url, err := redis.HGet(SettingsHashKey, prefix+"releases-url"); err == nil && url != "" {
 		c.ReleasesURL = url
 	}
 
-	// Load dry-run from Redis if available
 	if dryRunStr, err := redis.HGet(SettingsHashKey, prefix+"dry-run"); err == nil && dryRunStr != "" {
 		if dryRun, err := strconv.ParseBool(dryRunStr); err == nil {
 			c.DryRun = dryRun
@@ -208,7 +184,6 @@ func (c *Config) DownloadBudget() (maxDuration, stallWindow time.Duration, stall
 func (c *Config) ApplyRedisUpdate(key, value string) bool {
 	prefix := fmt.Sprintf("updates.%s.", c.Component)
 
-	// Only process settings for this component
 	if len(key) <= len(prefix) || key[:len(prefix)] != prefix {
 		return false
 	}
