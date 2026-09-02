@@ -23,6 +23,43 @@ func TestNormalizeDeltaBase(t *testing.T) {
 	}
 }
 
+func TestSameVersionInstallErr(t *testing.T) {
+	cases := []struct {
+		name    string
+		target  string // as extracted from the .mender filename
+		current string // version_id from redis
+		wantErr string // substring; "" means proceed
+	}{
+		{"same stable, current without v prefix", "v1.3.0", "1.3.0", "already installed"},
+		{"same stable, both v-prefixed", "v1.3.0", "v1.3.0", "already installed"},
+		{"same stable semver normalization", "v0.10.0", "0.10.0", "already installed"},
+		{"same nightly, legacy bare timestamp", "nightly-20260101T000000", "20260101T000000", "already installed"},
+		{"newer stable", "v1.4.0", "1.3.0", ""},
+		{"older stable (downgrade not gated here)", "v1.2.0", "1.3.0", ""},
+		{"same nightly", "nightly-20260102T000000", "nightly-20260102t000000", "already installed"},
+		{"cross-channel is not a same-version reinstall", "v1.3.0", "testing-20260101T000000", ""},
+		{"unparseable target proceeds", "", "v1.3.0", ""},
+		{"unknown installed version proceeds", "v1.3.0", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := sameVersionInstallErr(tc.target, tc.current)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateDeltaTarget(t *testing.T) {
 	cases := []struct {
 		name     string

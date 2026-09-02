@@ -905,6 +905,18 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		return
 	}
 
+	// Fail early on a same-version full image instead of after the full
+	// artifact write (see sameVersionInstallErr).
+	if current, err := u.getCurrentVersion(); err != nil {
+		u.logger.Printf("Cannot read installed %s version, skipping same-version check: %v", u.config.Component, err)
+	} else if err := sameVersionInstallErr(version.FromFilename(source), current); err != nil {
+		u.logger.Printf("Refusing update from file: %v", err)
+		if err := u.status.SetError(u.ctx, "already-installed", err.Error()); err != nil {
+			u.logger.Printf("Failed to set error status: %v", err)
+		}
+		return
+	}
+
 	u.logger.Printf("File exists: %s", source)
 
 	var version string
@@ -1062,6 +1074,27 @@ func validateDeltaTarget(target, current string) (string, error) {
 		return "", fmt.Errorf("delta target %s not newer than installed", target)
 	}
 	return base, nil
+}
+
+// sameVersionInstallErr reports whether a locally delivered full .mender
+// carries the version that is already running, so the caller can fail before
+// the multi-minute mender write and the reboot / DBC power cycle it would
+// trigger. Deltas are gated by validateDeltaTarget; this is the full-image
+// equivalent. Best-effort by design: an unparseable target, an unknown
+// installed version, or a channel mismatch proceeds — we can't tell, so we
+// don't block (and a cross-channel reinstall may well be intentional).
+func sameVersionInstallErr(target, current string) error {
+	if target == "" {
+		return nil
+	}
+	base := normalizeDeltaBase(current, version.Channel(target))
+	if base == "" {
+		return nil
+	}
+	if version.Compare(strings.ToLower(target), base) == 0 {
+		return fmt.Errorf("%s is already installed", target)
+	}
+	return nil
 }
 
 // handleDeltaFromFileLocked installs a locally delivered .delta file (BLE OTA
