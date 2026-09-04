@@ -7,11 +7,26 @@ import (
 	"os/exec"
 )
 
+// lookPath is exec.LookPath, indirected so tests can control which of the
+// priority wrappers appear to be installed.
+var lookPath = exec.LookPath
+
 // lowPriorityArgs prepends ionice/nice to minimize CPU and IO impact during OTA updates.
+//
+// Both wrappers are optional. They are a courtesy to whatever else the scooter
+// is doing during an update, not a requirement of it, so a rootfs without
+// util-linux runs the command at normal priority instead of failing every
+// delta update with "executable file not found". Falling back also lets the
+// package be exercised off-target, where ionice does not exist at all.
 func lowPriorityArgs(name string, args ...string) (string, []string) {
 	// ionice -c3 = idle IO class, nice -n 19 = lowest CPU priority
-	fullArgs := append([]string{"-c3", "nice", "-n", "19", name}, args...)
-	return "ionice", fullArgs
+	if _, err := lookPath("ionice"); err == nil {
+		return "ionice", append([]string{"-c3", "nice", "-n", "19", name}, args...)
+	}
+	if _, err := lookPath("nice"); err == nil {
+		return "nice", append([]string{"-n", "19", name}, args...)
+	}
+	return name, args
 }
 
 func lowPriorityCommand(name string, args ...string) *exec.Cmd {
