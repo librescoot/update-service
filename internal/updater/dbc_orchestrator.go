@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/librescoot/update-service/internal/config"
+	"github.com/librescoot/update-service/internal/status"
 	"github.com/librescoot/update-service/internal/version"
 )
 
@@ -49,9 +50,14 @@ func (u *Updater) orchestrateDBC(releases []Release) {
 		return
 	}
 
-	// Check if DBC is already updating
+	// Check if DBC is already updating.
+	//
+	// pending-reboot is not such a state: it means the DBC finished installing
+	// and only needs a power cycle to activate, which is exactly what this
+	// function does. Treating it as busy strands the DBC, because it is powered
+	// off in stand-by right after the install and nothing else brings it back.
 	dbcStatus, err := u.redis.GetDBCOTAStatus()
-	if err == nil && dbcStatus != "" && dbcStatus != "idle" {
+	if err == nil && dbcStatusBlocksOrchestration(dbcStatus) {
 		u.logger.Printf("[dbc-orchestrate] DBC already in '%s' state, skipping", dbcStatus)
 		return
 	}
@@ -226,5 +232,22 @@ func (u *Updater) watchDBCActivity() dbcWatchResult {
 				return dbcWatchStarted
 			}
 		}
+	}
+}
+
+// dbcStatusBlocksOrchestration reports whether a DBC OTA status means an update
+// is already under way, so powering the dashboard on would interfere.
+//
+// pending-reboot does not qualify: it means the DBC finished installing and
+// needs only a power cycle to activate, which is exactly what orchestration
+// does. The DBC is powered off in stand-by right after the install, so treating
+// pending-reboot as busy leaves the staged image stranded with nothing to bring
+// it back.
+func dbcStatusBlocksOrchestration(dbcStatus string) bool {
+	switch dbcStatus {
+	case "", string(status.StatusIdle), string(status.StatusPendingReboot):
+		return false
+	default:
+		return true
 	}
 }

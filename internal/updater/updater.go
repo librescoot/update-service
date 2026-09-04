@@ -387,6 +387,20 @@ func (u *Updater) installPendingMenderFile(menderNeedsReboot bool) {
 	}()
 }
 
+// dbcStateIsStaleOnPowerOff reports whether a DBC OTA status left behind when
+// the dashboard powers off is stale and should be cleared by the MDB. See the
+// rationale at the dashboard:power watcher: only the states the DBC's own
+// recoverFromStuckState clears unconditionally qualify. installing and
+// pending-reboot deliberately do not.
+func dbcStateIsStaleOnPowerOff(dbcStatus string) bool {
+	switch dbcStatus {
+	case string(status.StatusDownloading), string(status.StatusPreparing):
+		return true
+	default:
+		return false
+	}
+}
+
 // recoverFromStuckState recovers from any stuck status on startup.
 // The menderNeedsReboot parameter indicates if mender has an update waiting for reboot.
 func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
@@ -637,18 +651,24 @@ func (u *Updater) monitorVehicleState() {
 	// would make the DBC boot into idle and skip that branch. An interrupted
 	// install therefore still self-heals the slow way, when the rider next powers
 	// the scooter on.
+	//
+	// pending-reboot is excluded for the same reason. The DBC is powered off in
+	// stand-by right after a successful install, so seeing it here is the normal
+	// end of an update rather than a stuck state: the image is staged and needs
+	// only the next power-on. recoverFromStuckState handles that on the DBC
+	// itself, keeping the status while mender still needs the reboot and clearing
+	// it (and notifying vehicle-service) once the reboot has happened. Clearing
+	// it from here skips all of that. It was cleared here once, to stop a stuck
+	// pending-reboot from making orchestrateDBC skip the DBC forever; that now
+	// lives where it belongs, in orchestrateDBC not treating pending-reboot as
+	// busy.
 	if u.dbcStatus != nil {
-		staleOnPowerOff := map[string]bool{
-			string(status.StatusDownloading):   true,
-			string(status.StatusPreparing):     true,
-			string(status.StatusPendingReboot): true,
-		}
 		watcher.OnField("dashboard:power", func(power string) error {
 			if power != "off" {
 				return nil
 			}
 			dbcOTA, err := u.redis.GetDBCOTAStatus()
-			if err != nil || !staleOnPowerOff[dbcOTA] {
+			if err != nil || !dbcStateIsStaleOnPowerOff(dbcOTA) {
 				return nil
 			}
 			u.logger.Printf("[dbc-orchestrate] DBC powered off while status=%s; clearing stale state", dbcOTA)
