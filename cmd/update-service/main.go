@@ -158,12 +158,9 @@ func main() {
 		cfg.DownloadStallMinBytes = *downloadStallMinBytes
 	}
 
-	// Refuse to run without a usable channel. This guards custom-nightly and
-	// other off-stream builds from being silently treated as nightly.
 	if !config.IsValidChannel(cfg.Channel) {
-		logger.Fatalf("No update channel configured for %s (installed version: %q). "+
-			"Set settings.updates.%s.channel in Redis or pass --channel.",
-			*component, installedVersion, *component)
+		logger.Printf("No update channel configured for %s (installed version: %q); periodic and check-now requests are disabled, explicit file and URL installs remain available",
+			*component, installedVersion)
 	}
 
 	// Power inhibitor and governor clients ride the same redis-ipc client
@@ -211,7 +208,9 @@ func main() {
 		channelSource = "detected"
 	}
 
-	if cfg.CheckInterval > 0 {
+	if !config.IsValidChannel(cfg.Channel) {
+		logger.Printf("Config: %s has no release channel; explicit installs only", cfg.Component)
+	} else if cfg.CheckInterval > 0 {
 		logger.Printf("Config: %s on %s (%s), check every %v", cfg.Component, cfg.Channel, channelSource, cfg.CheckInterval)
 	} else {
 		logger.Printf("Config: %s on %s (%s), manual checks only", cfg.Component, cfg.Channel, channelSource)

@@ -1768,6 +1768,16 @@ func (u *Updater) NotifyCheckIntervalChanged() {
 // manual is true when the check was requested explicitly (check-now command) rather than by
 // the periodic timer; manual updates skip the 3-minute standby wait before an MDB reboot.
 func (u *Updater) checkForUpdates(manual bool) {
+	if !config.IsValidChannel(u.config.Channel) {
+		u.logger.Printf("Skipping update check for %s: no release channel configured", u.config.Component)
+		if manual {
+			if err := u.status.SetError(u.ctx, "channel-not-configured", "No release channel is configured"); err != nil {
+				u.logger.Printf("Failed to report missing update channel: %v", err)
+			}
+		}
+		return
+	}
+
 	// Prevent concurrent update checks - if an update is already in progress, skip
 	if !u.updateCheckMu.TryLock() {
 		u.logger.Printf("Update check already in progress for %s, skipping duplicate request", u.config.Component)
