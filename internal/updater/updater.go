@@ -1771,6 +1771,11 @@ func (u *Updater) checkForUpdates(manual bool) {
 	if !config.IsValidChannel(u.config.Channel) {
 		u.logger.Printf("Skipping update check for %s: no release channel configured", u.config.Component)
 		if manual {
+			if !u.updateOpMu.TryLock() {
+				u.logger.Printf("Not reporting missing channel while an explicit update operation is active")
+				return
+			}
+			defer u.updateOpMu.Unlock()
 			if err := u.status.SetError(u.ctx, "channel-not-configured", "No release channel is configured"); err != nil {
 				u.logger.Printf("Failed to report missing update channel: %v", err)
 			}

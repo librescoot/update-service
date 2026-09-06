@@ -14,6 +14,19 @@ func TestCheckForUpdatesWithoutChannelReportsManualError(t *testing.T) {
 	}
 }
 
+func TestManualCheckWithoutChannelDoesNotOverwriteActiveOperation(t *testing.T) {
+	u, mr := newTestUpdaterForAbort(t)
+	u.config.Channel = ""
+	u.updateOpMu.Lock()
+	defer u.updateOpMu.Unlock()
+
+	u.checkForUpdates(true)
+
+	if got := mr.HGet("ota", "status:mdb"); got != "" {
+		t.Fatalf("status:mdb = %q, want unchanged", got)
+	}
+}
+
 func TestPeriodicCheckWithoutChannelDoesNotPublishError(t *testing.T) {
 	u, mr := newTestUpdaterForAbort(t)
 	u.config.Channel = ""
