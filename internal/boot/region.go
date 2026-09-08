@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 type regionFile interface {
@@ -87,7 +89,7 @@ func inspectRegion(f regionFile, path string) (uint64, error) {
 		return 0, fmt.Errorf("missing device descriptor")
 	}
 	var capacity uint64
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd.Fd(), 0x80081272, uintptr(unsafe.Pointer(&capacity))) // BLKGETSIZE64
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd.Fd(), uintptr(unix.BLKGETSIZE64), uintptr(unsafe.Pointer(&capacity)))
 	if errno != 0 {
 		return 0, fmt.Errorf("boot region capacity: %w", errno)
 	}

@@ -10,8 +10,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Synthetic imximage v2: SD prefix 0x400, initial load 0x1000, entry
@@ -272,6 +275,21 @@ func TestBootIOFailures(t *testing.T) {
 				t.Fatal("did not re-lock")
 			}
 		})
+	}
+}
+
+func TestBLKGETSIZE64RequestIsArchitectureCorrect(t *testing.T) {
+	var want uintptr
+	switch runtime.GOARCH {
+	case "arm", "386":
+		want = 0x80041272
+	case "amd64", "arm64":
+		want = 0x80081272
+	default:
+		return
+	}
+	if got := uintptr(unix.BLKGETSIZE64); got != want {
+		t.Fatalf("BLKGETSIZE64 request on %s = %#x, want %#x", runtime.GOARCH, got, want)
 	}
 }
 
