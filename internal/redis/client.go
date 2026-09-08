@@ -109,7 +109,18 @@ func (c *Client) WaitForOTAStatus(otaHashKey, statusField, expectedStatus string
 	}
 }
 
-// GetComponentVersion gets the installed version of a component from Redis
+type DBCStateFacts struct {
+	RunningVersion string
+	TargetVersion  string
+	Status         string
+	Origin         string
+}
+
+func (c *Client) SetComponentRunningVersion(component, version string) error {
+	return c.client.HSet(fmt.Sprintf("version:%s", component), "version_id", version)
+}
+
+// GetComponentVersion gets the running version of a component from Redis.
 func (c *Client) GetComponentVersion(component string) (string, error) {
 	versionHash := fmt.Sprintf("version:%s", component)
 	versionID, err := c.client.HGet(versionHash, "version_id")
@@ -249,6 +260,72 @@ func (c *Client) GetLastUpdateCheckTime(component string) (time.Time, error) {
 func (c *Client) HandleUpdateCommands(component string, handler func(string) error) *ipc.QueueHandler[string] {
 	channel := fmt.Sprintf("scooter:update:%s", component)
 	return ipc.HandleRequests(c.client, channel, handler)
+}
+
+func (c *Client) GetDBCStateFacts() (DBCStateFacts, error) {
+	running, err := c.client.HGet("version:dbc", "version_id")
+	if err != nil {
+		running = ""
+	}
+	ota, err := c.client.HGetAll("ota")
+	if err != nil {
+		return DBCStateFacts{}, err
+	}
+	return DBCStateFacts{
+		RunningVersion: running,
+		TargetVersion:  ota["update-version:dbc"],
+		Status:         ota["status:dbc"],
+		Origin:         ota["state-origin:dbc"],
+	}, nil
+}
+
+// RestoreDBCStateFacts conditionally restores one persisted snapshot after
+// Redis loss. The Lua transaction prevents an older cache from overwriting a
+// DBC that starts publishing live state concurrently.
+func (c *Client) RestoreDBCStateFacts(facts DBCStateFacts) (bool, error) {
+	const script = `
+if redis.call('HGET', KEYS[1], 'version_id') then
+  return 0
+end
+if redis.call('HGET', KEYS[2], 'state-origin:dbc') == 'live' then
+  return 0
+end
+if redis.call('HGET', KEYS[2], 'status:dbc') then
+  return 0
+end
+redis.call('HSET', KEYS[1], 'version_id', ARGV[1])
+redis.call('HSET', KEYS[2], 'status:dbc', ARGV[2], 'update-version:dbc', ARGV[3], 'state-origin:dbc', 'cached')
+return 1`
+	result, err := c.client.Do("EVAL", script, 2, "version:dbc", "ota",
+		facts.RunningVersion, facts.Status, facts.TargetVersion)
+	if err != nil {
+		return false, err
+	}
+	return fmt.Sprint(result) == "1", nil
+}
+
+func (c *Client) SetDBCStateOrigin(origin string) error {
+	return c.client.HSet("ota", "state-origin:dbc", origin)
+}
+
+func (c *Client) GetRebootOwner(component string) (string, error) {
+	ota, err := c.client.HGetAll("ota")
+	if err != nil {
+		return "", err
+	}
+	return ota[fmt.Sprintf("reboot-owner:%s", component)], nil
+}
+
+func (c *Client) GetPendingLifecycleCompletion(component string) (string, error) {
+	value, err := c.client.HGet("ota", fmt.Sprintf("completion-pending:%s", component))
+	if err != nil {
+		return "", nil
+	}
+	return value, nil
+}
+
+func (c *Client) SetPendingLifecycleCompletion(component, value string) error {
+	return c.client.HSet("ota", fmt.Sprintf("completion-pending:%s", component), value)
 }
 
 // GetTargetVersion gets the target update version for a component from the OTA hash

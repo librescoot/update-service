@@ -187,7 +187,7 @@ func main() {
 
 	menderNeedsReboot, err := updater.CheckAndCommitPendingUpdate()
 	if err != nil {
-		logger.Printf("Warning: Failed to check/commit pending update: %v", err)
+		logger.Fatalf("Failed to reconcile pending update: %v", err)
 	}
 
 	if err := updater.Start(menderNeedsReboot); err != nil {

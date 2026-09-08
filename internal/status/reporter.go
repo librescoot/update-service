@@ -205,8 +205,20 @@ func (r *Reporter) SetInstalling(ctx context.Context) error {
 }
 
 // SetPendingReboot atomically transitions to pending-reboot status and
-// clears progress fields.
+// clears progress fields. It preserves the target already reported by the
+// active install.
 func (r *Reporter) SetPendingReboot(ctx context.Context) error {
+	return r.setPendingReboot("")
+}
+
+// SetPendingRebootForVersion also reconstructs the target version. Startup
+// recovery uses this after Redis loss, deriving targetVersion from Mender's
+// durable standalone state rather than from a previous Redis value.
+func (r *Reporter) SetPendingRebootForVersion(ctx context.Context, targetVersion string) error {
+	return r.setPendingReboot(targetVersion)
+}
+
+func (r *Reporter) setPendingReboot(targetVersion string) error {
 	m := map[string]any{
 		r.key("status"):            string(StatusPendingReboot),
 		r.key("download-progress"): "",
@@ -214,8 +226,10 @@ func (r *Reporter) SetPendingReboot(ctx context.Context) error {
 		r.key("download-total"):    "",
 		r.key("install-progress"):  "",
 	}
-	err := r.pub.SetMany(m, ipc.Sync())
-	if err != nil {
+	if targetVersion != "" {
+		m[r.key("update-version")] = targetVersion
+	}
+	if err := r.pub.SetMany(m, ipc.Sync()); err != nil {
 		return fmt.Errorf("set pending-reboot for %s: %w", r.component, err)
 	}
 	r.logger.Printf("Set pending-reboot for %s", r.component)

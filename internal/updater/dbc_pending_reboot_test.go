@@ -1,18 +1,83 @@
 package updater
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
 
-// A DBC that finished installing is powered off in stand-by before it can
-// reboot, so pending-reboot is the normal end of an update. It must survive the
-// power-off (the DBC's own recoverFromStuckState acts on it at next boot) and
-// must not stop orchestration from powering the dashboard back on, which is
-// what activates the staged image.
+	"github.com/librescoot/update-service/internal/mender"
+)
+
+// A DBC can still lose power before its local reboot completes. Its durable
+// pending state must survive so MDB orchestration can power it back on and its
+// own startup recovery can resume activation.
 func TestPendingRebootSurvivesDashboardPowerOff(t *testing.T) {
 	if dbcStateIsStaleOnPowerOff("pending-reboot") {
 		t.Error("pending-reboot cleared on power-off: the staged image loses its status and the DBC boots into idle, skipping recoverFromStuckState")
 	}
 	if dbcStatusBlocksOrchestration("pending-reboot") {
 		t.Error("pending-reboot treated as busy: nothing powers the DBC back on, so the staged image is stranded")
+	}
+}
+
+func TestTriggerRebootDBCRunsLocalReboot(t *testing.T) {
+	u, mr := newPendingCommitUpdater(t)
+	u.config.Component = "dbc"
+	u.activationAttempt = filepath.Join(t.TempDir(), "activation")
+	u.bootID = func() (string, error) { return "boot-a", nil }
+	u.observeUpdate = func() (mender.UpdateObservation, error) {
+		return mender.UpdateObservation{PendingArtifact: "release-v1.4.0"}, nil
+	}
+	mr.HSet("vehicle", "state", "stand-by")
+	called := false
+	u.localReboot = func() error {
+		called = true
+		return nil
+	}
+	if err := u.TriggerReboot("dbc", true); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("local DBC reboot was not requested")
+	}
+}
+
+func TestTriggerBootRebootDBCDoesNotRequireMender(t *testing.T) {
+	u, mr := newPendingCommitUpdater(t)
+	u.config.Component = "dbc"
+	mr.HSet("vehicle", "state", "parked")
+	called := false
+	u.localReboot = func() error { called = true; return nil }
+	if err := u.TriggerBootReboot("dbc", true); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("boot-only DBC reboot was not requested")
+	}
+}
+
+func TestTriggerRebootMDBDefersToUMSOwner(t *testing.T) {
+	u, mr := newPendingCommitUpdater(t)
+	mr.HSet("ota", "reboot-owner:mdb", "ums")
+	mr.HSet("vehicle", "state", "stand-by")
+	if err := u.TriggerReboot("mdb", true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := mr.List("scooter:power")
+	if err == nil && len(got) != 0 {
+		t.Fatalf("update-service queued MDB reboot despite UMS ownership: %v", got)
+	}
+}
+
+func TestDBCRebootAllowedState(t *testing.T) {
+	for _, state := range []string{"stand-by", "parked", "shutting-down"} {
+		if !dbcRebootAllowedState(state) {
+			t.Errorf("state %q should allow DBC reboot", state)
+		}
+	}
+	for _, state := range []string{"driving", "ready-to-drive", "", "hibernating"} {
+		if dbcRebootAllowedState(state) {
+			t.Errorf("state %q should not allow DBC reboot", state)
+		}
 	}
 }
 

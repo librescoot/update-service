@@ -108,6 +108,11 @@ func (m *Manager) CommitWithResult() CommitResult {
 	return m.installer.CommitWithResult()
 }
 
+// Resume continues an interrupted standalone Mender state transition.
+func (m *Manager) Resume() error {
+	return m.installer.Resume()
+}
+
 // Rollback rolls back a pending mender update, clearing the standalone-state from LMDB.
 func (m *Manager) Rollback() error {
 	return m.installer.Rollback()
@@ -118,9 +123,24 @@ func (m *Manager) GetCurrentArtifact() (string, error) {
 	return m.installer.GetCurrentArtifact()
 }
 
-// CheckUpdateState checks the current mender update state relative to expected version
+// CheckUpdateState checks the current Mender update state. The expected
+// version argument is retained for compatibility; pending state comes from
+// Mender's durable database rather than Redis.
 func (m *Manager) CheckUpdateState(expectedVersion string) (UpdateState, error) {
 	return m.installer.CheckUpdateState(expectedVersion)
+}
+
+// ObserveUpdate returns Mender's durable committed and pending identities.
+func (m *Manager) ObserveUpdate() (UpdateObservation, error) {
+	return m.installer.ObserveUpdate()
+}
+
+// RunningVersion returns VERSION_ID from the active root filesystem. Unlike
+// runningVersion, it does not fall back to Mender's committed artifact: callers
+// use this for commit verification, where confusing committed with running
+// would accept a rolled-back or otherwise wrong slot.
+func (m *Manager) RunningVersion() (string, error) {
+	return m.osReleaseVersion()
 }
 
 // GetDownloadDir returns the download directory path

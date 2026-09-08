@@ -18,25 +18,62 @@ type UpdateState int
 
 const (
 	StateNoUpdate     UpdateState = iota
-	StateCommitted                // Expected artifact is active and committed.
+	StateCommitted                // The expected artifact is active and committed.
 	StateNeedsReboot              // Install succeeded in the inactive partition.
-	StateNeedsCommit              // Booted into the new partition; Mender must commit it.
+	StateNeedsCommit              // Commit-enter state; running rootfs determines whether reboot happened.
+	StateNeedsResume              // Interrupted Mender transition must be resumed.
 	StateInconsistent             // Mender marked the artifact failed; do not continue normally.
 )
+
+// UpdateObservation separates the durable facts Mender records. In particular,
+// CommittedArtifact and PendingArtifact legitimately name different releases
+// between install and commit.
+type UpdateObservation struct {
+	State             UpdateState
+	CommittedArtifact string
+	CommittedVersion  string
+	PendingArtifact   string
+	PendingVersion    string
+	MenderState       string
+}
+
+// VersionFromArtifact converts this project's Mender artifact names to the
+// VERSION_ID written into /etc/os-release. Keep the raw artifact beside this
+// value whenever exact identity matters.
+func VersionFromArtifact(artifact string) string {
+	artifact = strings.TrimSuffix(artifact, "_INCONSISTENT")
+	artifact = strings.TrimPrefix(artifact, "release-")
+	return strings.TrimSuffix(artifact, "-minimal")
+}
 
 type Installer struct {
 	logger *log.Logger
 
-	// menderConfPaths and deviceSize let tests drive the fit check against a
-	// temp dir. Nil means the production defaults.
+	// menderConfPaths, deviceSize and readStatus let tests drive hardware and
+	// Mender observations. Nil means the production defaults.
 	menderConfPaths []string
 	deviceSize      func(string) (int64, error)
+	readStatus      func() (*menderstatus.Status, error)
 }
 
 func NewInstaller(logger *log.Logger) *Installer {
 	return &Installer{
 		logger: logger,
 	}
+}
+
+// Resume asks Mender to continue an interrupted standalone transition.
+func (i *Installer) Resume() error {
+	i.logger.Printf("Resuming mender update")
+	cmd := exec.Command("mender-update", "resume")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("mender-update resume failed: %w, stderr: %s", err, stderr.String())
+	}
+	i.logger.Printf("mender-update resume output: %s", stdout.String())
+	return nil
 }
 
 // Rollback asks Mender to discard the pending standalone update state.
@@ -180,43 +217,76 @@ func (i *Installer) GetCurrentArtifact() (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-// CheckUpdateState interprets Mender's LMDB standalone state relative to expectedVersion.
-func (i *Installer) CheckUpdateState(expectedVersion string) (UpdateState, error) {
+func readDefaultStatus() (*menderstatus.Status, error) {
 	reader, err := menderstatus.NewReaderDefault()
 	if err != nil {
-		return StateNoUpdate, fmt.Errorf("failed to create mender status reader: %w", err)
+		return nil, fmt.Errorf("failed to create mender status reader: %w", err)
 	}
-
 	status, err := reader.ReadStatus()
 	if err != nil {
-		return StateNoUpdate, fmt.Errorf("failed to read mender status: %w", err)
+		return nil, fmt.Errorf("failed to read mender status: %w", err)
+	}
+	return status, nil
+}
+
+// ObserveUpdate reads Mender's durable committed and standalone state. It does
+// not consult Redis: Redis is deliberately volatile and can be reconstructed
+// from this observation after a reboot.
+func (i *Installer) ObserveUpdate() (UpdateObservation, error) {
+	readStatus := i.readStatus
+	if readStatus == nil {
+		readStatus = readDefaultStatus
+	}
+	status, err := readStatus()
+	if err != nil {
+		return UpdateObservation{}, err
+	}
+	return observeStatus(status), nil
+}
+
+func observeStatus(status *menderstatus.Status) UpdateObservation {
+	observation := UpdateObservation{
+		State:             StateNoUpdate,
+		CommittedArtifact: status.CommittedArtifact,
+		CommittedVersion:  VersionFromArtifact(status.CommittedArtifact),
 	}
 
-	committedArtifact := status.CommittedArtifact
-
-	if strings.HasSuffix(committedArtifact, "_INCONSISTENT") {
-		i.logger.Printf("Mender: INCONSISTENT state (%s)", committedArtifact)
-		return StateInconsistent, nil
+	if strings.HasSuffix(status.CommittedArtifact, "_INCONSISTENT") {
+		observation.State = StateInconsistent
+		return observation
+	}
+	if !status.UpdateInProgress || status.State == nil {
+		return observation
 	}
 
-	if status.UpdateInProgress {
-		if status.State.Failed {
-			i.logger.Printf("Mender: update failed (state=%s)", status.State.InState)
-			return StateInconsistent, nil
-		}
-		if status.NeedsCommit() {
-			i.logger.Printf("Mender: pending commit for %s", status.State.ArtifactName)
-			return StateNeedsCommit, nil
-		}
-		i.logger.Printf("Mender: reboot pending for %s (state=%s)", status.State.ArtifactName, status.State.InState)
-		return StateNeedsReboot, nil
-	}
+	observation.PendingArtifact = status.State.ArtifactName
+	observation.PendingVersion = VersionFromArtifact(status.State.ArtifactName)
+	observation.MenderState = status.State.InState
 
-	if expectedVersion != "" && committedArtifact == expectedVersion {
-		i.logger.Printf("Mender: running %s (expected)", committedArtifact)
+	switch {
+	case status.NeedsCommit() && !status.State.Failed:
+		observation.State = StateNeedsCommit
+	default:
+		// Cleanup, rollback, failure handling, and interrupted install states
+		// are all advanced by `mender-update resume`. Failed is not terminal
+		// while standalone-state still exists; resume removes it or records the
+		// final committed artifact (including _INCONSISTENT when unrecoverable).
+		observation.State = StateNeedsResume
+	}
+	return observation
+}
+
+// CheckUpdateState remains as a compatibility wrapper for callers that only
+// need the coarse state. expectedVersion is intentionally ignored; Mender's
+// LMDB is authoritative for pending-update state.
+func (i *Installer) CheckUpdateState(expectedVersion string) (UpdateState, error) {
+	observation, err := i.ObserveUpdate()
+	if err != nil {
+		return StateNoUpdate, err
+	}
+	if observation.State == StateNoUpdate && expectedVersion != "" &&
+		observation.CommittedVersion == VersionFromArtifact(expectedVersion) {
 		return StateCommitted, nil
 	}
-
-	i.logger.Printf("Mender: running %s, no update pending", committedArtifact)
-	return StateNoUpdate, nil
+	return observation.State, nil
 }

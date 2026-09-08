@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/librescoot/update-service/internal/backoff"
 	"github.com/librescoot/update-service/internal/boot"
 	"github.com/librescoot/update-service/internal/config"
+	"github.com/librescoot/update-service/internal/dbcstate"
 	"github.com/librescoot/update-service/internal/inhibitor"
 	"github.com/librescoot/update-service/internal/mender"
 	"github.com/librescoot/update-service/internal/power"
@@ -30,25 +32,33 @@ type dbcInstallGuard interface {
 
 // Updater represents the component-aware update orchestrator
 type Updater struct {
-	config           *config.Config
-	redis            *redis.Client // Client from internal/redis
-	inhibitor        *inhibitor.Client
-	power            *power.Client
-	mender           *mender.Manager
-	installArtifact  func(string, mender.InstallProgressCallback) error
-	dbcInstallGuard  dbcInstallGuard
-	backoff          *backoff.Store
-	status           *status.Reporter
-	bootUpdater      *boot.BootUpdater  // nil if --boot-update not set
-	bootStatus       *status.Reporter   // reporter for "{component}-boot" keys
-	dbcStatus        *status.Reporter   // reporter for "dbc" keys (MDB-only, for clearing stale DBC state)
-	flatMirror       *status.FlatMirror // mirrors mdb+dbc status into the flat pair (MDB-only)
-	githubAPI        *GitHubAPI
-	logger           *log.Logger
-	ctx              context.Context
-	cancel           context.CancelFunc
-	standbyMu        sync.RWMutex
-	standbyStartTime time.Time // Tracks when vehicle entered standby state
+	config            *config.Config
+	redis             *redis.Client // Client from internal/redis
+	inhibitor         *inhibitor.Client
+	power             *power.Client
+	mender            *mender.Manager
+	observeUpdate     func() (mender.UpdateObservation, error)
+	runningVersion    func() (string, error)
+	commitUpdate      func() error
+	resumeUpdate      func() error
+	installArtifact   func(string, mender.InstallProgressCallback) error
+	dbcInstallGuard   dbcInstallGuard
+	localReboot       func() error
+	dbcStateCache     string
+	activationAttempt string
+	bootID            func() (string, error)
+	backoff           *backoff.Store
+	status            *status.Reporter
+	bootUpdater       *boot.BootUpdater  // nil if --boot-update not set
+	bootStatus        *status.Reporter   // reporter for "{component}-boot" keys
+	dbcStatus         *status.Reporter   // reporter for "dbc" keys (MDB-only, for clearing stale DBC state)
+	flatMirror        *status.FlatMirror // mirrors mdb+dbc status into the flat pair (MDB-only)
+	githubAPI         *GitHubAPI
+	logger            *log.Logger
+	ctx               context.Context
+	cancel            context.CancelFunc
+	standbyMu         sync.RWMutex
+	standbyStartTime  time.Time // Tracks when vehicle entered standby state
 
 	// Update method configuration
 	updateMethodMu sync.RWMutex
@@ -156,13 +166,26 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 	}, logger)
 
 	u := &Updater{
-		config:               cfg,
-		redis:                redisClient,
-		inhibitor:            inhibitorClient,
-		power:                powerClient,
-		mender:               manager,
-		installArtifact:      manager.Install,
-		dbcInstallGuard:      inhibitorClient,
+		config:          cfg,
+		redis:           redisClient,
+		inhibitor:       inhibitorClient,
+		power:           powerClient,
+		mender:          manager,
+		observeUpdate:   manager.ObserveUpdate,
+		runningVersion:  manager.RunningVersion,
+		commitUpdate:    manager.Commit,
+		resumeUpdate:    manager.Resume,
+		installArtifact: manager.Install,
+		dbcInstallGuard: inhibitorClient,
+		localReboot: func() error {
+			return exec.Command("systemctl", "reboot").Run()
+		},
+		dbcStateCache:     dbcstate.DefaultPath,
+		activationAttempt: dbcstate.DefaultActivationAttempt,
+		bootID: func() (string, error) {
+			data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+			return strings.TrimSpace(string(data)), err
+		},
 		backoff:              backoff.NewStore(downloadDir, logger),
 		status:               statusReporter,
 		bootUpdater:          bootUpdater,
@@ -193,48 +216,381 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 	return u
 }
 
-// CheckAndCommitPendingUpdate checks mender state and commits if needed.
-// Returns true if an update is installed but waiting for reboot.
+// CheckAndCommitPendingUpdate reconstructs pending state from Mender, verifies
+// that the pending artifact is actually running, commits it, then verifies the
+// durable Mender state again. Redis is an output of this reconciliation, not
+// its source of truth.
 func (u *Updater) CheckAndCommitPendingUpdate() (needsReboot bool, err error) {
-	// Get expected version from Redis (set during download/install)
-	expectedVersion, _ := u.redis.GetTargetVersion(u.config.Component)
+	return u.checkAndCommitPendingUpdate("")
+}
 
-	state, err := u.mender.CheckUpdateState(expectedVersion)
+func (u *Updater) checkAndCommitPendingUpdate(expectedArtifact string) (needsReboot bool, err error) {
+	observation, err := u.observeUpdate()
 	if err != nil {
-		u.logger.Printf("Failed to check mender state: %v", err)
-		return false, nil // Don't fail startup
+		return false, fmt.Errorf("observe Mender state: %w", err)
 	}
 
-	switch state {
-	case mender.StateNeedsCommit:
-		// We've rebooted into the new partition - commit it
-		u.logger.Printf("Committing pending update")
-		if err := u.mender.Commit(); err != nil {
-			u.logger.Printf("Failed to commit update: %v", err)
+	if expectedArtifact != "" && observation.PendingArtifact != "" && observation.PendingArtifact != expectedArtifact {
+		return false, u.pendingCommitError(fmt.Errorf(
+			"Mender pending artifact changed from %q to %q during recovery", expectedArtifact, observation.PendingArtifact))
+	}
+
+	if observation.PendingVersion != "" {
+		if err := u.status.SetPendingRebootForVersion(u.ctx, observation.PendingVersion); err != nil {
 			return false, err
 		}
-		u.logger.Printf("Update committed successfully")
-		return false, nil
+		if u.config.Component == "dbc" {
+			if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+				return false, fmt.Errorf("restore DBC update lifecycle: %w", err)
+			}
+		}
+	}
 
+	switch observation.State {
 	case mender.StateNeedsReboot:
-		// Update installed but not yet rebooted
+		u.logger.Printf("Mender has %s installed and waiting for reboot", observation.PendingArtifact)
 		return true, nil
 
-	case mender.StateInconsistent:
-		u.logger.Printf("Mender in inconsistent state, attempting rollback to clean up")
-		if err := u.mender.Rollback(); err != nil {
-			u.logger.Printf("Rollback failed: %v (may need manual intervention)", err)
+	case mender.StateNeedsCommit:
+		runningVersion, err := u.runningVersion()
+		if err != nil {
+			return false, u.pendingCommitError(fmt.Errorf("read running version: %w", err))
 		}
+		if !sameObservedVersion(runningVersion, observation.PendingVersion) {
+			// Mender enters Before_ArtifactCommit_Enter before reboot as well as
+			// after it. Seeing the still-committed rootfs means the reboot request
+			// was interrupted; it is not a failed activation yet.
+			if sameObservedVersion(runningVersion, observation.CommittedVersion) {
+				if u.config.Component == "dbc" {
+					attempted, err := dbcstate.LoadActivationAttempt(u.activationAttempt)
+					if err == nil && attempted.Artifact == observation.PendingArtifact {
+						bootID, bootErr := u.bootID()
+						if bootErr != nil {
+							return false, u.pendingCommitError(fmt.Errorf("read current boot ID: %w", bootErr))
+						}
+						if attempted.BootID != bootID {
+							return false, u.pendingCommitError(fmt.Errorf(
+								"DBC activation of %s returned to committed version %s",
+								observation.PendingArtifact, runningVersion))
+						}
+						// The reboot request was never completed. Clear the same-boot
+						// marker and safely retry it instead of declaring rollback.
+						if err := dbcstate.ClearActivationAttempt(u.activationAttempt); err != nil {
+							return false, u.pendingCommitError(fmt.Errorf("clear unperformed activation attempt: %w", err))
+						}
+					}
+					if err != nil && !errors.Is(err, os.ErrNotExist) {
+						return false, u.pendingCommitError(fmt.Errorf("read DBC activation attempt: %w", err))
+					}
+				}
+				u.logger.Printf("Pending artifact %s is not active yet; reboot still required", observation.PendingArtifact)
+				return true, nil
+			}
+			return false, u.pendingCommitError(fmt.Errorf(
+				"refusing to commit: running version %q matches neither pending %q nor committed %q",
+				runningVersion, observation.PendingVersion, observation.CommittedVersion))
+		}
+
+		u.logger.Printf("Verified running version %s; committing %s", runningVersion, observation.PendingArtifact)
+		if err := u.commitUpdate(); err != nil {
+			return false, u.pendingCommitError(fmt.Errorf("commit pending update: %w", err))
+		}
+
+		verified, err := u.observeUpdate()
+		if err != nil {
+			return false, u.pendingCommitError(fmt.Errorf("verify committed Mender state: %w", err))
+		}
+		if verified.State != mender.StateNoUpdate || verified.PendingArtifact != "" ||
+			verified.CommittedArtifact != observation.PendingArtifact {
+			return false, u.pendingCommitError(fmt.Errorf(
+				"commit verification failed: pending=%q committed=%q state=%d",
+				verified.PendingArtifact, verified.CommittedArtifact, verified.State))
+		}
+
+		if err := u.finishVerifiedUpdate(verified.CommittedArtifact); err != nil {
+			return false, err
+		}
+		u.logger.Printf("Update %s committed and verified", verified.CommittedArtifact)
 		return false, nil
 
-	default:
+	case mender.StateNeedsResume:
+		before := observation
+		if err := u.resumeUpdate(); err != nil {
+			return false, u.pendingCommitError(fmt.Errorf("resume Mender state %s: %w", observation.MenderState, err))
+		}
+		after, err := u.observeUpdate()
+		if err != nil {
+			return false, u.pendingCommitError(fmt.Errorf("observe resumed Mender state: %w", err))
+		}
+		if after.State == before.State && after.MenderState == before.MenderState &&
+			after.PendingArtifact == before.PendingArtifact {
+			return false, u.pendingCommitError(fmt.Errorf("Mender resume made no progress from %s", before.MenderState))
+		}
+		return u.checkAndCommitPendingUpdate(before.PendingArtifact)
+
+	case mender.StateInconsistent:
+		return false, u.pendingCommitError(fmt.Errorf("Mender reports an inconsistent update state"))
+	}
+
+	if expectedArtifact != "" {
+		if observation.CommittedArtifact != expectedArtifact {
+			return false, u.pendingCommitError(fmt.Errorf(
+				"Mender resumed %q but committed artifact is %q", expectedArtifact, observation.CommittedArtifact))
+		}
+		running, err := u.runningVersion()
+		if err != nil || !sameObservedVersion(running, observation.CommittedVersion) {
+			return false, u.pendingCommitError(fmt.Errorf(
+				"resumed artifact %q is not verified running (running=%q committed=%q err=%v)",
+				expectedArtifact, running, observation.CommittedVersion, err))
+		}
+		if err := u.finishVerifiedUpdate(observation.CommittedArtifact); err != nil {
+			return false, err
+		}
 		return false, nil
+	}
+
+	// A cache restored while this DBC was off is observational only. Once the
+	// live DBC proves there is no standalone update, replace it with idle rather
+	// than interpreting the cached target as a lifecycle to complete.
+	if u.config.Component == "dbc" {
+		facts, _ := u.redis.GetDBCStateFacts()
+		if facts.Origin == "cached" {
+			if err := u.status.SetIdle(u.ctx); err != nil {
+				return false, err
+			}
+			if err := u.redis.SetDBCStateOrigin("live"); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+	}
+
+	// Retry the small completion gap after a verified commit. The marker is
+	// retained until complete-dbc is accepted, even though status is already
+	// idle and the ordinary update target has been cleared.
+	if u.config.Component == "dbc" {
+		pendingCompletion, _ := u.redis.GetPendingLifecycleCompletion("dbc")
+		if pendingCompletion != "" {
+			if pendingCompletion != observation.CommittedArtifact {
+				return false, u.pendingCommitError(fmt.Errorf(
+					"pending DBC lifecycle completion %q does not match committed artifact %q",
+					pendingCompletion, observation.CommittedArtifact))
+			}
+			return false, u.finishVerifiedUpdate(observation.CommittedArtifact)
+		}
+	}
+
+	// Complete a lifecycle interrupted after Mender committed but before Redis
+	// was cleared. Unlike the old generic stuck-state cleanup, fail closed when
+	// committed identity does not corroborate the pending target.
+	expectedVersion, _ := u.redis.GetTargetVersion(u.config.Component)
+	currentStatus, _ := u.status.GetStatus(u.ctx)
+	otaData, _ := u.redis.GetOTAStatus("ota")
+	recoveryError := currentStatus == status.StatusError &&
+		otaData[fmt.Sprintf("error:%s", u.config.Component)] == "recovery-failed"
+	if currentStatus == status.StatusPendingReboot || recoveryError {
+		if expectedVersion == "" || !sameObservedVersion(expectedVersion, observation.CommittedVersion) {
+			return false, u.pendingCommitError(fmt.Errorf(
+				"pending target %q does not match committed version %q",
+				expectedVersion, observation.CommittedVersion))
+		}
+		if err := u.finishVerifiedUpdate(observation.CommittedArtifact); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func sameObservedVersion(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+func (u *Updater) pendingCommitError(err error) error {
+	if statusErr := u.status.SetError(u.ctx, "recovery-failed", err.Error()); statusErr != nil {
+		u.logger.Printf("Also failed to publish recovery error: %v", statusErr)
+	}
+	return err
+}
+
+func (u *Updater) finishVerifiedUpdate(committedArtifact string) error {
+	if u.config.Component == "dbc" {
+		if err := u.redis.SetPendingLifecycleCompletion("dbc", committedArtifact); err != nil {
+			return fmt.Errorf("persist DBC lifecycle completion: %w", err)
+		}
+	}
+	if err := u.status.SetIdle(u.ctx); err != nil {
+		return fmt.Errorf("publish committed update: %w", err)
+	}
+	if u.config.Component != "dbc" {
+		return nil
+	}
+	if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+		return fmt.Errorf("complete DBC update lifecycle: %w", err)
+	}
+	if err := dbcstate.ClearActivationAttempt(u.activationAttempt); err != nil {
+		return fmt.Errorf("clear DBC activation attempt: %w", err)
+	}
+	if err := u.redis.SetPendingLifecycleCompletion("dbc", ""); err != nil {
+		return fmt.Errorf("clear DBC lifecycle completion: %w", err)
+	}
+	return nil
+}
+
+// completeDBCLifecycleIfSafe releases the MDB-owned lifecycle only when the
+// operation failed before Mender staged anything. Once a standalone update
+// exists, the hold must span the DBC reboot and is released by verified startup
+// commit recovery.
+func (u *Updater) completeDBCLifecycleIfSafe() {
+	observation, err := u.observeUpdate()
+	if err != nil {
+		u.logger.Printf("Retaining DBC update lifecycle: cannot observe Mender state: %v", err)
+		return
+	}
+	if observation.PendingArtifact != "" {
+		u.logger.Printf("Retaining DBC update lifecycle across reboot for %s", observation.PendingArtifact)
+		return
+	}
+	u.logger.Printf("Completing DBC update lifecycle (nothing staged)")
+	if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+		u.logger.Printf("Failed to send complete-dbc command: %v", err)
+	}
+}
+
+func stableDBCStatus(value string) bool {
+	switch value {
+	case "idle", "pending-reboot", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+func (u *Updater) restoreDBCStateCache() {
+	existing, err := u.redis.GetDBCStateFacts()
+	if err == nil && existing.RunningVersion != "" {
+		return
+	}
+	snapshot, err := dbcstate.Load(u.dbcStateCache)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			u.logger.Printf("Cannot restore DBC state cache: %v", err)
+		}
+		return
+	}
+	facts := redis.DBCStateFacts{
+		RunningVersion: snapshot.RunningVersion,
+		TargetVersion:  snapshot.TargetVersion,
+		Status:         snapshot.Status,
+	}
+	restored, err := u.redis.RestoreDBCStateFacts(facts)
+	if err != nil {
+		u.logger.Printf("Cannot restore DBC state cache into Redis: %v", err)
+		return
+	}
+	if restored {
+		u.logger.Printf("Restored cached DBC state (running=%s status=%s)", snapshot.RunningVersion, snapshot.Status)
+	}
+}
+
+func (u *Updater) monitorDBCStateCache() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		facts, err := u.redis.GetDBCStateFacts()
+		if err == nil && facts.RunningVersion == "" {
+			u.restoreDBCStateCache()
+		} else {
+			u.persistDBCStateCache()
+		}
+		select {
+		case <-u.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (u *Updater) persistDBCStateCache() {
+	facts, err := u.redis.GetDBCStateFacts()
+	if err != nil || facts.Origin == "cached" || facts.RunningVersion == "" || !stableDBCStatus(facts.Status) {
+		return
+	}
+	// Avoid wearing persistent storage and falsely refreshing ObservedAt while
+	// the DBC is powered off and its last live Redis values remain unchanged.
+	if old, err := dbcstate.Load(u.dbcStateCache); err == nil &&
+		old.RunningVersion == facts.RunningVersion && old.TargetVersion == facts.TargetVersion && old.Status == facts.Status {
+		return
+	}
+	snapshot := dbcstate.Snapshot{
+		RunningVersion: facts.RunningVersion,
+		TargetVersion:  facts.TargetVersion,
+		Status:         facts.Status,
+		ObservedAt:     time.Now().UTC(),
+	}
+	if err := dbcstate.Save(u.dbcStateCache, snapshot); err != nil {
+		u.logger.Printf("Cannot persist DBC state cache: %v", err)
+	}
+}
+
+func (u *Updater) publishLocalDurableState() {
+	ota, _ := u.redis.GetOTAStatus("ota")
+	rawStatus := ota[fmt.Sprintf("status:%s", u.config.Component)]
+	wasCached := u.config.Component == "dbc" && ota["state-origin:dbc"] == "cached"
+
+	running, err := u.runningVersion()
+	if err == nil && running != "" {
+		if err := u.redis.SetComponentRunningVersion(u.config.Component, running); err != nil {
+			u.logger.Printf("Cannot republish running version: %v", err)
+		}
+	}
+
+	observation, err := u.observeUpdate()
+	if err == nil {
+		switch observation.State {
+		case mender.StateNeedsCommit:
+			// Commit-enter is the only stable standalone phase that means the
+			// payload is installed. Other phases must be resumed, not advertised
+			// to UMS as reboot-ready.
+			if observation.PendingVersion != "" && (rawStatus == "" || rawStatus == string(status.StatusIdle) || wasCached) {
+				if err := u.status.SetPendingRebootForVersion(u.ctx, observation.PendingVersion); err != nil {
+					u.logger.Printf("Cannot reconstruct pending update state: %v", err)
+				}
+			}
+		case mender.StateNoUpdate:
+			if rawStatus == "" || wasCached {
+				if err := u.status.SetIdle(u.ctx); err != nil {
+					u.logger.Printf("Cannot reconstruct idle update state: %v", err)
+				}
+			}
+		}
+	}
+	if u.config.Component == "dbc" {
+		if err := u.redis.SetDBCStateOrigin("live"); err != nil {
+			u.logger.Printf("Cannot mark DBC state live: %v", err)
+		}
+	}
+}
+
+func (u *Updater) monitorLocalDurableState() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		u.publishLocalDurableState()
+		select {
+		case <-u.ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
 // Start starts the updater. The menderNeedsReboot parameter indicates if
 // CheckAndCommitPendingUpdate detected that mender has an update waiting for reboot.
 func (u *Updater) Start(menderNeedsReboot bool) error {
+	if u.config.Component == "mdb" {
+		u.restoreDBCStateCache()
+	}
+
 	// Clean up stale temp files from previous runs (killed mid-update etc.)
 	if err := u.cleanupDeltaTempDirs(); err != nil {
 		u.logger.Printf("Warning: Failed to cleanup stale temp dirs: %v", err)
@@ -307,6 +663,29 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 
 	// Start the update check loop
 	go u.updateCheckLoop()
+	go u.monitorLocalDurableState()
+	if u.config.Component == "mdb" {
+		go u.monitorDBCStateCache()
+	}
+
+	// A process crash can occur after Mender records the inactive slot but
+	// before the original reboot request. Recover that gap on the DBC without
+	// asking the MDB to cycle dashboard power.
+	if menderNeedsReboot && u.config.Component == "dbc" && !u.config.DryRun {
+		u.wg.Add(1)
+		go func() {
+			defer u.wg.Done()
+			defer u.startHeartbeat()()
+			select {
+			case <-u.ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+			if err := u.TriggerReboot("dbc", false); err != nil {
+				u.pendingCommitError(fmt.Errorf("recover pending DBC reboot: %w", err))
+			}
+		}()
+	}
 
 	return nil
 }
@@ -981,12 +1360,7 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
 			u.logger.Printf("Failed to send start-dbc command: %v", err)
 		}
-		defer func() {
-			u.logger.Printf("DBC file update cleanup - sending complete-dbc command")
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("Failed to send complete-dbc command: %v", err)
-			}
-		}()
+		defer u.completeDBCLifecycleIfSafe()
 	}
 
 	if checksum != "" {
@@ -1171,12 +1545,7 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
 			u.logger.Printf("Failed to send start-dbc command: %v", err)
 		}
-		defer func() {
-			u.logger.Printf("DBC delta update cleanup - sending complete-dbc command")
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("Failed to send complete-dbc command: %v", err)
-			}
-		}()
+		defer u.completeDBCLifecycleIfSafe()
 	}
 
 	if checksum != "" {
@@ -1301,12 +1670,7 @@ func (u *Updater) handleUpdateFromURL(url string) {
 		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
 			u.logger.Printf("Failed to send start-dbc command: %v", err)
 		}
-		defer func() {
-			u.logger.Printf("DBC URL update finished - sending complete-dbc command")
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("Failed to send complete-dbc command: %v", err)
-			}
-		}()
+		defer u.completeDBCLifecycleIfSafe()
 	}
 
 	// Add download inhibit (MDB only, vehicle-service handles DBC power)
@@ -2209,13 +2573,8 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string, manual b
 				u.logger.Printf("Failed to remove install inhibit: %v", err)
 			}
 		}
-
-		// For DBC updates, notify vehicle-service that update is complete
 		if u.config.Component == "dbc" {
-			u.logger.Printf("DBC update cleanup - sending complete-dbc command")
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("Failed to send complete-dbc command: %v", err)
-			}
+			u.completeDBCLifecycleIfSafe()
 		}
 	}()
 
@@ -2552,13 +2911,8 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 				u.logger.Printf("Failed to remove install inhibit: %v", err)
 			}
 		}
-
-		// For DBC updates, notify vehicle-service that update is complete
 		if u.config.Component == "dbc" {
-			u.logger.Printf("DBC update cleanup - sending complete-dbc command")
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("Failed to send complete-dbc command: %v", err)
-			}
+			u.completeDBCLifecycleIfSafe()
 		}
 	}()
 
@@ -2936,6 +3290,35 @@ func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, reason str
 	}
 }
 
+const umsMDBRebootOwnerPath = "/run/librescoot/ums-mdb-reboot-owner"
+
+func (u *Updater) triggerMDBRebootIfUnowned() error {
+	if _, err := os.Stat(umsMDBRebootOwnerPath); err == nil {
+		u.logger.Printf("MDB reboot is owned by UMS (local claim); leaving update pending")
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read local MDB reboot owner: %w", err)
+	}
+	owner, err := u.redis.GetRebootOwner("mdb")
+	if err != nil {
+		return fmt.Errorf("read MDB reboot owner: %w", err)
+	}
+	if owner == "ums" {
+		u.logger.Printf("MDB reboot is owned by UMS; leaving update pending")
+		return nil
+	}
+	return u.redis.TriggerReboot()
+}
+
+func dbcRebootAllowedState(state string) bool {
+	switch state {
+	case "stand-by", "parked", "shutting-down":
+		return true
+	default:
+		return false
+	}
+}
+
 // TriggerReboot triggers a reboot or restart of the specified component.
 // manual marks updates that were requested explicitly (check-now,
 // update-from-file/url, local boot assets) rather than found by the periodic
@@ -2949,6 +3332,14 @@ func (u *Updater) TriggerReboot(component string, manual bool) error {
 
 	switch component {
 	case "mdb":
+		owner, err := u.redis.GetRebootOwner("mdb")
+		if err != nil {
+			return fmt.Errorf("read MDB reboot owner: %w", err)
+		}
+		if owner == "ums" {
+			u.logger.Printf("MDB reboot is owned by UMS; leaving update pending")
+			return nil
+		}
 		requiredStandbyDuration := 3 * time.Minute
 		const safetyBuffer = 5 * time.Second
 
@@ -2974,7 +3365,7 @@ func (u *Updater) TriggerReboot(component string, manual bool) error {
 				}
 				u.logger.Printf("Vehicle in 'stand-by' for %v (since %s). Proceeding with MDB reboot immediately.", durationInStandby, standbyStart.Format(time.RFC3339))
 				u.logger.Printf("Triggering MDB reboot via Redis command")
-				return u.redis.TriggerReboot()
+				return u.triggerMDBRebootIfUnowned()
 			}
 
 			// Calculate exact remaining time plus safety buffer
@@ -2998,7 +3389,7 @@ func (u *Updater) TriggerReboot(component string, manual bool) error {
 				totalDuration := time.Since(standbyStart)
 				u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", totalDuration, standbyStart.Format(time.RFC3339))
 				u.logger.Printf("Triggering MDB reboot via Redis command")
-				return u.redis.TriggerReboot()
+				return u.triggerMDBRebootIfUnowned()
 			}
 		}
 
@@ -3007,14 +3398,72 @@ func (u *Updater) TriggerReboot(component string, manual bool) error {
 		return u.waitForStandbyWithSubscription(requiredStandbyDuration)
 
 	case "dbc":
-		u.logger.Printf("DBC update installed. Will apply on next power cycle.")
-		// For DBC, we don't actively reboot - it will apply the update on next power-on
-		// Status remains "pending-reboot" and will be cleared on next service startup
-		return nil
+		return u.triggerDBCLocalReboot(true)
 
 	default:
 		return fmt.Errorf("unknown component for reboot: %s", component)
 	}
+}
+
+// TriggerBootReboot activates boot-assets-only updates. DBC boot updates use
+// the same vehicle-state safety gate as rootfs updates but intentionally do not
+// require or create a Mender activation marker.
+func (u *Updater) TriggerBootReboot(component string, manual bool) error {
+	if component != "dbc" {
+		return u.TriggerReboot(component, manual)
+	}
+	if u.config.DryRun {
+		return fmt.Errorf("DRY-RUN: Would reboot/restart %s", component)
+	}
+	return u.triggerDBCLocalReboot(false)
+}
+
+func (u *Updater) triggerDBCLocalReboot(requireMender bool) error {
+	for {
+		state, err := u.redis.GetVehicleState(config.VehicleHashKey)
+		if err == nil && dbcRebootAllowedState(state) {
+			break
+		}
+		if err != nil {
+			u.logger.Printf("Cannot read vehicle state before DBC reboot: %v", err)
+		} else {
+			u.logger.Printf("Deferring DBC reboot while vehicle state is %q", state)
+		}
+		select {
+		case <-u.ctx.Done():
+			return u.ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+
+	if requireMender {
+		observation, err := u.observeUpdate()
+		if err != nil {
+			return fmt.Errorf("observe pending DBC update before reboot: %w", err)
+		}
+		if observation.PendingArtifact == "" {
+			return fmt.Errorf("refusing DBC rootfs reboot without a pending Mender artifact")
+		}
+		bootID, err := u.bootID()
+		if err != nil {
+			return fmt.Errorf("read DBC boot ID: %w", err)
+		}
+		attempt := dbcstate.ActivationAttempt{Artifact: observation.PendingArtifact, BootID: bootID}
+		if err := dbcstate.SaveActivationAttempt(u.activationAttempt, attempt); err != nil {
+			return fmt.Errorf("persist DBC activation attempt: %w", err)
+		}
+	}
+
+	u.logger.Printf("Rebooting DBC locally to activate installed changes")
+	if err := u.localReboot(); err != nil {
+		if requireMender {
+			if clearErr := dbcstate.ClearActivationAttempt(u.activationAttempt); clearErr != nil {
+				u.logger.Printf("Failed to clear rejected DBC activation marker: %v", clearErr)
+			}
+		}
+		return fmt.Errorf("reboot DBC locally: %w", err)
+	}
+	return nil
 }
 
 // waitForStandbyWithSubscription waits until the vehicle has been in stand-by
@@ -3071,7 +3520,7 @@ func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration)
 
 			u.logger.Printf("Vehicle in 'stand-by' for %v (since %s). Triggering MDB reboot.",
 				durationInStandby, standbyStart.Format(time.RFC3339))
-			return u.redis.TriggerReboot()
+			return u.triggerMDBRebootIfUnowned()
 		}
 	}
 }
@@ -3192,11 +3641,15 @@ func (u *Updater) performLocalBootUpdate() {
 	// command handling and periodic checks until the next restart. The boot
 	// assets are already written and the version file recorded, so the reboot
 	// can happen whenever the vehicle next reaches stand-by (or on the next
-	// natural power cycle) without blocking anything.
+	// natural power cycle) without blocking anything. Reserve the update
+	// operation lock before launching the waiter so no rootfs write can start
+	// in the gap and then be interrupted by this deferred reboot.
+	u.updateOpMu.Lock()
 	u.wg.Add(1)
 	go func() {
 		defer u.wg.Done()
-		if err := u.TriggerReboot(u.config.Component, true); err != nil {
+		defer u.updateOpMu.Unlock()
+		if err := u.TriggerBootReboot(u.config.Component, true); err != nil {
 			if !strings.Contains(err.Error(), "DRY-RUN") {
 				u.logger.Printf("[boot-local] reboot trigger failed: %v", err)
 				if err := u.bootStatus.SetError(u.ctx, "reboot-failed", err.Error()); err != nil {

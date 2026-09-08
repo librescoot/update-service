@@ -10,7 +10,7 @@ The Update Service manages component-specific operating-system updates for MDB a
 - Downloads resumable Mender artifacts with configurable per-attempt duration and throughput budgets.
 - Supports full and delta update methods; delta installation requires a compatible local base artifact.
 - Accepts local-file and URL update requests, with optional SHA-256 verification.
-- Recovers Mender state at startup, commits a booted pending update, and attempts rollback of inconsistent state.
+- Recovers pending state from Mender at startup, verifies the active rootfs, commits it, and verifies the resulting Mender state.
 - Optionally updates the U-Boot boot region from local boot assets when `--boot-update` is enabled.
 - Publishes component status, progress, errors, heartbeats, and channel-preview results in the `ota` hash.
 - Uses Redis/Valkey inhibitors and vehicle state to coordinate downloads, installation, and reboots.
@@ -35,9 +35,11 @@ Each instance accepts commands on `scooter:update:<component>`:
 
 For `update-from-file` and `update-from-url`, append `#sha256=<hex>` to request checksum verification. The legacy `:sha256:<hex>` suffix is also accepted. An unverified source is allowed when no checksum is supplied.
 
-The service stores component-scoped data in the `ota` hash, including `status:<component>`, `update-version:<component>`, download and install progress, and error details. Primary statuses are `idle`, `downloading`, `preparing`, `installing`, `pending-reboot`, and `error`. Channel preview output is published as `preview-channel:<component>`, `preview-status:<component>`, `preview-version:<component>`, and `preview-size:<component>`.
+The service stores component-scoped data in the `ota` hash, including `status:<component>`, `update-version:<component>`, download and install progress, and error details. `update-version:<component>` is the target of an active operation; it is not the running version. Primary statuses are `idle`, `downloading`, `preparing`, `installing`, `pending-reboot`, and `error`. Channel preview output is published as `preview-channel:<component>`, `preview-status:<component>`, `preview-version:<component>`, and `preview-size:<component>`.
 
-Installed versions are read from `version:<component>` field `version_id`; the release variant is read from `variant_id`. Ensure the version service has published these fields before relying on automated channel selection.
+Running versions are read from `version:<component>` field `version_id`; the release variant is read from `variant_id`. During startup recovery, Mender's committed artifact and `standalone-state.ArtifactName` are the durable sources for committed and installed-but-uncommitted identity. The active rootfs `/etc/os-release` `VERSION_ID` must match the pending artifact before commit.
+
+The MDB instance atomically maintains `/data/ota/dbc-state.json` after stable live DBC observations. If Redis data is lost while the DBC is powered off, it restores `version:dbc[version_id]` and the DBC OTA status/target with `ota[state-origin:dbc]=cached`. A running DBC instance sets that marker to `live`.
 
 ## Configuration
 
@@ -77,7 +79,7 @@ For local dry-run instances, use `make run-mdb` or `make run-dbc`. The Makefile 
 
 The image recipe installs `/usr/bin/update-service`, `mender-apply-delta.py`, and one board-specific unit as `librescoot-update.service`. Both units run as `root`, restart automatically, create their required `/data/ota` directories before start, and set `GOMEMLIMIT=100MiB`.
 
-The MDB unit requires Valkey and orders itself after network, modem, vehicle, version, power-management, and settings services. The DBC unit uses the MDB Redis/Valkey address `192.168.7.1:6379` and orders itself after network, version, and settings services.
+The MDB unit requires Valkey and orders itself after network, modem, vehicle, version, power-management, and settings services. The DBC unit uses the MDB Redis/Valkey address `192.168.7.1:6379` and orders itself after network, version, and settings services. A successful DBC rootfs install keeps the `start-dbc` lifecycle active, waits for `stand-by`, `parked`, or `shutting-down`, requests a local DBC reboot, verifies and commits on startup, then emits `complete-dbc`; MDB dashboard-power cycling is not part of this activation path. UMS claims `ota[reboot-owner:mdb]=ums` around imported MDB updates so update-service leaves a combined install pending until UMS has observed the DBC's final outcome.
 
 Runtime dependencies include Redis or Valkey, the Mender command-line tooling and state storage, network access to the configured release index for remote updates, sufficient storage in the download directory, and the vehicle/power services used for inhibition and reboot coordination. Boot updates additionally require a valid boot mount/device and `/usr/share/boot-assets/u-boot-dtb.imx`.
 
