@@ -24,8 +24,11 @@ type Config struct {
 	ReleasesURL   string
 	CheckInterval time.Duration
 
-	Component string // CLI-only target: mdb or dbc.
-	Channel   string // stable, testing, or nightly; CLI overrides Redis.
+	Component       string // CLI-only target: mdb or dbc.
+	Channel         string // stable, testing, or nightly; CLI overrides Redis.
+	ChannelFromCLI  bool   // Immutable after startup; prevents Redis overriding --channel.
+	FallbackChannel string // Startup default/inferred channel, never replaced by Redis.
+	channelMu       sync.RWMutex
 
 	DownloadDir string // CLI-only OTA staging directory.
 
@@ -37,11 +40,8 @@ type Config struct {
 	//
 	// These three are read once per download attempt through DownloadBudget()
 	// by the download goroutine, while ApplyRedisUpdate can rewrite them at
-	// any time from the settings-watcher goroutine. budgetMu guards exactly
-	// that pair of accesses. Every other Config field is read and written
-	// directly with no synchronization, a convention of this struct that this
-	// lock does not attempt to fix; these three differ in having a genuine
-	// concurrent reader, so their guard has to be correct.
+	// any time from the settings-watcher goroutine. budgetMu guards those
+	// accesses independently of channelMu.
 	budgetMu              sync.RWMutex
 	DownloadMaxDuration   time.Duration
 	DownloadStallWindow   time.Duration
@@ -74,6 +74,7 @@ func New(
 		CheckInterval:          checkInterval,
 		Component:              component,
 		Channel:                channel,
+		FallbackChannel:        channel,
 		DownloadDir:            downloadDir,
 		MdbRebootCheckInterval: 5 * time.Minute,
 		UpdateRetryInterval:    15 * time.Minute,
@@ -179,6 +180,15 @@ func (c *Config) DownloadBudget() (maxDuration, stallWindow time.Duration, stall
 	return c.DownloadMaxDuration, c.DownloadStallWindow, c.DownloadStallMinBytes
 }
 
+// GetChannel returns the synchronized cached channel. Checks read Redis directly
+// unless pinned by CLI; FallbackChannel is the separate startup default used
+// when a Redis override is absent.
+func (c *Config) GetChannel() string {
+	c.channelMu.RLock()
+	defer c.channelMu.RUnlock()
+	return c.Channel
+}
+
 // ApplyRedisUpdate applies a single setting update from Redis.
 // Returns true if the setting was recognized and applied, false otherwise.
 func (c *Config) ApplyRedisUpdate(key, value string) bool {
@@ -192,8 +202,13 @@ func (c *Config) ApplyRedisUpdate(key, value string) bool {
 
 	switch settingName {
 	case "channel":
-		if IsValidChannel(value) {
+		if value == "" {
+			value = c.FallbackChannel
+		}
+		if IsValidChannel(value) || value == "" {
+			c.channelMu.Lock()
 			c.Channel = value
+			c.channelMu.Unlock()
 			return true
 		}
 	case "check-interval":

@@ -617,6 +617,11 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 		u.logger.Printf("Warning: Failed to clear stale download suspend inhibit: %v", err)
 	}
 
+	// Clear the boot block before no-assets/current/pending-rootfs checks can skip it.
+	if err := cleanupBootUpdate(u.inhibitor, u.config.Component); err != nil {
+		u.logger.Printf("Warning: Failed to clear stale boot install inhibit: %v", err)
+	}
+
 	// Clear a DBC install block left by an unclean exit.
 	if u.config.Component == "dbc" {
 		if err := u.inhibitor.RemoveDBCInstallInhibit(); err != nil {
@@ -734,7 +739,7 @@ func (u *Updater) installPendingMenderFile(menderNeedsReboot bool) {
 		return
 	}
 
-	menderPath, menderVersion, found := u.mender.FindLatestMenderFile(u.config.Channel)
+	menderPath, menderVersion, found := u.mender.FindLatestMenderFile(u.config.GetChannel())
 	if !found || menderVersion == "" {
 		return
 	}
@@ -2128,38 +2133,42 @@ func (u *Updater) NotifyCheckIntervalChanged() {
 	}
 }
 
+// resolveCheckSettings reads the authoritative values before selecting a release.
+// The settings watcher is asynchronous to the command queue; its cached values
+// cannot order a preceding HSET relative to check-now.
+func (u *Updater) resolveChannel() (string, error) {
+	if u.config.ChannelFromCLI {
+		return u.config.GetChannel(), nil
+	}
+	configured, err := u.redis.GetUpdateChannel(u.config.Component)
+	if err != nil {
+		return "", err
+	}
+	if configured != "" {
+		return configured, nil
+	}
+	return u.config.FallbackChannel, nil
+}
+
+func (u *Updater) resolveCheckSettings() (channel, method string, err error) {
+	channel, err = u.resolveChannel()
+	if err != nil {
+		return channel, "", err
+	}
+	method, err = u.redis.GetUpdateMethod(u.config.Component)
+	return channel, method, err
+}
+
 // checkForUpdates checks for updates and initiates the update process if updates are available.
 // manual is true when the check was requested explicitly (check-now command) rather than by
 // the periodic timer; manual updates skip the 3-minute standby wait before an MDB reboot.
 func (u *Updater) checkForUpdates(manual bool) {
-	if !config.IsValidChannel(u.config.Channel) {
-		u.logger.Printf("Skipping update check for %s: no release channel configured", u.config.Component)
-		if manual {
-			if !u.updateOpMu.TryLock() {
-				u.logger.Printf("Not reporting missing channel while an explicit update operation is active")
-				return
-			}
-			defer u.updateOpMu.Unlock()
-			if err := u.status.SetError(u.ctx, "channel-not-configured", "No release channel is configured"); err != nil {
-				u.logger.Printf("Failed to report missing update channel: %v", err)
-			}
-		}
-		return
-	}
-
 	// Prevent concurrent update checks - if an update is already in progress, skip
 	if !u.updateCheckMu.TryLock() {
 		u.logger.Printf("Update check already in progress for %s, skipping duplicate request", u.config.Component)
 		return
 	}
 	defer u.updateCheckMu.Unlock()
-
-	u.logger.Printf("Checking for updates for component %s on channel %s", u.config.Component, u.config.Channel)
-
-	// Store the timestamp of this check
-	if err := u.redis.SetLastUpdateCheckTime(u.config.Component, time.Now()); err != nil {
-		u.logger.Printf("Warning: Failed to store last check time: %v", err)
-	}
 
 	// Check if we're waiting for a reboot - if so, defer updates
 	currentStatus, err := u.status.GetStatus(u.ctx)
@@ -2187,6 +2196,29 @@ func (u *Updater) checkForUpdates(manual bool) {
 		return
 	}
 
+	// Read settings when consuming the check, not from an independently updated
+	// watcher cache. Keep the selected channel for the whole operation.
+	channel, updateMethod, err := u.resolveCheckSettings()
+	if err != nil || !config.IsValidChannel(channel) {
+		code := "settings-unavailable"
+		if err == nil {
+			err = fmt.Errorf("No valid release channel is configured")
+			code = "channel-not-configured"
+		}
+		u.logger.Printf("Skipping update check: %v", err)
+		if manual && u.updateOpMu.TryLock() {
+			defer u.updateOpMu.Unlock()
+			if statusErr := u.status.SetError(u.ctx, code, err.Error()); statusErr != nil {
+				u.logger.Printf("Failed to report check configuration error: %v", statusErr)
+			}
+		}
+		return
+	}
+	u.logger.Printf("Checking for updates for component %s on channel %s", u.config.Component, channel)
+	if err := u.redis.SetLastUpdateCheckTime(u.config.Component, time.Now()); err != nil {
+		u.logger.Printf("Warning: Failed to store last check time: %v", err)
+	}
+
 	// Get the currently installed version
 	currentVersion, err := u.getCurrentVersion()
 	if err != nil {
@@ -2196,7 +2228,7 @@ func (u *Updater) checkForUpdates(manual bool) {
 	}
 
 	// Get releases from GitHub
-	releases, err := u.githubAPI.GetReleases(u.config.Channel)
+	releases, err := u.githubAPI.GetReleases(channel)
 	if err != nil {
 		u.logger.Printf("Failed to get releases: %v", err)
 		return
@@ -2218,15 +2250,13 @@ func (u *Updater) checkForUpdates(manual bool) {
 		variantID = u.config.Component
 	}
 
-	// Get the cached update method
-	updateMethod := u.getUpdateMethod()
 	u.logger.Printf("Update method for %s: %s", u.config.Component, updateMethod)
 
 	// Check for channel switch
 	if currentVersion != "" {
 		currentChannel := u.inferChannelFromVersion(currentVersion)
-		if currentChannel != "" && currentChannel != u.config.Channel {
-			u.logger.Printf("Channel switch detected from %s to %s for component %s. Forcing full update.", currentChannel, u.config.Channel, u.config.Component)
+		if currentChannel != "" && currentChannel != channel {
+			u.logger.Printf("Channel switch detected from %s to %s for component %s. Forcing full update.", currentChannel, channel, u.config.Component)
 			updateMethod = "full"
 		}
 	}
@@ -2237,7 +2267,7 @@ func (u *Updater) checkForUpdates(manual bool) {
 		u.wg.Add(1)
 		go func() {
 			defer u.wg.Done()
-			u.performDeltaUpdate(releases, currentVersion, variantID, false, manual)
+			u.performDeltaUpdate(releases, currentVersion, variantID, channel, false, manual)
 		}()
 
 		return
@@ -2249,9 +2279,9 @@ func (u *Updater) checkForUpdates(manual bool) {
 	}
 
 	// Find the latest release for our variant and channel
-	release, found := u.findLatestRelease(releases, variantID, u.config.Channel)
+	release, found := u.findLatestRelease(releases, variantID, channel)
 	if !found {
-		u.logger.Printf("No release found for variant_id %s and channel %s", variantID, u.config.Channel)
+		u.logger.Printf("No release found for variant_id %s and channel %s", variantID, channel)
 		return
 	}
 
@@ -2463,8 +2493,18 @@ func (u *Updater) isUpdateNeeded(release Release) bool {
 		return true
 	}
 
+	channel := config.InferChannelFromVersion(release.TagName)
+	if !config.IsValidChannel(channel) {
+		u.logger.Printf("Ignoring release with unrecognized channel: %s", release.TagName)
+		return false
+	}
+	if currentChannel := config.InferChannelFromVersion(currentVersion); channel == "stable" && currentChannel != "" && currentChannel != channel {
+		u.logger.Printf("Update needed for channel switch: current=%s, release=%s", currentVersion, release.TagName)
+		return true
+	}
+
 	// Handle stable channel version comparison (vX.Y.Z)
-	if u.config.Channel == "stable" {
+	if channel == "stable" {
 		// Current version might be just "1.2.3" or "v1.2.3", release tag is "v1.2.3"
 		// Normalize both to ensure comparison works
 		normCurrent := currentVersion
@@ -2487,7 +2527,7 @@ func (u *Updater) isUpdateNeeded(release Release) bool {
 	normalizedCurrentVersion := strings.ToLower(currentVersion)
 
 	// If current version is short (legacy), try to match it against the short part of release
-	if !strings.HasPrefix(normalizedCurrentVersion, u.config.Channel+"-") {
+	if !strings.HasPrefix(normalizedCurrentVersion, channel+"-") {
 		parts := strings.Split(normalizedReleaseVersion, "-")
 		if len(parts) >= 2 && normalizedCurrentVersion == parts[1] {
 			u.logger.Printf("No update needed for %s: current=%s (legacy), release=%s", u.config.Component, currentVersion, normalizedReleaseVersion)
@@ -2532,7 +2572,7 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string, manual b
 	u.logger.Printf("Starting update process for %s to version %s", u.config.Component, release.TagName)
 
 	var version string
-	if u.config.Channel == "stable" {
+	if config.InferChannelFromVersion(release.TagName) == "stable" {
 		version = release.TagName
 	} else {
 		// Use full tag name for nightly/testing too
@@ -2748,7 +2788,7 @@ const deltaChecksumFailureLimit = 2
 // older than this.
 const deltaMaxAge = 30 * 24 * time.Hour
 
-func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID string, isRecheck, manual bool) {
+func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variantID, channel string, isRecheck, manual bool) {
 	// The recursive re-check call at the end of this function runs inside the
 	// same goroutine that already holds updateOpMu, skip TryLock in that case
 	// to avoid self-deadlocking on the non-reentrant mutex. That reasoning
@@ -2774,10 +2814,10 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	baseVersion := currentVersion
 	if _, exists := u.mender.FindMenderFileForVersion(currentVersion); !exists {
 		// No mender file for current version - find the latest mender file we have for this channel
-		_, menderVersion, found := u.mender.FindLatestMenderFile(u.config.Channel)
+		_, menderVersion, found := u.mender.FindLatestMenderFile(channel)
 		if !found || menderVersion == "" {
-			u.logger.Printf("No local mender file for any version on channel %s, need full update", u.config.Channel)
-			u.fallbackToFullUpdate(releases, variantID, "no local mender file to base delta chain on", manual)
+			u.logger.Printf("No local mender file for any version on channel %s, need full update", channel)
+			u.fallbackToFullUpdate(releases, variantID, channel, "no local mender file to base delta chain on", manual)
 			return
 		}
 		u.logger.Printf("No mender file for running version %s, using available mender file version %s as base", currentVersion, menderVersion)
@@ -2785,7 +2825,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	}
 
 	// Step 1: Build the delta chain from the base version
-	deltaChain, err := u.buildDeltaChain(releases, baseVersion, u.config.Channel, variantID)
+	deltaChain, err := u.buildDeltaChain(releases, baseVersion, channel, variantID)
 	if err != nil {
 		u.logger.Printf("Failed to build delta chain: %v", err)
 
@@ -2794,7 +2834,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		// been transferred, so it must honour the backoff: otherwise a scooter
 		// whose chain will not build re-downloads the full image on every
 		// check and never serves its ladder.
-		latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
+		latestRelease, found := u.findLatestRelease(releases, variantID, channel)
 		if found {
 			if !u.isUpdateNeeded(latestRelease) {
 				return
@@ -2960,7 +3000,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 					_ = u.mender.CleanupDeltaFile(downloads[j].deltaPath)
 				}
 			}
-			u.fallbackToFullUpdate(releases, variantID, reason, manual)
+			u.fallbackToFullUpdate(releases, variantID, channel, reason, manual)
 		}
 
 		deltaURL := ""
@@ -3071,7 +3111,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			return
 		}
 		u.logger.Printf("Delta chain apply failed: %v", err)
-		u.fallbackToFullUpdate(releases, variantID, fmt.Sprintf("chain apply failed: %v", err), manual)
+		u.fallbackToFullUpdate(releases, variantID, channel, fmt.Sprintf("chain apply failed: %v", err), manual)
 		return
 	}
 
@@ -3086,11 +3126,11 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	if u.ctx.Err() != nil {
 		return
 	}
-	freshReleases, err := u.githubAPI.GetReleases(u.config.Channel)
+	freshReleases, err := u.githubAPI.GetReleases(channel)
 	if err != nil {
 		u.logger.Printf("Warning: Failed to check for new releases: %v (proceeding with install)", err)
 	} else {
-		additionalChain, err := u.buildDeltaChain(freshReleases, workingVersion, u.config.Channel, variantID)
+		additionalChain, err := u.buildDeltaChain(freshReleases, workingVersion, channel, variantID)
 		if err == nil && len(additionalChain) > 0 {
 			u.logger.Printf("Found %d additional deltas released during update", len(additionalChain))
 
@@ -3152,13 +3192,13 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	// version rather than installing something already stale.
 	// isRecheck guards against looping if nightlies publish faster than deltas apply.
 	if !isRecheck {
-		recheckReleases, err := u.githubAPI.GetReleases(u.config.Channel)
+		recheckReleases, err := u.githubAPI.GetReleases(channel)
 		if err != nil {
 			u.logger.Printf("Re-check API call failed: %v (proceeding with install)", err)
-		} else if newerChain, err := u.buildDeltaChain(recheckReleases, workingVersion, u.config.Channel, variantID); err == nil && len(newerChain) > 0 {
+		} else if newerChain, err := u.buildDeltaChain(recheckReleases, workingVersion, channel, variantID); err == nil && len(newerChain) > 0 {
 			newerVersion := strings.ToLower(newerChain[len(newerChain)-1].TagName)
 			u.logger.Printf("Newer version %s published while applying delta chain; restarting from assembled %s", newerVersion, workingVersion)
-			u.performDeltaUpdate(recheckReleases, workingVersion, variantID, true, manual)
+			u.performDeltaUpdate(recheckReleases, workingVersion, variantID, channel, true, manual)
 			return
 		}
 	}
@@ -3265,7 +3305,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 }
 
 // fallbackToFullUpdate logs the delta failure reason and initiates a full update.
-func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, reason string, manual bool) {
+func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, channel, reason string, manual bool) {
 	u.logger.Printf("Delta update failed (%s), falling back to full update", reason)
 
 	if err := u.status.SetError(u.ctx, "delta-failed", reason); err != nil {
@@ -3277,7 +3317,7 @@ func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, reason str
 		u.logger.Printf("Failed to clear status before fallback: %v", err)
 	}
 
-	latestRelease, found := u.findLatestRelease(releases, variantID, u.config.Channel)
+	latestRelease, found := u.findLatestRelease(releases, variantID, channel)
 	if found {
 		if !u.isUpdateNeeded(latestRelease) {
 			return
@@ -3546,123 +3586,6 @@ func releaseAsset(release Release, variantID, ext string) (Asset, bool) {
 		}
 	}
 	return Asset{}, false
-}
-
-// bootComponent returns the boot component identifier for the given rootfs component.
-// e.g. "dbc" → "dbc-boot", "mdb" → "mdb-boot"
-func bootComponent(component string) string {
-	return component + "-boot"
-}
-
-// performLocalBootUpdate checks for boot assets baked into the rootfs and applies
-// them if they differ from what's currently on the boot partition.
-func (u *Updater) performLocalBootUpdate() {
-	if u.bootUpdater == nil {
-		return
-	}
-
-	if !boot.HasLocalAssets() {
-		u.logger.Printf("[boot-local] no local boot assets found")
-		return
-	}
-
-	// Ask the hardware, not a version file. The old boot-version file hashed
-	// the whole asset bundle, so a kernel-only change asked for a U-Boot
-	// rewrite that changed nothing — and it could report an install that never
-	// reached anything the board reads.
-	upToDate, err := u.bootUpdater.UpToDate(boot.LocalAssetsPath)
-	if err != nil {
-		u.logger.Printf("[boot-local] could not compare U-Boot against the boot region: %v", err)
-		return
-	}
-	if upToDate {
-		u.logger.Printf("[boot-local] U-Boot already matches the local assets")
-		return
-	}
-
-	u.logger.Printf("[boot-local] U-Boot differs from the local assets, applying")
-
-	bootComp := bootComponent(u.config.Component)
-
-	// For DBC: tell vehicle-service to keep dashboard power on during boot write.
-	// This is critical — there is no A/B redundancy for the boot partition,
-	// so a power cut mid-write could brick the device.
-	if u.config.Component == "dbc" {
-		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
-			u.logger.Printf("[boot-local] ABORTING: failed to send start-dbc — cannot guarantee power safety: %v", err)
-			return
-		}
-	}
-
-	if err := u.bootStatus.SetInstalling(u.ctx); err != nil {
-		u.logger.Printf("[boot-local] failed to set installing status: %v", err)
-	}
-
-	if err := u.inhibitor.AddInstallInhibit(bootComp); err != nil {
-		u.logger.Printf("[boot-local] failed to add install inhibit: %v", err)
-	}
-
-	if err := u.bootUpdater.Apply(u.ctx, boot.LocalAssetsPath); err != nil {
-		u.logger.Printf("[boot-local] apply failed: %v", err)
-		if err := u.inhibitor.RemoveInstallInhibit(bootComp); err != nil {
-			u.logger.Printf("[boot-local] failed to remove install inhibit: %v", err)
-		}
-		if err := u.bootStatus.SetError(u.ctx, "install-failed", err.Error()); err != nil {
-			u.logger.Printf("[boot-local] failed to set error status: %v", err)
-		}
-		if u.config.Component == "dbc" {
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("[boot-local] failed to send complete-dbc after error: %v", err)
-			}
-		}
-		return
-	}
-
-	if err := u.inhibitor.RemoveInstallInhibit(bootComp); err != nil {
-		u.logger.Printf("[boot-local] failed to remove install inhibit: %v", err)
-	}
-
-	// Boot write complete — release vehicle-service power protection
-	if u.config.Component == "dbc" {
-		if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-			u.logger.Printf("[boot-local] failed to send complete-dbc: %v", err)
-		}
-	}
-
-	if err := u.bootStatus.SetPendingReboot(u.ctx); err != nil {
-		u.logger.Printf("[boot-local] failed to set pending-reboot status: %v", err)
-	}
-
-	u.logger.Printf("[boot-local] boot update applied, deferring reboot to background")
-	// The reboot wait must not run on the Start() path. For MDB, TriggerReboot
-	// blocks until the vehicle has been in 'stand-by' long enough, which can be
-	// indefinite. Running it synchronously here wedged Start() before
-	// listenForCommands and updateCheckLoop launched, silently killing OTA
-	// command handling and periodic checks until the next restart. The boot
-	// assets are already written and the version file recorded, so the reboot
-	// can happen whenever the vehicle next reaches stand-by (or on the next
-	// natural power cycle) without blocking anything. Reserve the update
-	// operation lock before launching the waiter so no rootfs write can start
-	// in the gap and then be interrupted by this deferred reboot.
-	u.updateOpMu.Lock()
-	u.wg.Add(1)
-	go func() {
-		defer u.wg.Done()
-		defer u.updateOpMu.Unlock()
-		if err := u.TriggerBootReboot(u.config.Component, true); err != nil {
-			if !strings.Contains(err.Error(), "DRY-RUN") {
-				u.logger.Printf("[boot-local] reboot trigger failed: %v", err)
-				if err := u.bootStatus.SetError(u.ctx, "reboot-failed", err.Error()); err != nil {
-					u.logger.Printf("[boot-local] failed to set error status: %v", err)
-				}
-			} else {
-				u.logger.Printf("[boot-local] dry-run: simulating post-reboot state")
-				if err := u.bootStatus.SetIdle(u.ctx); err != nil {
-					u.logger.Printf("[boot-local] failed to set idle status in dry run: %v", err)
-				}
-			}
-		}
-	}()
 }
 
 // buildDeltaChain builds a complete chain of deltas from currentVersion to the

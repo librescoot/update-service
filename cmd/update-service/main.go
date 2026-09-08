@@ -120,7 +120,8 @@ func main() {
 		*bootUBootSeek,
 	)
 
-	cliChannel := cfg.Channel
+	cfg.ChannelFromCLI = cliChannelSet
+	cliChannel := cfg.GetChannel()
 	cliCheckInterval := cfg.CheckInterval
 	cliReleasesURL := cfg.ReleasesURL
 	cliDryRun := cfg.DryRun
@@ -208,12 +209,12 @@ func main() {
 		channelSource = "detected"
 	}
 
-	if !config.IsValidChannel(cfg.Channel) {
+	if !config.IsValidChannel(cfg.GetChannel()) {
 		logger.Printf("Config: %s has no release channel; explicit installs only", cfg.Component)
 	} else if cfg.CheckInterval > 0 {
-		logger.Printf("Config: %s on %s (%s), check every %v", cfg.Component, cfg.Channel, channelSource, cfg.CheckInterval)
+		logger.Printf("Config: %s on %s (%s), check every %v", cfg.Component, cfg.GetChannel(), channelSource, cfg.CheckInterval)
 	} else {
-		logger.Printf("Config: %s on %s (%s), manual checks only", cfg.Component, cfg.Channel, channelSource)
+		logger.Printf("Config: %s on %s (%s), manual checks only", cfg.Component, cfg.GetChannel(), channelSource)
 	}
 	logger.Printf("Config: download budget max=%v stall=%v/%d bytes",
 		cfg.DownloadMaxDuration, cfg.DownloadStallWindow, cfg.DownloadStallMinBytes)

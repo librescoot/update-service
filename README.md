@@ -41,6 +41,8 @@ Running versions are read from `version:<component>` field `version_id`; the rel
 
 The MDB instance atomically maintains `/data/ota/dbc-state.json` after stable live DBC observations. If Redis data is lost while the DBC is powered off, it restores `version:dbc[version_id]` and the DBC OTA status/target with `ota[state-origin:dbc]=cached`. A running DBC instance sets that marker to `live`.
 
+Each release check reads the current component channel and update method from settings before selecting a release; an explicit `--channel` still takes precedence. The selected channel stays fixed for that operation, including delta rechecks. Switching between recognized channels requests a full image, including nightly/testing to stable; same-channel stable checks still reject version downgrades. A settings read failure aborts the check instead of silently using a stale channel.
+
 ## Configuration
 
 | Flag | Default | Purpose |
@@ -54,8 +56,8 @@ The MDB instance atomically maintains `/data/ota/dbc-state.json` after stable li
 | `--dry-run` | `false` | Do not reboot after a successful update path |
 | `--boot-update` | `false` | Enable boot-region update support |
 | `--boot-mount` | `/uboot` | Boot partition mount point for device detection |
-| `--boot-device` | auto-detected | U-Boot device path |
-| `--boot-uboot-seek` | `2` | 512-byte blocks to skip before writing U-Boot |
+| `--boot-device` | auto-detected | Supported eMMC boot0 device (`/dev/mmcblkNboot0`); user-area targets are refused |
+| `--boot-uboot-seek` | `2` | SD/eMMC IVT offset in 512-byte blocks; only `2` (1024 bytes) is supported |
 | `--download-max-duration` | `60m` | Per-attempt download wall-clock limit; `0` disables it |
 | `--download-stall-window` | `2m` | Throughput evaluation window; `0` disables it |
 | `--download-stall-min-bytes` | `65536` | Bytes required in each stall window |
@@ -94,6 +96,14 @@ journalctl -u librescoot-update.service
 - The service can invoke Mender and, with boot updates enabled, write and verify a U-Boot image in the boot region. Do not enable or run it with untrusted configuration or device paths.
 - A pending Mender update is committed on the next successful startup after reboot. Inspect the `ota` hash and journal before clearing errors or replacing staged artifacts.
 - `--dry-run` suppresses rebooting; it does not turn remote discovery, downloads, or all installation preparation into a no-op. Use it only with an appropriate test environment.
+
+## Boot-write safeguards
+
+Boot updates require `/usr/share/boot-assets/u-boot-dtb.imx` and its exact SHA-256 entry in the packaged `manifest.sha256`. Source reads are bounded; checksum and IVT/BootData validation run before comparing or writing the target. The opened target must match the kernel's boot0 block-device identity and capacity, and the declared image must fit. Identical images are not rewritten; comparison, write, sync, readback, and read-only restoration errors abort the operation.
+
+Before writing, the service requires settled Mender state and a non-expiring `block` inhibitor acknowledged by pm-service in `power-manager:busy-services`, with `power-manager[state]` still `running`. DBC writes also wait for vehicle-service's `vehicle[dbc-updating]` acknowledgement and maintain a heartbeat. Failed prerequisites prevent the write. Startup clears orphaned boot inhibitors; operation cleanup releases its holds after the writer returns. A failed write does not request a reboot.
+
+These checks detect corrupt inputs and reduce unsafe writes; they do not prove board compatibility, provide image authentication, or make an in-place write survive forced power loss. Device detection still selects boot0 and does not determine whether the ROM boots from it. This service does not migrate boot regions or provide bootloader A/B/fallback.
 
 ## License
 

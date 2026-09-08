@@ -1,6 +1,7 @@
 package redis
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -210,9 +211,11 @@ func (c *Client) TriggerReboot() error {
 func (c *Client) GetUpdateMethod(component string) (string, error) {
 	key := fmt.Sprintf("updates.%s.method", component)
 	method, err := c.client.HGet("settings", key)
-	if err != nil {
-		// Default to delta if not configured
+	if errors.Is(err, ipc.ErrNil) {
 		return "delta", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read update method: %w", err)
 	}
 
 	// Validate the method
@@ -221,6 +224,19 @@ func (c *Client) GetUpdateMethod(component string) (string, error) {
 	}
 
 	return method, nil
+}
+
+// GetUpdateChannel distinguishes an absent override from a failed read. A
+// failed read must not make a channel-switch check silently use its old channel.
+func (c *Client) GetUpdateChannel(component string) (string, error) {
+	value, err := c.client.HGet("settings", "updates."+component+".channel")
+	if errors.Is(err, ipc.ErrNil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read update channel: %w", err)
+	}
+	return value, nil
 }
 
 // HGet gets a field value from a Redis hash

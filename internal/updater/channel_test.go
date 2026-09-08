@@ -3,7 +3,7 @@ package updater
 import "testing"
 
 func TestCheckForUpdatesWithoutChannelReportsManualError(t *testing.T) {
-	u, mr := newTestUpdaterForAbort(t)
+	u, mr := newTestUpdaterForPreview(t, nil)
 	u.config.Channel = ""
 
 	u.checkForUpdates(true)
@@ -15,7 +15,7 @@ func TestCheckForUpdatesWithoutChannelReportsManualError(t *testing.T) {
 }
 
 func TestManualCheckWithoutChannelDoesNotOverwriteActiveOperation(t *testing.T) {
-	u, mr := newTestUpdaterForAbort(t)
+	u, mr := newTestUpdaterForPreview(t, nil)
 	u.config.Channel = ""
 	u.updateOpMu.Lock()
 	defer u.updateOpMu.Unlock()
@@ -28,7 +28,7 @@ func TestManualCheckWithoutChannelDoesNotOverwriteActiveOperation(t *testing.T) 
 }
 
 func TestPeriodicCheckWithoutChannelDoesNotPublishError(t *testing.T) {
-	u, mr := newTestUpdaterForAbort(t)
+	u, mr := newTestUpdaterForPreview(t, nil)
 	u.config.Channel = ""
 
 	u.checkForUpdates(false)

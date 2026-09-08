@@ -118,6 +118,9 @@ func (u *Updater) isDBCUpdateAvailable(releases []Release) bool {
 
 	// Determine DBC channel
 	dbcChannel := u.getDBCChannel()
+	if !config.IsValidChannel(dbcChannel) {
+		return false
+	}
 
 	// Find the latest release for DBC
 	release, found := u.findLatestRelease(releases, dbcVariantID, dbcChannel)
@@ -167,13 +170,23 @@ func (u *Updater) getDBCChannel() string {
 		}
 	}
 
-	// Fall back to MDB's own channel
-	return u.config.Channel
+	// Fall back to the MDB's effective channel, not a delayed watcher value.
+	channel, err := u.resolveChannel()
+	if err != nil {
+		u.logger.Printf("[dbc-orchestrate] Failed to read fallback channel: %v", err)
+		return ""
+	}
+	return channel
 }
 
 // isVersionNewer checks if releaseTag is newer than installedVersion for the given channel.
 func (u *Updater) isVersionNewer(releaseTag, installedVersion, channel string) bool {
+	installedChannel := config.InferChannelFromVersion(installedVersion)
+	switching := installedChannel != "" && installedChannel != channel
 	if channel == "stable" {
+		if switching {
+			return true
+		}
 		normInstalled := installedVersion
 		if !strings.HasPrefix(normInstalled, "v") {
 			normInstalled = "v" + normInstalled
@@ -193,7 +206,7 @@ func (u *Updater) isVersionNewer(releaseTag, installedVersion, channel string) b
 		}
 	}
 
-	return normRelease > normInstalled
+	return switching || normRelease > normInstalled
 }
 
 type dbcWatchResult int
