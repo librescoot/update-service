@@ -65,12 +65,14 @@ func TestCommitResult_ExitCodes(t *testing.T) {
 
 func TestVersionFromArtifact(t *testing.T) {
 	tests := map[string]string{
-		"release-v1.4.0":                         "v1.4.0",
-		"release-nightly-20260908t063233":        "nightly-20260908t063233",
-		"release-v1.4.0-minimal":                 "v1.4.0",
-		"release-v1.4.0_INCONSISTENT":            "v1.4.0",
-		"release-v1.4.0-minimal_INCONSISTENT":    "v1.4.0",
-		"custom-artifact-without-release-prefix": "custom-artifact-without-release-prefix",
+		"release-v1.4.0":                          "v1.4.0",
+		"release-nightly-20260908t063233":         "nightly-20260908t063233",
+		"release-nightly-20260910T085736":         "nightly-20260910t085736",
+		"release-testing-20260910T085736-minimal": "testing-20260910t085736",
+		"release-v1.4.0-minimal":                  "v1.4.0",
+		"release-v1.4.0_INCONSISTENT":             "v1.4.0",
+		"release-v1.4.0-minimal_INCONSISTENT":     "v1.4.0",
+		"custom-artifact-without-release-prefix":  "custom-artifact-without-release-prefix",
 	}
 	for artifact, want := range tests {
 		if got := VersionFromArtifact(artifact); got != want {

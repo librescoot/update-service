@@ -2,6 +2,7 @@ package updater
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/librescoot/update-service/internal/mender"
@@ -19,6 +20,14 @@ func TestPendingRebootSurvivesDashboardPowerOff(t *testing.T) {
 	}
 }
 
+func TestLocalRebootCommandDoesNotWaitForShutdown(t *testing.T) {
+	got := localRebootCommand().Args
+	want := []string{"systemctl", "--no-block", "reboot"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("local reboot command = %q, want %q", got, want)
+	}
+}
+
 func TestTriggerRebootDBCRunsLocalReboot(t *testing.T) {
 	u, mr := newPendingCommitUpdater(t)
 	u.config.Component = "dbc"
@@ -28,6 +37,9 @@ func TestTriggerRebootDBCRunsLocalReboot(t *testing.T) {
 		return mender.UpdateObservation{PendingArtifact: "release-v1.4.0"}, nil
 	}
 	mr.HSet("vehicle", "state", "stand-by")
+	if err := u.status.SetPendingReboot(u.ctx); err != nil {
+		t.Fatal(err)
+	}
 	called := false
 	u.localReboot = func() error {
 		called = true
@@ -38,6 +50,13 @@ func TestTriggerRebootDBCRunsLocalReboot(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("local DBC reboot was not requested")
+	}
+	got, err := u.status.GetStatus(u.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "pending-reboot" {
+		t.Fatalf("status after accepted reboot = %q, want pending-reboot", got)
 	}
 }
 

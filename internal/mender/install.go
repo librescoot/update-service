@@ -43,7 +43,12 @@ type UpdateObservation struct {
 func VersionFromArtifact(artifact string) string {
 	artifact = strings.TrimSuffix(artifact, "_INCONSISTENT")
 	artifact = strings.TrimPrefix(artifact, "release-")
-	return strings.TrimSuffix(artifact, "-minimal")
+	version := strings.TrimSuffix(artifact, "-minimal")
+	lower := strings.ToLower(version)
+	if strings.HasPrefix(lower, "nightly-") || strings.HasPrefix(lower, "testing-") {
+		return lower
+	}
+	return version
 }
 
 type Installer struct {

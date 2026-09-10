@@ -178,7 +178,7 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		installArtifact: manager.Install,
 		dbcInstallGuard: inhibitorClient,
 		localReboot: func() error {
-			return exec.Command("systemctl", "reboot").Run()
+			return localRebootCommand().Run()
 		},
 		dbcStateCache:     dbcstate.DefaultPath,
 		activationAttempt: dbcstate.DefaultActivationAttempt,
@@ -3456,6 +3456,14 @@ func (u *Updater) TriggerBootReboot(component string, manual bool) error {
 		return fmt.Errorf("DRY-RUN: Would reboot/restart %s", component)
 	}
 	return u.triggerDBCLocalReboot(false)
+}
+
+// localRebootCommand asks systemd to enqueue the reboot without waiting for the
+// transaction to finish. A blocking `systemctl reboot` is normally terminated
+// by systemd while the machine is shutting down, which exec.Cmd reports as a
+// command failure even though the reboot was accepted.
+func localRebootCommand() *exec.Cmd {
+	return exec.Command("systemctl", "--no-block", "reboot")
 }
 
 func (u *Updater) triggerDBCLocalReboot(requireMender bool) error {
