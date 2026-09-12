@@ -1810,9 +1810,7 @@ func (u *Updater) handleUpdateFromURL(url string) {
 			if err != nil {
 				u.logger.Printf("Failed to trigger %s reboot: %v", u.config.Component, err)
 				if !strings.Contains(err.Error(), "DRY-RUN") {
-					if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
-						u.logger.Printf("Additionally failed to set error status after %s reboot trigger failure: %v", u.config.Component, statusErr)
-					}
+					u.setRebootTriggerError(u.config.Component, err)
 				}
 
 				if u.config.DryRun || strings.Contains(err.Error(), "DRY-RUN") {

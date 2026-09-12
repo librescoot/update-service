@@ -156,7 +156,7 @@ func runLocalBootUpdate(ctx context.Context, component string, d bootUpdateDeps)
 	defer cancelWrite()
 	cleanupCtx := context.WithoutCancel(ctx)
 	defer func() {
-		if result != nil {
+		if result != nil && !errors.Is(result, context.Canceled) {
 			c, cancel := context.WithTimeout(cleanupCtx, bootGuardTimeout)
 			defer cancel()
 			result = errors.Join(result, d.status.SetError(c, "install-failed", result.Error()))
@@ -272,13 +272,7 @@ func (u *Updater) performLocalBootUpdate() {
 	})
 	if err != nil {
 		u.logger.Printf("[boot-local] aborted: %v", err)
-		// Validation and rootfs-state failures can occur before the guarded
-		// install begins; publish those too rather than retaining stale success.
-		statusCtx, cancel := context.WithTimeout(context.WithoutCancel(u.ctx), bootGuardTimeout)
-		defer cancel()
-		if statusErr := u.bootStatus.SetError(statusCtx, "install-failed", err.Error()); statusErr != nil {
-			u.logger.Printf("[boot-local] failed to report abort: %v", statusErr)
-		}
+		u.recordBootAbort(err)
 		return
 	}
 	if !applied {
@@ -309,4 +303,20 @@ func (u *Updater) performLocalBootUpdate() {
 			}
 		}
 	}()
+}
+
+// recordBootAbort publishes a boot-update abort. Validation and rootfs-state
+// failures can occur before the guarded install begins; publish those too
+// rather than retaining stale success. Shutdown-induced cancellations are not
+// failures: the board is rebooting or systemd is stopping the service, and the
+// next instance restores the update lifecycle, so no terminal status is written.
+func (u *Updater) recordBootAbort(err error) {
+	if u.skipTerminalErrorOnShutdown("[boot-local] update") {
+		return
+	}
+	statusCtx, cancel := context.WithTimeout(context.WithoutCancel(u.ctx), bootGuardTimeout)
+	defer cancel()
+	if statusErr := u.bootStatus.SetError(statusCtx, "install-failed", err.Error()); statusErr != nil {
+		u.logger.Printf("[boot-local] failed to report abort: %v", statusErr)
+	}
 }

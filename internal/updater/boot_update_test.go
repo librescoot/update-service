@@ -186,7 +186,10 @@ func TestBootOperationCancellationCleanup(t *testing.T) {
 	if applied || !errors.Is(err, context.Canceled) || f.writes != 0 || f.held {
 		t.Fatalf("applied=%v err=%v events=%v", applied, err, f.events)
 	}
-	if !reflect.DeepEqual(f.events, []string{"acquire", "installing", "start-dbc", "complete-dbc", "release", "error"}) {
+	// A shutdown cancellation is not a failure: the deferred status write must
+	// be suppressed, so no "error" event is published (the next instance
+	// restores the lifecycle).
+	if !reflect.DeepEqual(f.events, []string{"acquire", "installing", "start-dbc", "complete-dbc", "release"}) {
 		t.Fatal(f.events)
 	}
 }
@@ -200,7 +203,7 @@ func TestBootOperationCancellationDuringWrite(t *testing.T) {
 	if applied || !errors.Is(err, context.Canceled) || f.held {
 		t.Fatalf("applied=%v err=%v held=%v", applied, err, f.held)
 	}
-	want := []string{"acquire", "installing", "start-dbc", "ack", "heartbeat", "write", "clear-heartbeat", "complete-dbc", "release", "error"}
+	want := []string{"acquire", "installing", "start-dbc", "ack", "heartbeat", "write", "clear-heartbeat", "complete-dbc", "release"}
 	if !reflect.DeepEqual(f.events, want) {
 		t.Fatalf("events=%v", f.events)
 	}
