@@ -1626,9 +1626,12 @@ func planStagedArtifacts(current string, menders, deltas []string) (stagedPlan, 
 	}
 
 	switch {
-	case len(newerMenders) > 0 && len(deltas) > 0:
+	case len(newerMenders) > 0 && len(candidates) > 0:
+		// Only deltas that UMS could actually have staged count as a conflict.
+		// A stray file the version test cannot judge (a partial transfer, a
+		// manual/BLE leftover) must not block a legitimately staged image.
 		return stagedPlan{}, fmt.Errorf("%d full image(s) newer than the running version staged together with %d delta(s); it is ambiguous whether to full-update or delta-update",
-			len(newerMenders), len(deltas))
+			len(newerMenders), len(candidates))
 	case len(newerMenders) > 1:
 		return stagedPlan{}, fmt.Errorf("%d full images newer than the running version are staged; it is ambiguous which one to install", len(newerMenders))
 	case len(newerMenders) == 1:

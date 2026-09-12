@@ -254,6 +254,20 @@ func TestPlanStagedArtifacts(t *testing.T) {
 			deltas:  []string{"librescoot-unu-mdb-foo-bar.delta"},
 			wantErr: "no staged artifact",
 		},
+		{
+			// A junk delta must not block a legitimate staged image: only real
+			// delta candidates can make a full-image-plus-delta set ambiguous.
+			name:     "newer full image beside an unparsable delta installs the image",
+			menders:  []string{base, newer},
+			deltas:   []string{"update.delta"},
+			wantFull: newer,
+		},
+		{
+			name:     "newer full image beside an unknown-channel delta installs the image",
+			menders:  []string{base, newer},
+			deltas:   []string{"librescoot-unu-mdb-foo-bar.delta"},
+			wantFull: newer,
+		},
 	}
 
 	for _, tc := range cases {
