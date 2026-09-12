@@ -551,10 +551,9 @@ func TestHandleApplyStagedUpdatesInstallsNewerFullImage(t *testing.T) {
 	}
 }
 
-// TestHandleApplyStagedUpdatesNothingStagedGoesIdle pins the post-success
-// state: a repeat or late push can find nothing newer than the running version,
-// which must log and go idle rather than report staged-updates-refused.
-func TestHandleApplyStagedUpdatesNothingStagedGoesIdle(t *testing.T) {
+// TestHandleApplyStagedUpdatesNothingStagedPublishesNoop: a push that finds
+// nothing newer than the running version must publish staged-noop, not a refusal.
+func TestHandleApplyStagedUpdatesNothingStagedPublishesNoop(t *testing.T) {
 	u, mr, installs := newStagedTestUpdater(t, "mdb")
 	dir := u.mender.GetDownloadDir()
 	mr.HSet("version:mdb", "version_id", "nightly-20260101T000000")
@@ -563,8 +562,8 @@ func TestHandleApplyStagedUpdatesNothingStagedGoesIdle(t *testing.T) {
 
 	u.handleApplyStagedUpdates()
 
-	if got := mr.HGet("ota", "status:mdb"); got != "idle" {
-		t.Errorf("status:mdb = %q, want idle", got)
+	if got := mr.HGet("ota", "status:mdb"); got != "staged-noop" {
+		t.Errorf("status:mdb = %q, want staged-noop", got)
 	}
 	if got := mr.HGet("ota", "error:mdb"); got != "" {
 		t.Errorf("error:mdb = %q, want empty", got)

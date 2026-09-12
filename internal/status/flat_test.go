@@ -37,6 +37,13 @@ func TestFlatFor(t *testing.T) {
 		{"dbc pending-reboot, mdb idle", StatusIdle, StatusPendingReboot, "installation-complete-waiting-reboot", "blocking"},
 		{"both pending-reboot", StatusPendingReboot, StatusPendingReboot, "installation-complete-waiting-reboot", "blocking"},
 
+		// staged-noop is terminal and not busy; a genuinely busy peer still wins.
+		{"mdb staged-noop, dbc idle", StatusStagedNoop, StatusIdle, "", ""},
+		{"dbc staged-noop, mdb idle", StatusIdle, StatusStagedNoop, "", ""},
+		{"both staged-noop", StatusStagedNoop, StatusStagedNoop, "", ""},
+		{"mdb staged-noop, dbc pending-reboot", StatusStagedNoop, StatusPendingReboot, "installation-complete-waiting-reboot", "blocking"},
+		{"mdb staged-noop, dbc installing", StatusStagedNoop, StatusInstalling, "installing-updates", "blocking"},
+
 		// Earliest stage wins: a component further along must not mask one
 		// that is still busy earlier in the pipeline.
 		{"mdb pending-reboot, dbc downloading", StatusPendingReboot, StatusDownloading, "downloading-updates", "blocking"},

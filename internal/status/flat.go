@@ -35,6 +35,8 @@ func flatFor(s Status) (flatStatus, updateType string) {
 		return "installing-updates", "blocking"
 	case StatusPendingReboot:
 		return "installation-complete-waiting-reboot", "blocking"
+	case StatusStagedNoop:
+		return "", ""
 	default:
 		return "", ""
 	}

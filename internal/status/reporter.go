@@ -20,6 +20,8 @@ const (
 	StatusInstalling    Status = "installing"
 	StatusPendingReboot Status = "pending-reboot"
 	StatusError         Status = "error"
+	// StatusStagedNoop: an apply-staged-updates push found nothing applicable.
+	StatusStagedNoop Status = "staged-noop"
 )
 
 // Reporter handles Redis status reporting for OTA updates using HashPublisher.
@@ -75,8 +77,16 @@ func (r *Reporter) GetStatus(ctx context.Context) (Status, error) {
 
 // SetIdle atomically sets status to idle and clears all other fields.
 func (r *Reporter) SetIdle(ctx context.Context) error {
+	return r.setTerminal(ctx, StatusIdle)
+}
+
+func (r *Reporter) SetStagedNoop(ctx context.Context) error {
+	return r.setTerminal(ctx, StatusStagedNoop)
+}
+
+func (r *Reporter) setTerminal(ctx context.Context, st Status) error {
 	m := map[string]any{
-		r.key("status"):            string(StatusIdle),
+		r.key("status"):            string(st),
 		r.key("update-version"):    "",
 		r.key("update-method"):     "",
 		r.key("download-progress"): "",
@@ -88,9 +98,9 @@ func (r *Reporter) SetIdle(ctx context.Context) error {
 	}
 	err := r.pub.SetMany(m, ipc.Sync())
 	if err != nil {
-		return fmt.Errorf("set idle for %s: %w", r.component, err)
+		return fmt.Errorf("set %s for %s: %w", st, r.component, err)
 	}
-	r.logger.Printf("Set idle for %s", r.component)
+	r.logger.Printf("Set %s for %s", st, r.component)
 	return nil
 }
 

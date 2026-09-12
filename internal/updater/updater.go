@@ -1682,12 +1682,11 @@ func (u *Updater) handleApplyStagedUpdates() {
 	plan, err := planStagedArtifacts(current, menders, deltas)
 	if err != nil {
 		if errors.Is(err, errNoStagedArtifacts) {
-			// Legitimate post-success state (a retry, or a push delivered
-			// after the staged image already became the running version):
-			// log and go idle rather than reporting a failure.
+			// Not idle: ums-service finishes on this value instead of waiting out
+			// its install liveness window.
 			u.logger.Printf("No staged updates apply to the running %s version %s; nothing to install", u.config.Component, current)
-			if idleErr := u.status.SetIdle(u.ctx); idleErr != nil {
-				u.logger.Printf("Failed to set idle status: %v", idleErr)
+			if noopErr := u.status.SetStagedNoop(u.ctx); noopErr != nil {
+				u.logger.Printf("Failed to set staged-noop status: %v", noopErr)
 			}
 			return
 		}
