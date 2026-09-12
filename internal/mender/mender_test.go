@@ -398,26 +398,28 @@ func TestManager_CleanupStaleDeltaFiles(t *testing.T) {
 				{"librescoot-unu-dbc-nightly-20260601T000000.delta", freshMtime, true},
 			},
 		},
-		// Cross-channel: version path must not fire; fresh stays, old reaps via age.
+		// Cross-channel: nothing can apply a delta without a base on its own
+		// channel, so a base-less cross-channel orphan goes at once rather than
+		// waiting for the age backstop.
 		{
 			name: "cross-channel stable delta vs nightly ref fresh",
 			files: []fileSpec{
 				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
-				{"librescoot-unu-dbc-v0.8.0.delta", freshMtime, true},
+				{"librescoot-unu-dbc-v0.8.0.delta", freshMtime, false},
 			},
 		},
 		{
 			name: "cross-channel testing delta vs nightly ref fresh",
 			files: []fileSpec{
 				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
-				{"librescoot-unu-dbc-testing-20260428T013225.delta", freshMtime, true},
+				{"librescoot-unu-dbc-testing-20260428T013225.delta", freshMtime, false},
 			},
 		},
 		{
 			name: "cross-channel stable delta vs testing ref fresh",
 			files: []fileSpec{
 				{"librescoot-unu-dbc-testing-20260428T013225.mender", freshMtime, true},
-				{"librescoot-unu-dbc-v0.8.0.delta", freshMtime, true},
+				{"librescoot-unu-dbc-v0.8.0.delta", freshMtime, false},
 			},
 		},
 		{
@@ -427,12 +429,32 @@ func TestManager_CleanupStaleDeltaFiles(t *testing.T) {
 				{"librescoot-unu-dbc-v0.8.0.delta", oldMtime, false},
 			},
 		},
-		// Empty / malformed token.
+		// A cross-channel delta that DOES have a base on its own channel could
+		// become applicable after a channel switch, so it survives while fresh and
+		// only the backstop reaps it.
 		{
-			name: "malformed token fresh kept",
+			name: "cross-channel delta with a base on its channel fresh kept",
 			files: []fileSpec{
 				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
-				{"garbage.delta", freshMtime, true},
+				{"librescoot-unu-dbc-v0.8.0.mender", freshMtime, true},
+				{"librescoot-unu-dbc-v0.9.0.delta", freshMtime, true},
+			},
+		},
+		{
+			name: "cross-channel delta with a base on its channel old reaps via age",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-v0.8.0.mender", freshMtime, true},
+				{"librescoot-unu-dbc-v0.9.0.delta", oldMtime, false},
+			},
+		},
+		// Empty / malformed token: no update path can select it, so it goes at
+		// once rather than waiting for the backstop.
+		{
+			name: "malformed token reaped at once",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"garbage.delta", freshMtime, false},
 			},
 		},
 		{

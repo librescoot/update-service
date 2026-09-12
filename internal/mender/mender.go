@@ -355,9 +355,13 @@ func newestMenderFile(files []string, accept func(ver string) bool) string {
 // directory. The reference version is the newest LOCAL ".mender" token (a
 // download-dir artifact, not necessarily the running OS version). A delta is
 // reaped when it is provably superseded on the same channel (target version <=
-// reference, clock-independent), or as an age backstop for deltas the version
-// test cannot judge: cross-channel orphans, unparseable names, or the case
-// where the local base ".mender" is itself stale after a channel switch.
+// reference, clock-independent). A delta that can never apply is reaped at
+// once, because no amount of waiting makes it usable: a name carrying no target
+// version at all (a manual or file:// transfer such as "update.delta"), or one
+// whose channel has no local base ".mender" to apply against. The age backstop
+// covers only what remains judgeable-but-unusable: a same-channel delta newer
+// than a stale local base, or a cross-channel delta that does have a base on its
+// own channel (it could become applicable after a channel switch).
 func (m *Manager) CleanupStaleDeltaFiles(maxAge time.Duration) {
 	dir := m.downloader.downloadDir
 
@@ -383,12 +387,32 @@ func (m *Manager) CleanupStaleDeltaFiles(maxAge time.Duration) {
 		candidates = append(candidates, matches...)
 	}
 
+	// A delta only ever applies against a base ".mender" on its own channel, so
+	// one whose channel has no local base here can never be applied and is reaped
+	// at once instead of lingering for the age backstop.
+	baseChannels := make(map[string]bool, len(menderFiles))
+	for _, file := range menderFiles {
+		if ch := version.Channel(version.FromFilename(file)); ch != "" {
+			baseChannels[ch] = true
+		}
+	}
+
 	now := time.Now()
 	for _, file := range candidates {
 		reap := false
 
 		dv := version.FromFilename(file)
-		if version.SameChannel(dv, referenceVersion) && version.Compare(dv, referenceVersion) <= 0 {
+		ch := version.Channel(dv)
+		switch {
+		case ch == "":
+			// No target version at all: nothing can select this file.
+			reap = true
+		case len(baseChannels) > 0 && !baseChannels[ch]:
+			// No base image on this delta's channel, so it cannot be applied
+			// here. A channel switch that brings a matching base would have to
+			// restage the drop anyway.
+			reap = true
+		case version.SameChannel(dv, referenceVersion) && version.Compare(dv, referenceVersion) <= 0:
 			reap = true
 		}
 
