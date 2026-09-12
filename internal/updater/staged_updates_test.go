@@ -41,8 +41,9 @@ func newStagedTestUpdater(t *testing.T, component string) (*Updater, *miniredis.
 	t.Cleanup(cancel)
 
 	installs := &[]string{}
+	downloadDir := t.TempDir()
 	u := &Updater{
-		config:    &config.Config{Component: component, DownloadDir: t.TempDir(), DryRun: true},
+		config:    &config.Config{Component: component, DownloadDir: downloadDir, DryRun: true},
 		redis:     rc,
 		status:    status.NewReporter(rc.GetClient(), component, logger),
 		mender:    mender.NewManager(t.TempDir(), func() mender.Budget { return mender.Budget{} }, logger),
@@ -51,6 +52,12 @@ func newStagedTestUpdater(t *testing.T, component string) (*Updater, *miniredis.
 		installArtifact: func(path string, progress mender.InstallProgressCallback) error {
 			*installs = append(*installs, path)
 			return nil
+		},
+		// The real applier needs xdelta3 and a real base image; the handler
+		// tests only need to see what the resolver ordered and that the install
+		// tail ran. Individual tests override this to capture the chain.
+		applyDeltaChain: func(_ context.Context, _, _ []string, _ string, _ mender.DeltaProgressCallback) (string, error) {
+			return filepath.Join(downloadDir, "assembled-from-deltas.mender"), nil
 		},
 		logger: logger,
 		ctx:    ctx,
@@ -528,6 +535,117 @@ func TestHandleApplyStagedUpdatesNothingStagedGoesIdle(t *testing.T) {
 	}
 	if len(*installs) != 0 {
 		t.Fatalf("install ran with nothing staged: %v", *installs)
+	}
+}
+
+// TestHandleApplyStagedUpdatesRefusesForkedChain pins that the resolver's
+// fork refusal reaches the handler as staged-updates-refused, with nothing
+// installed. It must be driven through the handler: removing the
+// ResolveStagedDeltaChain call from handleApplyStagedUpdates would otherwise
+// leave the suite green.
+func TestHandleApplyStagedUpdatesRefusesForkedChain(t *testing.T) {
+	u, mr, installs := newStagedTestUpdater(t, "mdb")
+	dir := u.mender.GetDownloadDir()
+	mr.HSet("version:mdb", "version_id", "nightly-20260101T000000")
+
+	baseSum := strings.Repeat("a", 64)
+	writeBaseMender(t, dir, "librescoot-unu-mdb-nightly-20260101T000000.mender", baseSum)
+	// Both deltas were built from the base image: a fork.
+	writeDeltaFile(t, dir, "librescoot-unu-mdb-nightly-20260102T000000.delta", baseSum, strings.Repeat("b", 64))
+	writeDeltaFile(t, dir, "librescoot-unu-mdb-nightly-20260103T000000.delta", baseSum, strings.Repeat("c", 64))
+
+	u.handleApplyStagedUpdates()
+
+	waitForField(t, mr, "ota", "error:mdb", "staged-updates-refused")
+	if len(*installs) != 0 {
+		t.Fatalf("install ran for a forked staged set: %v", *installs)
+	}
+}
+
+// TestHandleApplyStagedUpdatesAppliesMultiDeltaChain drives a resolvable chain
+// end to end through the handler: plan -> resolver order -> apply -> install
+// tail. The applier is stubbed (a real one needs xdelta3 and a real base), so
+// the seam records the ordered chain the handler hands it.
+func TestHandleApplyStagedUpdatesAppliesMultiDeltaChain(t *testing.T) {
+	u, mr, installs := newStagedTestUpdater(t, "mdb")
+	dir := u.mender.GetDownloadDir()
+	mr.HSet("version:mdb", "version_id", "nightly-20260101T000000")
+
+	baseSum := strings.Repeat("a", 64)
+	writeBaseMender(t, dir, "librescoot-unu-mdb-nightly-20260101T000000.mender", baseSum)
+	d1 := writeDeltaFile(t, dir, "librescoot-unu-mdb-nightly-20260102T000000.delta", baseSum, strings.Repeat("b", 64))
+	d2 := writeDeltaFile(t, dir, "librescoot-unu-mdb-nightly-20260103T000000.delta", strings.Repeat("b", 64), strings.Repeat("c", 64))
+
+	var applied []string
+	assembled := filepath.Join(dir, "assembled-from-deltas.mender")
+	u.applyDeltaChain = func(_ context.Context, deltaPaths, _ []string, baseVersion string, _ mender.DeltaProgressCallback) (string, error) {
+		applied = append([]string{}, deltaPaths...)
+		if baseVersion != "nightly-20260101t000000" {
+			t.Errorf("baseVersion = %q, want the running version's normalized base", baseVersion)
+		}
+		return assembled, nil
+	}
+	// Past the delta dry-run guard, and with the MDB reboot claimed by UMS the
+	// reboot trigger returns without waiting for a vehicle state.
+	u.config.DryRun = false
+	mr.HSet("ota", "reboot-owner:mdb", "ums")
+
+	u.handleApplyStagedUpdates()
+
+	if strings.Join(applied, ",") != d1+","+d2 {
+		t.Fatalf("applied chain = %v, want [%s %s]", applied, d1, d2)
+	}
+	if len(*installs) != 1 || (*installs)[0] != assembled {
+		t.Fatalf("installArtifact calls = %v, want [%s]", *installs, assembled)
+	}
+}
+
+// TestHandleApplyStagedUpdatesHoldsInstallNotPreparing observes the power-hold
+// handover at the instant the install runs: the install hold is present while
+// the preparing hold is already gone, so there is no window with neither.
+func TestHandleApplyStagedUpdatesHoldsInstallNotPreparing(t *testing.T) {
+	u, mr, installs := newStagedTestUpdater(t, "mdb")
+	dir := u.mender.GetDownloadDir()
+	mr.HSet("version:mdb", "version_id", "nightly-20260101T000000")
+
+	baseSum := strings.Repeat("a", 64)
+	writeBaseMender(t, dir, "librescoot-unu-mdb-nightly-20260101T000000.mender", baseSum)
+	writeDeltaFile(t, dir, "librescoot-unu-mdb-nightly-20260102T000000.delta", baseSum, strings.Repeat("b", 64))
+
+	var installHold, preparingHold bool
+	u.installArtifact = func(path string, progress mender.InstallProgressCallback) error {
+		*installs = append(*installs, path)
+		installHold = mr.HGet(inhibitor.InhibitHashKey, "install:mdb") != ""
+		preparingHold = mr.HGet(inhibitor.InhibitHashKey, "preparing:mdb") != ""
+		return nil
+	}
+	u.config.DryRun = false
+	mr.HSet("ota", "reboot-owner:mdb", "ums")
+
+	u.handleApplyStagedUpdates()
+
+	if len(*installs) == 0 {
+		t.Fatal("install did not run")
+	}
+	if !installHold {
+		t.Error("install hold is absent at install time")
+	}
+	if preparingHold {
+		t.Error("preparing hold is still present at install time")
+	}
+}
+
+// TestInstallAssembledAndRebootAbortsWithoutInstallingStatus pins the
+// requireInstallingStatus abort: when the installing status cannot be
+// published, the full-image path must not write an image it cannot commit.
+func TestInstallAssembledAndRebootAbortsWithoutInstallingStatus(t *testing.T) {
+	u, mr, installs := newStagedTestUpdater(t, "mdb")
+	mr.SetError("redis unavailable")
+
+	u.installAssembledAndReboot("image.mender", nil, nil, true, "")
+
+	if len(*installs) != 0 {
+		t.Fatalf("install ran without an installing status: %v", *installs)
 	}
 }
 
