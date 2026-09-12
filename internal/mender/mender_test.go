@@ -423,7 +423,7 @@ func TestManager_CleanupStaleDeltaFiles(t *testing.T) {
 			},
 		},
 		{
-			name: "cross-channel stable delta vs nightly ref old reaps via age",
+			name: "cross-channel stable delta without a base on its channel reaped at once",
 			files: []fileSpec{
 				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
 				{"librescoot-unu-dbc-v0.8.0.delta", oldMtime, false},
@@ -448,6 +448,28 @@ func TestManager_CleanupStaleDeltaFiles(t *testing.T) {
 				{"librescoot-unu-dbc-v0.9.0.delta", oldMtime, false},
 			},
 		},
+		// The keep branch of the no-base rule must be decided by the base set, not
+		// by the reference: here the reference is the testing mender (it wins the
+		// cross-channel lexicographic compare), while the delta's own channel does
+		// have a base, so the delta must survive fresh and only age may reap it.
+		// A predicate that compared against the reference's channel instead of the
+		// base set would wrongly reap the fresh delta here.
+		{
+			name: "reference on another channel but a base on the delta's channel fresh kept",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-testing-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-nightly-20260601T000000.delta", freshMtime, true},
+			},
+		},
+		{
+			name: "reference on another channel but a base on the delta's channel old reaps via age",
+			files: []fileSpec{
+				{"librescoot-unu-dbc-testing-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
+				{"librescoot-unu-dbc-nightly-20260601T000000.delta", oldMtime, false},
+			},
+		},
 		// Empty / malformed token: no update path can select it, so it goes at
 		// once rather than waiting for the backstop.
 		{
@@ -458,7 +480,7 @@ func TestManager_CleanupStaleDeltaFiles(t *testing.T) {
 			},
 		},
 		{
-			name: "malformed token old reaps via age",
+			name: "malformed token old also reaped at once",
 			files: []fileSpec{
 				{"librescoot-unu-dbc-nightly-20260428T013225.mender", freshMtime, true},
 				{"garbage.delta", oldMtime, false},
