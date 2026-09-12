@@ -42,26 +42,25 @@ func newStagedTestUpdater(t *testing.T, component string) (*Updater, *miniredis.
 
 	installs := &[]string{}
 	downloadDir := t.TempDir()
+	// The default applier is the real one, so tests that expect its refusal
+	// behaviour are unchanged; tests that need a chain to succeed override
+	// applyDeltaChain with a stub.
+	mgr := mender.NewManager(t.TempDir(), func() mender.Budget { return mender.Budget{} }, logger)
 	u := &Updater{
 		config:    &config.Config{Component: component, DownloadDir: downloadDir, DryRun: true},
 		redis:     rc,
 		status:    status.NewReporter(rc.GetClient(), component, logger),
-		mender:    mender.NewManager(t.TempDir(), func() mender.Budget { return mender.Budget{} }, logger),
+		mender:    mgr,
 		inhibitor: inhibitor.New(rc.GetClient(), logger),
 		power:     power.New(rc.GetClient(), logger),
 		installArtifact: func(path string, progress mender.InstallProgressCallback) error {
 			*installs = append(*installs, path)
 			return nil
 		},
-		// The real applier needs xdelta3 and a real base image; the handler
-		// tests only need to see what the resolver ordered and that the install
-		// tail ran. Individual tests override this to capture the chain.
-		applyDeltaChain: func(_ context.Context, _, _ []string, _ string, _ mender.DeltaProgressCallback) (string, error) {
-			return filepath.Join(downloadDir, "assembled-from-deltas.mender"), nil
-		},
-		logger: logger,
-		ctx:    ctx,
-		cancel: cancel,
+		applyDeltaChain: mgr.ApplyDownloadedDeltaChain,
+		logger:          logger,
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 	// Registered after the client, so it runs first (t.Cleanup is LIFO): the
 	// heartbeat goroutine a file install starts must finish before the client
@@ -618,6 +617,12 @@ func TestHandleApplyStagedUpdatesHoldsInstallNotPreparing(t *testing.T) {
 		installHold = mr.HGet(inhibitor.InhibitHashKey, "install:mdb") != ""
 		preparingHold = mr.HGet(inhibitor.InhibitHashKey, "preparing:mdb") != ""
 		return nil
+	}
+	// The real applier needs xdelta3 and a real base image; only the install
+	// tail's power holds are under test here.
+	assembled := filepath.Join(dir, "assembled-from-deltas.mender")
+	u.applyDeltaChain = func(_ context.Context, _, _ []string, _ string, _ mender.DeltaProgressCallback) (string, error) {
+		return assembled, nil
 	}
 	u.config.DryRun = false
 	mr.HSet("ota", "reboot-owner:mdb", "ums")
