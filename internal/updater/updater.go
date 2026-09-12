@@ -1399,6 +1399,9 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 			}
 		}
 
+		if u.skipTerminalErrorOnShutdown("file update install") {
+			return
+		}
 		if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install update from file %s: %v", source, err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
@@ -1414,9 +1417,7 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 	if err := u.TriggerReboot(u.config.Component, true); err != nil {
 		u.logger.Printf("Failed to trigger %s reboot after file update: %v", u.config.Component, err)
 		if !strings.Contains(err.Error(), "DRY-RUN") {
-			if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
-				u.logger.Printf("Additionally failed to set error status after reboot trigger failure: %v", statusErr)
-			}
+			u.setRebootTriggerError(u.config.Component, err)
 			return
 		}
 
@@ -1624,6 +1625,9 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 	// image, so there is no corruption-retry path here (unlike raw downloads).
 	if err := u.installMender(newMenderPath); err != nil {
 		u.logger.Printf("Failed to install assembled delta update %s: %v", newMenderPath, err)
+		if u.skipTerminalErrorOnShutdown("assembled delta install") {
+			return
+		}
 		if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install update from file %s: %v", newMenderPath, err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
@@ -1640,9 +1644,7 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 	if err := u.TriggerReboot(u.config.Component, true); err != nil {
 		u.logger.Printf("Failed to trigger %s reboot after delta file update: %v", u.config.Component, err)
 		if !strings.Contains(err.Error(), "DRY-RUN") {
-			if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
-				u.logger.Printf("Additionally failed to set error status after reboot trigger failure: %v", statusErr)
-			}
+			u.setRebootTriggerError(u.config.Component, err)
 			return
 		}
 
@@ -1732,6 +1734,9 @@ func (u *Updater) handleUpdateFromURL(url string) {
 				continue
 			}
 			u.logger.Printf("Failed to download update after 5 attempts: %v", err)
+			if u.skipTerminalErrorOnShutdown("download") {
+				return
+			}
 			if err := u.status.SetError(u.ctx, "download-failed", fmt.Sprintf("Failed to download update: %v", err)); err != nil {
 				u.logger.Printf("Failed to set error status: %v", err)
 			}
@@ -1776,6 +1781,9 @@ func (u *Updater) handleUpdateFromURL(url string) {
 				}
 			}
 
+			if u.skipTerminalErrorOnShutdown("install") {
+				return
+			}
 			if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install update: %v", err)); err != nil {
 				u.logger.Printf("Failed to set error status: %v", err)
 			}
@@ -2645,6 +2653,9 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string, manual b
 			return
 		}
 		u.logger.Printf("Failed to download update: %v", err)
+		if u.skipTerminalErrorOnShutdown("download") {
+			return
+		}
 		if err := u.status.SetError(u.ctx, "download-failed", fmt.Sprintf("Failed to download update: %v", err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
@@ -2698,6 +2709,9 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string, manual b
 			}
 		}
 
+		if u.skipTerminalErrorOnShutdown("install") {
+			return
+		}
 		if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install update: %v", err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
@@ -2734,9 +2748,7 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string, manual b
 			// The TriggerReboot method now logs "DRY-RUN..." itself.
 			// We check if the error message contains "DRY-RUN" to avoid setting error status.
 			if !strings.Contains(err.Error(), "DRY-RUN") {
-				if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
-					u.logger.Printf("Additionally failed to set error status after %s reboot trigger failure: %v", u.config.Component, statusErr)
-				}
+				u.setRebootTriggerError(u.config.Component, err)
 			}
 
 			// If it was a dry run (error contains "DRY-RUN" or DryRun flag is true), simulate post-reboot.
@@ -3250,6 +3262,9 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			}
 		}
 
+		if u.skipTerminalErrorOnShutdown("delta-generated install") {
+			return
+		}
 		if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install delta-generated update: %v", err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
@@ -3283,9 +3298,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		if err != nil {
 			u.logger.Printf("Failed to trigger %s reboot: %v", u.config.Component, err)
 			if !strings.Contains(err.Error(), "DRY-RUN") {
-				if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", u.config.Component, err)); statusErr != nil {
-					u.logger.Printf("Additionally failed to set error status after %s reboot trigger failure: %v", u.config.Component, statusErr)
-				}
+				u.setRebootTriggerError(u.config.Component, err)
 			}
 
 			// If it was a dry run, simulate post-reboot
@@ -3348,6 +3361,33 @@ func (u *Updater) triggerMDBRebootIfUnowned() error {
 		return nil
 	}
 	return u.redis.TriggerReboot()
+}
+
+// setRebootTriggerError records a reboot-trigger failure for the component.
+// It never records a terminal error while the updater is shutting down: a
+// canceled context means the reboot is already in progress or the service is
+// being stopped, and the next instance restores the update lifecycle from
+// durable Mender state. Mirrors the delta-apply shutdown handling.
+func (u *Updater) setRebootTriggerError(component string, err error) {
+	if u.skipTerminalErrorOnShutdown(fmt.Sprintf("%s reboot trigger", component)) {
+		return
+	}
+	if statusErr := u.status.SetError(u.ctx, "reboot-failed", fmt.Sprintf("Failed to trigger %s reboot: %v", component, err)); statusErr != nil {
+		u.logger.Printf("Additionally failed to set error status after %s reboot trigger failure: %v", component, statusErr)
+	}
+}
+
+// skipTerminalErrorOnShutdown reports whether a terminal error status must be
+// suppressed because the updater is shutting down. A canceled context means
+// the board is rebooting or systemd is stopping the service; the next
+// instance restores the lifecycle from Mender state, so recording an error
+// now would misreport a successful or resumable operation as failed.
+func (u *Updater) skipTerminalErrorOnShutdown(where string) bool {
+	if u.ctx.Err() == nil {
+		return false
+	}
+	u.logger.Printf("Shutdown during %s; next instance will restore lifecycle", where)
+	return true
 }
 
 func dbcRebootAllowedState(state string) bool {

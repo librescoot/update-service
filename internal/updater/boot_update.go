@@ -295,6 +295,9 @@ func (u *Updater) performLocalBootUpdate() {
 		if err := u.TriggerBootReboot(u.config.Component, true); err != nil {
 			if !strings.Contains(err.Error(), "DRY-RUN") {
 				u.logger.Printf("[boot-local] reboot trigger failed: %v", err)
+				if u.skipTerminalErrorOnShutdown("[boot-local] reboot trigger") {
+					return
+				}
 				if err := u.bootStatus.SetError(u.ctx, "reboot-failed", err.Error()); err != nil {
 					u.logger.Printf("[boot-local] failed to set error status: %v", err)
 				}
