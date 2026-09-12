@@ -699,10 +699,16 @@ var ErrStagedChainAmbiguous = errors.New("staged delta chain is ambiguous")
 // before anything is unpacked). candidates must already be validated as one
 // channel and strictly increasing.
 //
-// A missing base, or a delta predating the payload-checksum fields, leaves the
-// chain unverifiable; the candidates are returned in the supplied order and the
-// downstream apply reports what it can. len(candidates) <= 1 is returned
-// unchanged.
+// A multi-candidate set that cannot be checksum-resolved is refused with
+// ErrStagedChainAmbiguous rather than passed through in the supplied order:
+// that is the only way a fork or an unplaceable delta could slip past the
+// resolver, and letting it through would fail much later, after the base was
+// unpacked and decompressed. The checksum is unreadable when the base manifest
+// cannot be read and when any candidate predates the payload-checksum fields.
+//
+// The running version's base image being absent is left to the caller: the
+// install path refuses it with no-base-image before unpacking anything.
+// len(candidates) <= 1 is returned unchanged.
 func (m *Manager) ResolveStagedDeltaChain(candidates []string, baseVersion string) ([]string, error) {
 	if len(candidates) <= 1 {
 		return candidates, nil
@@ -716,8 +722,8 @@ func (m *Manager) ResolveStagedDeltaChain(candidates []string, baseVersion strin
 	}
 	want, err := delta.BaseRootfsChecksum(oldMenderPath)
 	if err != nil || want == "" {
-		m.logger.Printf("Cannot read base rootfs checksum from %s: %v (keeping staged order)", oldMenderPath, err)
-		return candidates, nil
+		return nil, fmt.Errorf("%w: cannot read the base rootfs checksum from %s: %v",
+			ErrStagedChainAmbiguous, filepath.Base(oldMenderPath), err)
 	}
 
 	type link struct {
@@ -735,11 +741,11 @@ func (m *Manager) ResolveStagedDeltaChain(candidates []string, baseVersion strin
 	}
 	for _, l := range remaining {
 		if l.oldSum == "" || l.newSum == "" {
-			// A delta predating the payload-checksum fields cannot be placed
-			// by checksum. Fall back to the supplied order, which
-			// validateDeltaChain has already checked is strictly increasing.
-			m.logger.Printf("Delta %s carries no payload checksums, keeping staged order", filepath.Base(l.path))
-			return candidates, nil
+			// Without payload checksums the delta cannot be placed by
+			// checksum, so the fork/unplaceable guarantees cannot be made.
+			// Refuse rather than fall back to the supplied order.
+			return nil, fmt.Errorf("%w: delta %s carries no payload checksums, so the chain cannot be resolved",
+				ErrStagedChainAmbiguous, filepath.Base(l.path))
 		}
 	}
 

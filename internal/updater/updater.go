@@ -1533,6 +1533,13 @@ type stagedPlan struct {
 	baseVersion string
 }
 
+// errNoStagedArtifacts is the normal post-success state of the download dir:
+// nothing in it is newer than the running version, so there is nothing to
+// install. After a completed UMS cycle the staged .mender has become the
+// running version and is now the base, so this is not a failure and the
+// handler must not publish an error for it.
+var errNoStagedArtifacts = errors.New("no staged artifact applies to the running version")
+
 // listStagedArtifacts returns the .mender and .delta files staged in dir, or
 // empty slices when the dir does not exist yet. The base image of the running
 // version always lives here, so a non-empty result says nothing on its own.
@@ -1586,7 +1593,14 @@ func planStagedArtifacts(current string, menders, deltas []string) (stagedPlan, 
 			continue
 		}
 		base := normalizeDeltaBase(current, version.Channel(target))
-		if base == "" || version.Compare(strings.ToLower(target), base) <= 0 {
+		// A different channel is not a valid target for this install. Compare
+		// falls back to lexicographic order across channels, so a leftover
+		// testing-… artifact would rank above the running nightly-… image; gate
+		// on the channel first, as the delta branch and the cleanup sweeps do.
+		if !version.SameChannel(target, base) {
+			continue
+		}
+		if version.Compare(strings.ToLower(target), base) <= 0 {
 			continue
 		}
 		newerMenders = append(newerMenders, path)
@@ -1595,11 +1609,13 @@ func planStagedArtifacts(current string, menders, deltas []string) (stagedPlan, 
 	var candidates []string
 	for _, path := range deltas {
 		target := version.FromFilename(path)
-		if target == "" {
-			return stagedPlan{}, fmt.Errorf("staged delta %s has no parseable version", filepath.Base(path))
-		}
-		if version.Channel(target) == "" {
-			return stagedPlan{}, fmt.Errorf("staged delta %s has no recognized channel", filepath.Base(path))
+		if target == "" || version.Channel(target) == "" {
+			// Unparsable or unknown channel: like the .mender branch above it
+			// cannot be shown to be newer than the running version, so ignore
+			// it. A partially transferred file or an artifact with an
+			// unrecognised channel prefix must not refuse a legitimate chain
+			// staged beside it.
+			continue
 		}
 		if _, err := validateDeltaTarget(target, current); err != nil {
 			continue // not newer than the running version; stale
@@ -1616,7 +1632,7 @@ func planStagedArtifacts(current string, menders, deltas []string) (stagedPlan, 
 	case len(newerMenders) == 1:
 		return stagedPlan{fullImage: newerMenders[0]}, nil
 	case len(candidates) == 0:
-		return stagedPlan{}, fmt.Errorf("no staged artifact applies to the running version %s", current)
+		return stagedPlan{}, fmt.Errorf("%w %s", errNoStagedArtifacts, current)
 	}
 
 	sort.SliceStable(candidates, func(i, j int) bool {
@@ -1660,6 +1676,16 @@ func (u *Updater) handleApplyStagedUpdates() {
 
 	plan, err := planStagedArtifacts(current, menders, deltas)
 	if err != nil {
+		if errors.Is(err, errNoStagedArtifacts) {
+			// Legitimate post-success state (a retry, or a push delivered
+			// after the staged image already became the running version):
+			// log and go idle rather than reporting a failure.
+			u.logger.Printf("No staged updates apply to the running %s version %s; nothing to install", u.config.Component, current)
+			if idleErr := u.status.SetIdle(u.ctx); idleErr != nil {
+				u.logger.Printf("Failed to set idle status: %v", idleErr)
+			}
+			return
+		}
 		u.stagedRefusal("staged-updates-refused", err.Error())
 		return
 	}

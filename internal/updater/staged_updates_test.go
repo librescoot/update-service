@@ -218,6 +218,36 @@ func TestPlanStagedArtifacts(t *testing.T) {
 			deltas:   []string{d1, "librescoot-unu-mdb-v1.2.0.delta"},
 			wantDelt: []string{d1},
 		},
+		{
+			// A leftover cross-channel full image must not be ranked against
+			// the running version: Compare is lexicographic across channels,
+			// so a testing-… mender would compare as newer than a nightly-…
+			// install and be installed as a cross-channel image.
+			name:     "cross-channel newer full image is ignored",
+			menders:  []string{base, "librescoot-unu-mdb-testing-20260105T000000.mender"},
+			deltas:   []string{d1},
+			wantDelt: []string{d1},
+		},
+		{
+			name:    "cross-channel full image alone is not staged",
+			menders: []string{base, "librescoot-unu-mdb-testing-20260105T000000.mender"},
+			wantErr: "no staged artifact",
+		},
+		{
+			// An unparsable delta name (a manual/BLE leftover) is ignored like
+			// an unparsable .mender, so it cannot refuse a legitimate chain
+			// staged beside it.
+			name:     "unparsable delta name is ignored",
+			menders:  []string{base},
+			deltas:   []string{"update.delta", d1},
+			wantDelt: []string{d1},
+		},
+		{
+			name:    "delta with unknown channel prefix is ignored",
+			menders: []string{base},
+			deltas:  []string{"librescoot-unu-mdb-foo-bar.delta"},
+			wantErr: "no staged artifact",
+		},
 	}
 
 	for _, tc := range cases {
@@ -311,6 +341,41 @@ func TestResolveStagedDeltaChain(t *testing.T) {
 			t.Fatalf("ResolveStagedDeltaChain = %v, %v; want [%s]", got, err, d1)
 		}
 	})
+
+	t.Run("candidate without payload checksums refuses the set", func(t *testing.T) {
+		m, dir := newManager(t)
+		const baseVersion = "nightly-20260101t000000"
+		writeBaseMender(t, dir, "librescoot-unu-mdb-nightly-20260101T000000.mender", strings.Repeat("a", 64))
+		d1 := writeDeltaFile(t, dir, "librescoot-unu-mdb-nightly-20260102T000000.delta", strings.Repeat("a", 64), strings.Repeat("b", 64))
+		// Predates the payload-checksum fields: cannot be placed by checksum.
+		d2 := writeDeltaFile(t, dir, "librescoot-unu-mdb-nightly-20260103T000000.delta", "", "")
+
+		_, err := m.ResolveStagedDeltaChain([]string{d1, d2}, baseVersion)
+		if err == nil || !strings.Contains(err.Error(), "no payload checksums") {
+			t.Fatalf("err = %v, want a no-payload-checksums refusal", err)
+		}
+		if !isErrStagedChainAmbiguous(err) {
+			t.Fatalf("err = %v, want ErrStagedChainAmbiguous", err)
+		}
+	})
+
+	t.Run("unreadable base manifest refuses the set", func(t *testing.T) {
+		m, dir := newManager(t)
+		// Not a tar: the base rootfs checksum cannot be read from it.
+		if err := os.WriteFile(filepath.Join(dir, "librescoot-unu-mdb-nightly-20260101T000000.mender"), []byte("not a tar"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		d1 := writeDeltaFile(t, dir, "librescoot-unu-mdb-nightly-20260102T000000.delta", strings.Repeat("a", 64), strings.Repeat("b", 64))
+		d2 := writeDeltaFile(t, dir, "librescoot-unu-mdb-nightly-20260103T000000.delta", strings.Repeat("b", 64), strings.Repeat("c", 64))
+
+		_, err := m.ResolveStagedDeltaChain([]string{d1, d2}, "nightly-20260101t000000")
+		if err == nil || !strings.Contains(err.Error(), "base rootfs checksum") {
+			t.Fatalf("err = %v, want a base-checksum refusal", err)
+		}
+		if !isErrStagedChainAmbiguous(err) {
+			t.Fatalf("err = %v, want ErrStagedChainAmbiguous", err)
+		}
+	})
 }
 
 func isErrStagedChainAmbiguous(err error) bool {
@@ -372,6 +437,17 @@ func TestApplyLocalDeltaChainNoBaseImageDoesNotInstall(t *testing.T) {
 	}
 }
 
+func TestApplyLocalDeltaChainEmptyInputDoesNotInstall(t *testing.T) {
+	u, mr, installs := newStagedTestUpdater(t, "mdb")
+
+	u.applyLocalDeltaChainLocked(nil, "")
+
+	waitForField(t, mr, "ota", "error:mdb", "delta-rejected")
+	if len(*installs) != 0 {
+		t.Fatalf("install ran for an empty chain: %v", *installs)
+	}
+}
+
 func TestApplyLocalDeltaChainNonDeltaMemberDoesNotInstall(t *testing.T) {
 	u, mr, installs := newStagedTestUpdater(t, "mdb")
 	dir := u.mender.GetDownloadDir()
@@ -429,6 +505,29 @@ func TestHandleApplyStagedUpdatesInstallsNewerFullImage(t *testing.T) {
 
 	if len(*installs) != 1 || (*installs)[0] != newer {
 		t.Fatalf("installArtifact calls = %v, want [%s]", *installs, newer)
+	}
+}
+
+// TestHandleApplyStagedUpdatesNothingStagedGoesIdle pins the post-success
+// state: a repeat or late push can find nothing newer than the running version,
+// which must log and go idle rather than report staged-updates-refused.
+func TestHandleApplyStagedUpdatesNothingStagedGoesIdle(t *testing.T) {
+	u, mr, installs := newStagedTestUpdater(t, "mdb")
+	dir := u.mender.GetDownloadDir()
+	mr.HSet("version:mdb", "version_id", "nightly-20260101T000000")
+
+	writeBaseMender(t, dir, "librescoot-unu-mdb-nightly-20260101T000000.mender", strings.Repeat("a", 64))
+
+	u.handleApplyStagedUpdates()
+
+	if got := mr.HGet("ota", "status:mdb"); got != "idle" {
+		t.Errorf("status:mdb = %q, want idle", got)
+	}
+	if got := mr.HGet("ota", "error:mdb"); got != "" {
+		t.Errorf("error:mdb = %q, want empty", got)
+	}
+	if len(*installs) != 0 {
+		t.Fatalf("install ran with nothing staged: %v", *installs)
 	}
 }
 
