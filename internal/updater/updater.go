@@ -1708,6 +1708,17 @@ func (u *Updater) handleApplyStagedUpdates() {
 	u.applyLocalDeltaChainLocked(ordered, "")
 }
 
+// applyLocalDeltaChain runs the injected delta-chain applier, falling back to
+// the real mender.Manager method when the seam is unset. The production
+// constructor always injects it; the fallback only keeps an Updater built
+// directly by another test from panicking if its code reaches this path.
+func (u *Updater) applyLocalDeltaChain(ctx context.Context, deltaPaths, targets []string, baseVersion string, progress mender.DeltaProgressCallback) (string, error) {
+	if u.applyDeltaChain != nil {
+		return u.applyDeltaChain(ctx, deltaPaths, targets, baseVersion, progress)
+	}
+	return u.mender.ApplyDownloadedDeltaChain(ctx, deltaPaths, targets, baseVersion, progress)
+}
+
 // stagedRefusal publishes an error status for a staged drop refused before
 // anything was installed. A refusal during shutdown is suppressed like every
 // other terminal write: a canceled context means the board is rebooting or the
@@ -1859,7 +1870,7 @@ func (u *Updater) applyLocalDeltaChainLocked(deltaPaths []string, checksum strin
 		}
 	}
 
-	newMenderPath, err := u.applyDeltaChain(u.ctx, deltaPaths, targets, baseVersion, installProgressCallback)
+	newMenderPath, err := u.applyLocalDeltaChain(u.ctx, deltaPaths, targets, baseVersion, installProgressCallback)
 	if err != nil {
 		if u.ctx.Err() != nil {
 			u.logger.Printf("Delta apply interrupted (shutdown), staged deltas kept for retry")

@@ -721,9 +721,13 @@ func (m *Manager) ResolveStagedDeltaChain(candidates []string, baseVersion strin
 		return candidates, nil
 	}
 	want, err := delta.BaseRootfsChecksum(oldMenderPath)
-	if err != nil || want == "" {
+	if err != nil {
 		return nil, fmt.Errorf("%w: cannot read the base rootfs checksum from %s: %v",
 			ErrStagedChainAmbiguous, filepath.Base(oldMenderPath), err)
+	}
+	if want == "" {
+		return nil, fmt.Errorf("%w: base image %s records no rootfs checksum, so the chain cannot be resolved",
+			ErrStagedChainAmbiguous, filepath.Base(oldMenderPath))
 	}
 
 	type link struct {

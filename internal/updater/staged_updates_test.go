@@ -496,6 +496,29 @@ func TestApplyLocalDeltaChainOrderedReachesApplier(t *testing.T) {
 	}
 }
 
+// TestApplyLocalDeltaChainFallsBackWhenSeamUnset pins the nil-seam fallback:
+// an Updater built directly by another test, without the injected applier, must
+// reach the real mender applier rather than panicking on a nil seam.
+func TestApplyLocalDeltaChainFallsBackWhenSeamUnset(t *testing.T) {
+	u, mr, installs := newStagedTestUpdater(t, "mdb")
+	u.applyDeltaChain = nil
+	dir := u.mender.GetDownloadDir()
+	mr.HSet("version:mdb", "version_id", "nightly-20260101T000000")
+
+	baseSum := strings.Repeat("a", 64)
+	writeBaseMender(t, dir, "librescoot-unu-mdb-nightly-20260101T000000.mender", baseSum)
+	d1 := writeDeltaFile(t, dir, "librescoot-unu-mdb-nightly-20260102T000000.delta", baseSum, strings.Repeat("b", 64))
+
+	u.applyLocalDeltaChainLocked([]string{d1}, "")
+
+	// The real applier ran (and refused the fabricated delta) instead of a nil
+	// call panicking the process.
+	waitForField(t, mr, "ota", "error:mdb", "delta-apply-failed")
+	if len(*installs) != 0 {
+		t.Fatalf("install ran for a chain that could not be applied: %v", *installs)
+	}
+}
+
 // TestHandleApplyStagedUpdatesInstallsNewerFullImage is the end-to-end
 // discovery case: the running version's base .mender is present and ignored,
 // and the single newer .mender is installed once.
