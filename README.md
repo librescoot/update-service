@@ -31,9 +31,20 @@ Each instance accepts commands on `scooter:update:<component>`:
 | `check-now` | Start an immediate release check. |
 | `preview-channel:<channel>` | Resolve the latest matching artifact for a valid channel without starting an update. |
 | `update-from-file:<path>` | Install a local `.mender` or `.delta` artifact. |
+| `apply-staged-updates` | Discover the artifacts UMS staged in this component's download dir, resolve them, and install once. |
 | `update-from-url:<url>` | Download and install an artifact from `http`, `https`, or `file` URL. |
 
 For `update-from-file` and `update-from-url`, append `#sha256=<hex>` to request checksum verification. The legacy `:sha256:<hex>` suffix is also accepted. An unverified source is allowed when no checksum is supplied.
+
+`update-from-file` keeps its existing behaviour byte for byte: one `.mender` is a full image and one `.delta` is applied against the base image of the running version. A single delta is the one-file case of the chain path below, so it is prechecked the same way.
+
+`apply-staged-updates` is path-free. UMS stages artifacts in the canonical component download dir (`/data/ota/mdb`, or `/data/ota/dbc` on the DBC) and pushes this one command, and update-service owns the discovery. It resolves what to install as follows:
+
+- `.mender` files that are not newer than the running version are the delta bases and old full images that live in this dir permanently; they are ignored. The base for the running version has to be present for a delta to apply, so it is never a conflict.
+- a `.mender` newer than the running version together with any `.delta`, or two or more newer `.mender` files, is ambiguous: the whole set is refused (`staged-updates-refused`) and nothing is installed.
+- one newer `.mender` is installed as a full image. Otherwise the deltas newer than the running version are validated as one channel, strictly increasing chain that starts at the running version.
+
+A delta chain is resolved by matching each delta's recorded old payload checksum to the previous delta's new one. Two deltas built for the same base (a fork), or a delta that cannot be placed in the chain, refuses the whole set with a clear error; a subset is never applied. The chain is then applied in a single unpack/apply/repack cycle and installed with one mender write and one reboot. A chain whose base does not match the staged image is refused (`delta-base-mismatch`) and a running version with no staged base is refused (`no-base-image`) before anything is unpacked.
 
 The service stores component-scoped data in the `ota` hash, including `status:<component>`, `update-version:<component>`, download and install progress, and error details. `update-version:<component>` is the target of an active operation; it is not the running version. Primary statuses are `idle`, `downloading`, `preparing`, `installing`, `pending-reboot`, and `error`. Channel preview output is published as `preview-channel:<component>`, `preview-status:<component>`, `preview-version:<component>`, and `preview-size:<component>`.
 

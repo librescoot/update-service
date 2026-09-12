@@ -1178,6 +1178,17 @@ func (u *Updater) handleCommand(command string) {
 			u.previewChannel(channel)
 		}()
 
+	case command == "apply-staged-updates":
+		// Path-free: UMS stages the artifacts in this component's download
+		// dir (the canonical /data/ota/<component>) and update-service
+		// discovers what to install. See handleApplyStagedUpdates.
+		u.logger.Printf("Received apply-staged-updates command")
+		u.wg.Add(1)
+		go func() {
+			defer u.wg.Done()
+			u.handleApplyStagedUpdates()
+		}()
+
 	case strings.HasPrefix(command, "update-from-file:"):
 		filePath := strings.TrimSpace(strings.TrimPrefix(command, "update-from-file:"))
 		if filePath == "" {
@@ -1298,8 +1309,9 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		// full image: continues with the flow below
 	case strings.HasSuffix(source, ".delta"):
 		// locally delivered delta (BLE OTA path): apply against the base
-		// image of the running version, then install the assembled .mender
-		u.handleDeltaFromFileLocked(source, checksum)
+		// image of the running version, then install the assembled .mender.
+		// A single delta is the one-file case of the chain path.
+		u.applyLocalDeltaChainLocked([]string{source}, checksum)
 		return
 	default:
 		u.logger.Printf("Error: file is not a .mender or .delta file: %s", source)
@@ -1309,6 +1321,13 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		return
 	}
 
+	u.installLocalFullImage(source, checksum)
+}
+
+// installLocalFullImage publishes the target version, runs the DBC lifecycle
+// around a local .mender install and installs through the shared tail. Caller
+// must hold updateOpMu and have started the heartbeat (both callers do).
+func (u *Updater) installLocalFullImage(source, checksum string) {
 	// Fail early on a same-version full image instead of after the full
 	// artifact write (see sameVersionInstallErr).
 	if current, err := u.getCurrentVersion(); err != nil {
@@ -1344,11 +1363,10 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		return
 	}
 
-	if err := u.status.SetInstalling(u.ctx); err != nil {
-		u.logger.Printf("Failed to set installing status: %v", err)
-		return
-	}
-
+	// The install hold must cover the checksum verification below, which reads
+	// the whole artifact, exactly as it did when this tail lived in
+	// handleUpdateFromFile. installAssembledAndReboot takes the same hold again
+	// (idempotent) and removes it on the way out.
 	if u.config.Component == "mdb" {
 		if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
 			u.logger.Printf("Failed to add install inhibit: %v", err)
@@ -1379,53 +1397,27 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 		}
 	}
 
-	if err := u.installMender(source); err != nil {
-		u.logger.Printf("Failed to install update from file %s: %v", source, err)
-
+	// A corrupt full image is removed so the next check re-fetches it instead
+	// of failing on the same bytes. Deltas are verified by the applier, so
+	// only this path needs the retry.
+	u.installAssembledAndReboot(source, func(err error) bool {
 		errStr := err.Error()
 		isCorruptionError := strings.Contains(errStr, "gzip") ||
 			strings.Contains(errStr, "checksum") ||
 			strings.Contains(errStr, "corrupt") ||
 			strings.Contains(errStr, "truncated")
-
-		if isCorruptionError {
-			u.logger.Printf("Installation failed due to file corruption, deleting corrupted file: %s", source)
-			if removeErr := u.mender.RemoveFile(source); removeErr != nil {
-				u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
-			} else {
-				u.logger.Printf("Deleted corrupted file, restarting update check")
-				u.restartCheckAfterCorruptFile(true)
-				return
-			}
+		if !isCorruptionError {
+			return false
 		}
-
-		if u.skipTerminalErrorOnShutdown("file update install") {
-			return
+		u.logger.Printf("Installation failed due to file corruption, deleting corrupted file: %s", source)
+		if removeErr := u.mender.RemoveFile(source); removeErr != nil {
+			u.logger.Printf("Warning: Failed to delete corrupted file: %v", removeErr)
+			return false
 		}
-		if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install update from file %s: %v", source, err)); err != nil {
-			u.logger.Printf("Failed to set error status: %v", err)
-		}
-		return
-	}
-
-	u.logger.Printf("Successfully installed update from file: %s", source)
-
-	if err := u.status.SetPendingReboot(u.ctx); err != nil {
-		u.logger.Printf("Failed to set pending-reboot status: %v", err)
-	}
-
-	if err := u.TriggerReboot(u.config.Component, true); err != nil {
-		u.logger.Printf("Failed to trigger %s reboot after file update: %v", u.config.Component, err)
-		if !strings.Contains(err.Error(), "DRY-RUN") {
-			u.setRebootTriggerError(u.config.Component, err)
-			return
-		}
-
-		u.logger.Printf("Dry run: setting idle status for %s after file update", u.config.Component)
-		if idleErr := u.status.SetIdle(u.ctx); idleErr != nil {
-			u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
-		}
-	}
+		u.logger.Printf("Deleted corrupted file, restarting update check")
+		u.restartCheckAfterCorruptFile(true)
+		return true
+	}, nil, true)
 }
 
 // normalizeDeltaBase normalizes an installed version_id for comparison against
@@ -1497,20 +1489,255 @@ func sameVersionInstallErr(target, current string) error {
 	return nil
 }
 
-// handleDeltaFromFileLocked installs a locally delivered .delta file (BLE OTA
-// path): the delta is applied against the base .mender of the running version
-// in the download dir — where BLE transfers are staged too — and the assembled
-// full image is installed. Caller must hold updateOpMu.
-func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
-	target := version.FromFilename(source)
+// validateDeltaChain checks an ordered chain of delta target versions: every
+// target must parse and sit on one channel, each must be strictly newer than
+// the one before, and the first must be a valid successor of the installed
+// version (validateDeltaTarget). It returns the normalized base version for
+// the first link.
+//
+// Only the first link can be judged against the running version; a later
+// link's real base is the previous delta's output. Whether the chain is
+// contiguous in that sense — each delta's recorded old payload checksum
+// matching the previous delta's new one — is checked against the deltas
+// themselves by ApplyDownloadedDeltaChain, before anything is unpacked.
+func validateDeltaChain(targets []string, current string) (string, error) {
+	if len(targets) == 0 {
+		return "", fmt.Errorf("empty delta chain")
+	}
+	base, err := validateDeltaTarget(targets[0], current)
+	if err != nil {
+		return "", err
+	}
+	channel := version.Channel(targets[0])
+	for i := 1; i < len(targets); i++ {
+		target := targets[i]
+		if target == "" {
+			return "", fmt.Errorf("cannot parse delta %d target version", i+1)
+		}
+		if version.Channel(target) != channel {
+			return "", fmt.Errorf("delta %d is for channel %s, chain is %s", i+1, version.Channel(target), channel)
+		}
+		if version.Compare(strings.ToLower(target), strings.ToLower(targets[i-1])) <= 0 {
+			return "", fmt.Errorf("delta %d (%s) not newer than %s", i+1, target, targets[i-1])
+		}
+	}
+	return base, nil
+}
+
+// stagedPlan is what artifacts staged in a component download dir resolve to:
+// exactly one of fullImage or deltas is set. The paths are absolute paths
+// inside that download dir.
+type stagedPlan struct {
+	fullImage   string
+	deltas      []string
+	baseVersion string
+}
+
+// listStagedArtifacts returns the .mender and .delta files staged in dir, or
+// empty slices when the dir does not exist yet. The base image of the running
+// version always lives here, so a non-empty result says nothing on its own.
+func listStagedArtifacts(dir string) (menders, deltas []string, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(entry.Name(), ".mender"):
+			menders = append(menders, filepath.Join(dir, entry.Name()))
+		case strings.HasSuffix(entry.Name(), ".delta"):
+			deltas = append(deltas, filepath.Join(dir, entry.Name()))
+		}
+	}
+	return menders, deltas, nil
+}
+
+// planStagedArtifacts classifies the artifacts staged in a component download
+// dir against the running version and decides what to install. It implements
+// the UMS drop contract:
+//
+//   - .mender files that are not newer than the running version are the delta
+//     bases and old full images that live in this dir permanently. They are
+//     ignored: the base for the running version has to be here for a delta to
+//     apply at all, so it is never a conflict.
+//   - a .mender newer than the running version staged together with any .delta,
+//     or two or more such .mender files, is ambiguous. The caller refuses the
+//     whole set and installs nothing.
+//   - one newer .mender is the full image to install. Otherwise the deltas
+//     newer than the running version are validated as one channel, strictly
+//     increasing chain that starts at the running version.
+//
+// Deltas that are not newer than the running version are stale and ignored.
+// Chain contiguity (a fork, or a delta that cannot be placed) is checked
+// against the deltas' recorded payload checksums by ResolveStagedDeltaChain.
+func planStagedArtifacts(current string, menders, deltas []string) (stagedPlan, error) {
+	var newerMenders []string
+	for _, path := range menders {
+		target := version.FromFilename(path)
+		if target == "" {
+			// Unparsable: it cannot be shown to be newer, so treat it as an
+			// old image. mender itself refuses a bad artifact.
+			continue
+		}
+		base := normalizeDeltaBase(current, version.Channel(target))
+		if base == "" || version.Compare(strings.ToLower(target), base) <= 0 {
+			continue
+		}
+		newerMenders = append(newerMenders, path)
+	}
+
+	var candidates []string
+	for _, path := range deltas {
+		target := version.FromFilename(path)
+		if target == "" {
+			return stagedPlan{}, fmt.Errorf("staged delta %s has no parseable version", filepath.Base(path))
+		}
+		if version.Channel(target) == "" {
+			return stagedPlan{}, fmt.Errorf("staged delta %s has no recognized channel", filepath.Base(path))
+		}
+		if _, err := validateDeltaTarget(target, current); err != nil {
+			continue // not newer than the running version; stale
+		}
+		candidates = append(candidates, path)
+	}
+
+	switch {
+	case len(newerMenders) > 0 && len(deltas) > 0:
+		return stagedPlan{}, fmt.Errorf("%d full image(s) newer than the running version staged together with %d delta(s); it is ambiguous whether to full-update or delta-update",
+			len(newerMenders), len(deltas))
+	case len(newerMenders) > 1:
+		return stagedPlan{}, fmt.Errorf("%d full images newer than the running version are staged; it is ambiguous which one to install", len(newerMenders))
+	case len(newerMenders) == 1:
+		return stagedPlan{fullImage: newerMenders[0]}, nil
+	case len(candidates) == 0:
+		return stagedPlan{}, fmt.Errorf("no staged artifact applies to the running version %s", current)
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return version.Compare(version.FromFilename(candidates[i]), version.FromFilename(candidates[j])) < 0
+	})
+	targets := make([]string, len(candidates))
+	for i, p := range candidates {
+		targets[i] = version.FromFilename(p)
+	}
+	baseVersion, err := validateDeltaChain(targets, current)
+	if err != nil {
+		return stagedPlan{}, err
+	}
+	return stagedPlan{deltas: candidates, baseVersion: baseVersion}, nil
+}
+
+// handleApplyStagedUpdates installs whatever UMS staged in this component's
+// download dir with one mender install and one reboot. Unlike update-from-file
+// the command carries no paths: update-service owns the discovery, so a staged
+// delta chain is applied as one image without the caller naming its members.
+func (u *Updater) handleApplyStagedUpdates() {
+	if !u.updateOpMu.TryLock() {
+		u.logger.Printf("Update already in progress, ignoring apply-staged-updates")
+		return
+	}
+	defer u.updateOpMu.Unlock()
+	defer u.startHeartbeat()()
+
+	dir := u.mender.GetDownloadDir()
+	menders, deltas, err := listStagedArtifacts(dir)
+	if err != nil {
+		u.stagedRefusal("staged-read-failed", fmt.Sprintf("cannot read staged updates in %s: %v", dir, err))
+		return
+	}
+
+	current, err := u.getCurrentVersion()
+	if err != nil || strings.TrimSpace(current) == "" {
+		u.stagedRefusal("no-running-version", fmt.Sprintf("cannot determine the running %s version: %v", u.config.Component, err))
+		return
+	}
+
+	plan, err := planStagedArtifacts(current, menders, deltas)
+	if err != nil {
+		u.stagedRefusal("staged-updates-refused", err.Error())
+		return
+	}
+
+	if plan.fullImage != "" {
+		u.logger.Printf("Staged updates resolve to full image %s", filepath.Base(plan.fullImage))
+		u.installLocalFullImage(plan.fullImage, "")
+		return
+	}
+
+	ordered, err := u.mender.ResolveStagedDeltaChain(plan.deltas, plan.baseVersion)
+	if err != nil {
+		u.stagedRefusal("staged-updates-refused", err.Error())
+		return
+	}
+	u.logger.Printf("Staged updates resolve to a %d-delta chain ending at %s",
+		len(ordered), filepath.Base(ordered[len(ordered)-1]))
+	u.applyLocalDeltaChainLocked(ordered, "")
+}
+
+// stagedRefusal publishes an error status for a staged drop refused before
+// anything was installed.
+func (u *Updater) stagedRefusal(code, detail string) {
+	u.logger.Printf("Refusing staged updates (%s): %s", code, detail)
+	if err := u.status.SetError(u.ctx, code, detail); err != nil {
+		u.logger.Printf("Failed to set error status: %v", err)
+	}
+}
+
+// applyLocalDeltaChainLocked applies a chain of already-staged local .delta
+// files against the base image of the running version and installs the
+// assembled .mender. A single delta is a chain of one, which is how the
+// update-from-file delta path (BLE OTA) and the UMS chain command share this
+// routine. checksum is an optional "sha256:<hex>" for the one-delta case;
+// chain callers pass "".
+//
+// Caller must hold updateOpMu.
+func (u *Updater) applyLocalDeltaChainLocked(deltaPaths []string, checksum string) {
+	if len(deltaPaths) == 0 {
+		u.logger.Printf("Error: no delta files provided")
+		if err := u.status.SetError(u.ctx, "delta-rejected", "no delta files provided"); err != nil {
+			u.logger.Printf("Failed to set error status: %v", err)
+		}
+		return
+	}
+
+	for _, p := range deltaPaths {
+		if !strings.HasSuffix(p, ".delta") {
+			u.logger.Printf("Error: file is not a .delta file: %s", p)
+			if err := u.status.SetError(u.ctx, "invalid-file", fmt.Sprintf("File is not a .delta file: %s", p)); err != nil {
+				u.logger.Printf("Failed to set error status: %v", err)
+			}
+			return
+		}
+		if _, err := os.Stat(p); err != nil {
+			u.logger.Printf("Error: file not found: %s", p)
+			if err := u.status.SetError(u.ctx, "file-not-found", fmt.Sprintf("File not found: %s", p)); err != nil {
+				u.logger.Printf("Failed to set error status: %v", err)
+			}
+			return
+		}
+	}
+
+	targets := make([]string, len(deltaPaths))
+	for i, p := range deltaPaths {
+		targets[i] = version.FromFilename(p)
+	}
+	finalTarget := targets[len(targets)-1]
+	chain := strings.Join(deltaPaths, ", ")
+
 	currentVersion, err := u.getCurrentVersion()
 	if err != nil {
 		u.logger.Printf("Failed to get current %s version: %v", u.config.Component, err)
 	}
 
-	baseVersion, err := validateDeltaTarget(target, currentVersion)
+	baseVersion, err := validateDeltaChain(targets, currentVersion)
 	if err != nil {
-		u.logger.Printf("Rejecting delta %s (installed %q): %v", source, currentVersion, err)
+		u.logger.Printf("Rejecting delta %s (installed %q): %v", chain, currentVersion, err)
 		if statusErr := u.status.SetError(u.ctx, "delta-rejected", err.Error()); statusErr != nil {
 			u.logger.Printf("Failed to set error status: %v", statusErr)
 		}
@@ -1518,16 +1745,16 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 	}
 
 	if _, ok := u.mender.FindMenderFileForVersion(baseVersion); !ok {
-		u.logger.Printf("No base image for running version %s, cannot apply delta %s", currentVersion, source)
+		u.logger.Printf("No base image for running version %s, cannot apply delta %s", currentVersion, chain)
 		if err := u.status.SetError(u.ctx, "no-base-image", "no base image for delta; full update required"); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
 	}
 
-	u.logger.Printf("Applying delta from file: %s (%s -> %s)", source, baseVersion, target)
+	u.logger.Printf("Applying delta from file: %s (%s -> %s)", chain, baseVersion, finalTarget)
 
-	if err := u.status.SetDownloading(u.ctx, strings.ToLower(target), "delta"); err != nil {
+	if err := u.status.SetDownloading(u.ctx, strings.ToLower(finalTarget), "delta"); err != nil {
 		u.logger.Printf("Failed to set downloading status: %v", err)
 		return
 	}
@@ -1539,9 +1766,6 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 		defer func() {
 			if err := u.inhibitor.RemovePreparingInhibit(u.config.Component); err != nil {
 				u.logger.Printf("Failed to remove preparing inhibit: %v", err)
-			}
-			if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
-				u.logger.Printf("Failed to remove install inhibit: %v", err)
 			}
 		}()
 	}
@@ -1555,12 +1779,12 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 	}
 
 	if checksum != "" {
-		u.logger.Printf("Verifying checksum for %s", source)
-		if err := u.mender.VerifyChecksum(source, checksum); err != nil {
-			u.logger.Printf("Checksum verification failed for %s: %v", source, err)
+		u.logger.Printf("Verifying checksum for %s", deltaPaths[0])
+		if err := u.mender.VerifyChecksum(deltaPaths[0], checksum); err != nil {
+			u.logger.Printf("Checksum verification failed for %s: %v", deltaPaths[0], err)
 			// CleanupDeltaFile logs its own failures; the error status set
 			// below is what actually gets reported.
-			_ = u.mender.CleanupDeltaFile(source)
+			_ = u.mender.CleanupDeltaFile(deltaPaths[0])
 			if err := u.status.SetError(u.ctx, "checksum-mismatch", fmt.Sprintf("Checksum verification failed: %v", err)); err != nil {
 				u.logger.Printf("Failed to set error status: %v", err)
 			}
@@ -1576,16 +1800,21 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 		u.logger.Printf("Failed to request ondemand governor: %v", err)
 	}
 
+	// A chain apply runs for minutes, so hold off idle suspend for its whole
+	// duration, as the URL/multi-delta path does. Bounded by
+	// download-max-duration; a disabled cap means no hold (see holdSuspend).
+	defer u.holdSuspend()()
+
 	installProgressCallback := func(percent int) {
 		if err := u.status.SetInstallProgress(u.ctx, percent); err != nil {
 			u.logger.Printf("Failed to set install progress: %v", err)
 		}
 	}
 
-	newMenderPath, err := u.mender.ApplyDownloadedDelta(u.ctx, source, baseVersion, installProgressCallback)
+	newMenderPath, err := u.mender.ApplyDownloadedDeltaChain(u.ctx, deltaPaths, targets, baseVersion, installProgressCallback)
 	if err != nil {
 		if u.ctx.Err() != nil {
-			u.logger.Printf("Delta apply interrupted (shutdown), staged delta kept for retry")
+			u.logger.Printf("Delta apply interrupted (shutdown), staged deltas kept for retry")
 			return
 		}
 		u.logger.Printf("Delta apply failed: %v", err)
@@ -1609,46 +1838,87 @@ func (u *Updater) handleDeltaFromFileLocked(source, checksum string) {
 		return
 	}
 
+	// The preparation phase is over; installAssembledAndReboot takes the
+	// install hold before removing the preparing hold, so power stays guarded
+	// across the handover. The applier verified the per-file and rootfs
+	// checksums of the assembled image, so there is no corruption-retry path
+	// here (unlike raw downloads).
+	u.installAssembledAndReboot(newMenderPath, nil, func() {
+		u.mender.CleanupStaleDeltaFiles(deltaMaxAge)
+	}, false)
+}
+
+// installAssembledAndReboot installs an assembled .mender artifact and drives
+// the update through to the reboot. It is the tail every local install path
+// shares — the full image from file, a single delta from file, and a delta
+// chain from file — so the MDB install inhibit, the installing status, the
+// pending-reboot transition, and the reboot-trigger handling exist once.
+//
+// The caller has already made the component power-safe for the preceding
+// phase and published the downloading/preparing status. handleInstallError,
+// if non-nil, gets the mender install error before the generic error status
+// and returns true when it handled the failure itself (the full-image path
+// uses this to drop a corrupt artifact). onInstalled, if non-nil, runs after a
+// successful write and before pending-reboot. requireInstallingStatus aborts
+// the install when the installing status cannot be published: that is the
+// full-image path's long-standing behaviour, kept so a redis outage does not
+// write an image it cannot then commit. The delta paths only log.
+func (u *Updater) installAssembledAndReboot(menderPath string, handleInstallError func(error) bool, onInstalled func(), requireInstallingStatus bool) {
 	if err := u.status.SetInstalling(u.ctx); err != nil {
 		u.logger.Printf("Failed to set installing status: %v", err)
+		if requireInstallingStatus {
+			return
+		}
 	}
+
 	if u.config.Component == "mdb" {
+		// Take the install hold before releasing the preparing hold, so there
+		// is no window with neither (the ordering used everywhere else in this
+		// file, e.g. the URL path and the release-channel delta path).
 		if err := u.inhibitor.AddInstallInhibit(u.config.Component); err != nil {
 			u.logger.Printf("Failed to add install inhibit: %v", err)
 		}
 		if err := u.inhibitor.RemovePreparingInhibit(u.config.Component); err != nil {
 			u.logger.Printf("Failed to remove preparing inhibit: %v", err)
 		}
+		defer func() {
+			if err := u.inhibitor.RemoveInstallInhibit(u.config.Component); err != nil {
+				u.logger.Printf("Failed to remove install inhibit: %v", err)
+			}
+		}()
 	}
 
-	// The applier verified the per-file and rootfs checksums of the assembled
-	// image, so there is no corruption-retry path here (unlike raw downloads).
-	if err := u.installMender(newMenderPath); err != nil {
-		u.logger.Printf("Failed to install assembled delta update %s: %v", newMenderPath, err)
-		if u.skipTerminalErrorOnShutdown("assembled delta install") {
+	if err := u.installMender(menderPath); err != nil {
+		u.logger.Printf("Failed to install update from file %s: %v", menderPath, err)
+		if handleInstallError != nil && handleInstallError(err) {
 			return
 		}
-		if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install update from file %s: %v", newMenderPath, err)); err != nil {
+		if u.skipTerminalErrorOnShutdown("update install") {
+			return
+		}
+		if err := u.status.SetError(u.ctx, installErrorCode(err), fmt.Sprintf("Failed to install update from file %s: %v", menderPath, err)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
 	}
 
-	u.logger.Printf("Successfully installed delta update from file: %s -> %s", baseVersion, target)
-	u.mender.CleanupStaleDeltaFiles(deltaMaxAge)
+	u.logger.Printf("Successfully installed update from file: %s", menderPath)
+	if onInstalled != nil {
+		onInstalled()
+	}
 
 	if err := u.status.SetPendingReboot(u.ctx); err != nil {
 		u.logger.Printf("Failed to set pending-reboot status: %v", err)
 	}
 
 	if err := u.TriggerReboot(u.config.Component, true); err != nil {
-		u.logger.Printf("Failed to trigger %s reboot after delta file update: %v", u.config.Component, err)
+		u.logger.Printf("Failed to trigger %s reboot after file update: %v", u.config.Component, err)
 		if !strings.Contains(err.Error(), "DRY-RUN") {
 			u.setRebootTriggerError(u.config.Component, err)
 			return
 		}
 
-		u.logger.Printf("Dry run: setting idle status for %s after delta file update", u.config.Component)
+		u.logger.Printf("Dry run: setting idle status for %s after file update", u.config.Component)
 		if idleErr := u.status.SetIdle(u.ctx); idleErr != nil {
 			u.logger.Printf("Failed to set idle status in dry run for %s: %v", u.config.Component, idleErr)
 		}

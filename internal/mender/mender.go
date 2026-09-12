@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/librescoot/update-service/internal/mender/delta"
 	"github.com/librescoot/update-service/internal/version"
 )
 
@@ -682,6 +683,95 @@ func (m *Manager) ApplyDownloadedDeltaChain(ctx context.Context, deltaPaths []st
 	}
 
 	return newMenderPath, nil
+}
+
+// ErrStagedChainAmbiguous reports a set of staged deltas that cannot be
+// resolved into one contiguous chain from the running version's base image:
+// two deltas built for the same base (a fork), or a delta that cannot be
+// placed in the chain. The caller refuses the whole set rather than applying a
+// subset.
+var ErrStagedChainAmbiguous = errors.New("staged delta chain is ambiguous")
+
+// ResolveStagedDeltaChain orders candidates into the contiguous chain that
+// starts at the base image for baseVersion, by matching each delta's recorded
+// old payload checksum to the previous delta's new checksum (the same link
+// ApplyChain verifies, but here it also catches forks and unplaceable deltas
+// before anything is unpacked). candidates must already be validated as one
+// channel and strictly increasing.
+//
+// A missing base, or a delta predating the payload-checksum fields, leaves the
+// chain unverifiable; the candidates are returned in the supplied order and the
+// downstream apply reports what it can. len(candidates) <= 1 is returned
+// unchanged.
+func (m *Manager) ResolveStagedDeltaChain(candidates []string, baseVersion string) ([]string, error) {
+	if len(candidates) <= 1 {
+		return candidates, nil
+	}
+
+	oldMenderPath, ok := m.FindMenderFileForVersion(baseVersion)
+	if !ok {
+		// The downstream apply reports the missing base; there is nothing
+		// here to anchor the chain to.
+		return candidates, nil
+	}
+	want, err := delta.BaseRootfsChecksum(oldMenderPath)
+	if err != nil || want == "" {
+		m.logger.Printf("Cannot read base rootfs checksum from %s: %v (keeping staged order)", oldMenderPath, err)
+		return candidates, nil
+	}
+
+	type link struct {
+		path   string
+		oldSum string
+		newSum string
+	}
+	remaining := make([]link, 0, len(candidates))
+	for _, p := range candidates {
+		meta, readErr := delta.ReadMetadata(p)
+		if readErr != nil {
+			return nil, fmt.Errorf("%w: read metadata for %s: %v", ErrStagedChainAmbiguous, filepath.Base(p), readErr)
+		}
+		remaining = append(remaining, link{path: p, oldSum: meta.OldPayloadChecksum, newSum: meta.NewPayloadChecksum})
+	}
+	for _, l := range remaining {
+		if l.oldSum == "" || l.newSum == "" {
+			// A delta predating the payload-checksum fields cannot be placed
+			// by checksum. Fall back to the supplied order, which
+			// validateDeltaChain has already checked is strictly increasing.
+			m.logger.Printf("Delta %s carries no payload checksums, keeping staged order", filepath.Base(l.path))
+			return candidates, nil
+		}
+	}
+
+	chain := make([]string, 0, len(remaining))
+	for len(remaining) > 0 {
+		var matches []link
+		for _, l := range remaining {
+			if l.oldSum == want {
+				matches = append(matches, l)
+			}
+		}
+		if len(matches) == 0 {
+			break
+		}
+		if len(matches) > 1 {
+			return nil, fmt.Errorf("%w: %d staged deltas were built for the same base image", ErrStagedChainAmbiguous, len(matches))
+		}
+		chain = append(chain, matches[0].path)
+		want = matches[0].newSum
+		kept := make([]link, 0, len(remaining)-1)
+		for _, l := range remaining {
+			if l.path != matches[0].path {
+				kept = append(kept, l)
+			}
+		}
+		remaining = kept
+	}
+	if len(chain) != len(candidates) {
+		return nil, fmt.Errorf("%w: %d of %d staged deltas do not fit the chain from %s",
+			ErrStagedChainAmbiguous, len(candidates)-len(chain), len(candidates), baseVersion)
+	}
+	return chain, nil
 }
 
 // CleanupDeltaFile removes a delta file (used when downloads are cancelled or fail)

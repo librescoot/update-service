@@ -170,21 +170,45 @@ func TestInstallMenderMDBDoesNotUseDBCBlock(t *testing.T) {
 }
 
 // Prevent new rootfs install paths from bypassing the power-safety gate.
+// Every non-test .go file in the package is scanned, so a bypass added in a
+// new file moves one of the counts just as a bypass in updater.go would.
 func TestAllMenderInstallsUseSafetyGate(t *testing.T) {
-	source, err := os.ReadFile("updater.go")
+	files, err := filepath.Glob("*.go")
 	if err != nil {
-		t.Fatalf("ReadFile(updater.go) failed: %v", err)
+		t.Fatalf("Glob(*.go) failed: %v", err)
+	}
+	var text string
+	scanned := 0
+	for _, file := range files {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		source, readErr := os.ReadFile(file)
+		if readErr != nil {
+			t.Fatalf("ReadFile(%s) failed: %v", file, readErr)
+		}
+		text += string(source)
+		scanned++
+	}
+	if scanned == 0 {
+		t.Fatal("scanned no non-test Go files in package updater")
 	}
 
-	text := string(source)
 	if strings.Contains(text, "u.mender.Install(") {
 		t.Fatal("found direct mender Install call outside the safety gate")
 	}
 	if got := strings.Count(text, "u.installArtifact("); got != 1 {
 		t.Fatalf("found %d low-level installer calls, want exactly one inside installMender", got)
 	}
-	if got := strings.Count(text, "u.installMender("); got != 5 {
-		t.Fatalf("found %d guarded rootfs install paths, want 5", got)
+	// Every rootfs install is either a direct u.installMender call or one of
+	// the local-file paths that reach it through installAssembledAndReboot
+	// (the shared install tail). A new path of either shape moves one of
+	// these two counts, so a bypass cannot be added silently.
+	if got := strings.Count(text, "u.installMender("); got != 4 {
+		t.Fatalf("found %d guarded rootfs install sites, want 4", got)
+	}
+	if got := strings.Count(text, "u.installAssembledAndReboot("); got != 2 {
+		t.Fatalf("found %d shared local-file install call sites, want 2", got)
 	}
 }
 
