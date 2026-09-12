@@ -42,6 +42,7 @@ type Updater struct {
 	commitUpdate      func() error
 	resumeUpdate      func() error
 	installArtifact   func(string, mender.InstallProgressCallback) error
+	applyDeltaChain   func(context.Context, []string, []string, string, mender.DeltaProgressCallback) (string, error)
 	dbcInstallGuard   dbcInstallGuard
 	localReboot       func() error
 	dbcStateCache     string
@@ -176,6 +177,7 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		commitUpdate:    manager.Commit,
 		resumeUpdate:    manager.Resume,
 		installArtifact: manager.Install,
+		applyDeltaChain: manager.ApplyDownloadedDeltaChain,
 		dbcInstallGuard: inhibitorClient,
 		localReboot: func() error {
 			return localRebootCommand().Run()
@@ -1417,7 +1419,7 @@ func (u *Updater) installLocalFullImage(source, checksum string) {
 		u.logger.Printf("Deleted corrupted file, restarting update check")
 		u.restartCheckAfterCorruptFile(true)
 		return true
-	}, nil, true)
+	}, nil, true, "")
 }
 
 // normalizeDeltaBase normalizes an installed version_id for comparison against
@@ -1837,7 +1839,7 @@ func (u *Updater) applyLocalDeltaChainLocked(deltaPaths []string, checksum strin
 		}
 	}
 
-	newMenderPath, err := u.mender.ApplyDownloadedDeltaChain(u.ctx, deltaPaths, targets, baseVersion, installProgressCallback)
+	newMenderPath, err := u.applyDeltaChain(u.ctx, deltaPaths, targets, baseVersion, installProgressCallback)
 	if err != nil {
 		if u.ctx.Err() != nil {
 			u.logger.Printf("Delta apply interrupted (shutdown), staged deltas kept for retry")
@@ -1871,7 +1873,7 @@ func (u *Updater) applyLocalDeltaChainLocked(deltaPaths []string, checksum strin
 	// here (unlike raw downloads).
 	u.installAssembledAndReboot(newMenderPath, nil, func() {
 		u.mender.CleanupStaleDeltaFiles(deltaMaxAge)
-	}, false)
+	}, false, fmt.Sprintf(" (%s -> %s)", baseVersion, finalTarget))
 }
 
 // installAssembledAndReboot installs an assembled .mender artifact and drives
@@ -1888,8 +1890,10 @@ func (u *Updater) applyLocalDeltaChainLocked(deltaPaths []string, checksum strin
 // successful write and before pending-reboot. requireInstallingStatus aborts
 // the install when the installing status cannot be published: that is the
 // full-image path's long-standing behaviour, kept so a redis outage does not
-// write an image it cannot then commit. The delta paths only log.
-func (u *Updater) installAssembledAndReboot(menderPath string, handleInstallError func(error) bool, onInstalled func(), requireInstallingStatus bool) {
+// write an image it cannot then commit. The delta paths only log. detail is
+// appended to the success log line, so the delta path keeps naming the
+// base -> target it assembled.
+func (u *Updater) installAssembledAndReboot(menderPath string, handleInstallError func(error) bool, onInstalled func(), requireInstallingStatus bool, detail string) {
 	if err := u.status.SetInstalling(u.ctx); err != nil {
 		u.logger.Printf("Failed to set installing status: %v", err)
 		if requireInstallingStatus {
@@ -1928,7 +1932,7 @@ func (u *Updater) installAssembledAndReboot(menderPath string, handleInstallErro
 		return
 	}
 
-	u.logger.Printf("Successfully installed update from file: %s", menderPath)
+	u.logger.Printf("Successfully installed update from file: %s%s", menderPath, detail)
 	if onInstalled != nil {
 		onInstalled()
 	}
