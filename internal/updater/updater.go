@@ -1709,9 +1709,14 @@ func (u *Updater) handleApplyStagedUpdates() {
 }
 
 // stagedRefusal publishes an error status for a staged drop refused before
-// anything was installed.
+// anything was installed. A refusal during shutdown is suppressed like every
+// other terminal write: a canceled context means the board is rebooting or the
+// service is stopping, and the next instance restores the lifecycle.
 func (u *Updater) stagedRefusal(code, detail string) {
 	u.logger.Printf("Refusing staged updates (%s): %s", code, detail)
+	if u.skipTerminalErrorOnShutdown("staged-update refusal") {
+		return
+	}
 	if err := u.status.SetError(u.ctx, code, detail); err != nil {
 		u.logger.Printf("Failed to set error status: %v", err)
 	}
@@ -1728,6 +1733,9 @@ func (u *Updater) stagedRefusal(code, detail string) {
 func (u *Updater) applyLocalDeltaChainLocked(deltaPaths []string, checksum string) {
 	if len(deltaPaths) == 0 {
 		u.logger.Printf("Error: no delta files provided")
+		if u.skipTerminalErrorOnShutdown("empty delta chain") {
+			return
+		}
 		if err := u.status.SetError(u.ctx, "delta-rejected", "no delta files provided"); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
@@ -1737,6 +1745,9 @@ func (u *Updater) applyLocalDeltaChainLocked(deltaPaths []string, checksum strin
 	for _, p := range deltaPaths {
 		if !strings.HasSuffix(p, ".delta") {
 			u.logger.Printf("Error: file is not a .delta file: %s", p)
+			if u.skipTerminalErrorOnShutdown("invalid delta file") {
+				return
+			}
 			if err := u.status.SetError(u.ctx, "invalid-file", fmt.Sprintf("File is not a .delta file: %s", p)); err != nil {
 				u.logger.Printf("Failed to set error status: %v", err)
 			}
@@ -1744,6 +1755,9 @@ func (u *Updater) applyLocalDeltaChainLocked(deltaPaths []string, checksum strin
 		}
 		if _, err := os.Stat(p); err != nil {
 			u.logger.Printf("Error: file not found: %s", p)
+			if u.skipTerminalErrorOnShutdown("missing delta file") {
+				return
+			}
 			if err := u.status.SetError(u.ctx, "file-not-found", fmt.Sprintf("File not found: %s", p)); err != nil {
 				u.logger.Printf("Failed to set error status: %v", err)
 			}
@@ -1766,6 +1780,9 @@ func (u *Updater) applyLocalDeltaChainLocked(deltaPaths []string, checksum strin
 	baseVersion, err := validateDeltaChain(targets, currentVersion)
 	if err != nil {
 		u.logger.Printf("Rejecting delta %s (installed %q): %v", chain, currentVersion, err)
+		if u.skipTerminalErrorOnShutdown("delta rejection") {
+			return
+		}
 		if statusErr := u.status.SetError(u.ctx, "delta-rejected", err.Error()); statusErr != nil {
 			u.logger.Printf("Failed to set error status: %v", statusErr)
 		}
@@ -1774,6 +1791,9 @@ func (u *Updater) applyLocalDeltaChainLocked(deltaPaths []string, checksum strin
 
 	if _, ok := u.mender.FindMenderFileForVersion(baseVersion); !ok {
 		u.logger.Printf("No base image for running version %s, cannot apply delta %s", currentVersion, chain)
+		if u.skipTerminalErrorOnShutdown("missing base image") {
+			return
+		}
 		if err := u.status.SetError(u.ctx, "no-base-image", "no base image for delta; full update required"); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}

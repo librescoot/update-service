@@ -561,6 +561,33 @@ func TestHandleApplyStagedUpdatesRefusesForkedChain(t *testing.T) {
 	}
 }
 
+// TestHandleApplyStagedUpdatesRefusalSuppressedOnShutdown pins the upstream
+// shutdown guard at the staged refusal site: a canceled context means the board
+// is rebooting or the service is stopping, so a refused staged set must not
+// publish a terminal error (the next instance restores the lifecycle).
+func TestHandleApplyStagedUpdatesRefusalSuppressedOnShutdown(t *testing.T) {
+	u, mr, installs := newStagedTestUpdater(t, "mdb")
+	dir := u.mender.GetDownloadDir()
+	mr.HSet("version:mdb", "version_id", "nightly-20260101T000000")
+
+	baseSum := strings.Repeat("a", 64)
+	writeBaseMender(t, dir, "librescoot-unu-mdb-nightly-20260101T000000.mender", baseSum)
+	// A fork that would normally be refused with a terminal
+	// staged-updates-refused error.
+	writeDeltaFile(t, dir, "librescoot-unu-mdb-nightly-20260102T000000.delta", baseSum, strings.Repeat("b", 64))
+	writeDeltaFile(t, dir, "librescoot-unu-mdb-nightly-20260103T000000.delta", baseSum, strings.Repeat("c", 64))
+
+	u.cancel()
+	u.handleApplyStagedUpdates()
+
+	if got := mr.HGet("ota", "error:mdb"); got != "" {
+		t.Errorf("shutdown refusal published error:mdb = %q, want empty", got)
+	}
+	if len(*installs) != 0 {
+		t.Fatalf("install ran for a forked staged set: %v", *installs)
+	}
+}
+
 // TestHandleApplyStagedUpdatesAppliesMultiDeltaChain drives a resolvable chain
 // end to end through the handler: plan -> resolver order -> apply -> install
 // tail. The applier is stubbed (a real one needs xdelta3 and a real base), so
