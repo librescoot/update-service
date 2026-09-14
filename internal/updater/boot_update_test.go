@@ -14,17 +14,19 @@ import (
 var errBootTest = errors.New("injected failure")
 
 type fakeBootOperation struct {
-	events                                            []string
-	held                                              bool
-	writes                                            int
-	requestID                                         string
-	powerAck                                          bool
-	acquireErr, installingErr, applyErr, heartbeatErr error
-	ackErr, commandErr, rootfsErr                     error
-	state                                             mender.UpdateState
-	ack                                               bool
-	current                                           bool
-	apply                                             func(context.Context) error
+	events                                                        []string
+	held                                                          bool
+	writes                                                        int
+	requestID                                                     string
+	powerAck                                                      bool
+	lifecycleStarted                                              bool
+	acquireErr, releaseErr, installingErr, applyErr, heartbeatErr error
+	ackErr, commandErr, rootfsErr, existingDBCLifecycleErr        error
+	state                                                         mender.UpdateState
+	ack                                                           bool
+	current                                                       bool
+	existingDBCLifecycle                                          bool
+	apply                                                         func(context.Context) error
 }
 
 func (f *fakeBootOperation) UpToDate(string) (bool, error) { return f.current, nil }
@@ -47,8 +49,10 @@ func (f *fakeBootOperation) AddBootInstallInhibit(_ string, requestID string) er
 }
 func (f *fakeBootOperation) RemoveBootInstallInhibit(string) error {
 	f.events = append(f.events, "release")
-	f.held = false
-	return nil
+	if f.releaseErr == nil {
+		f.held = false
+	}
+	return f.releaseErr
 }
 func (f *fakeBootOperation) SetInstalling(context.Context) error {
 	f.events = append(f.events, "installing")
@@ -84,12 +88,19 @@ func (f *fakeBootOperation) deps() bootUpdateDeps {
 		command: func(ctx context.Context, s string) error {
 			f.events = append(f.events, s)
 			if s == "start-dbc" {
+				f.lifecycleStarted = true
 				return f.commandErr
 			}
 			return ctx.Err()
 		},
-		dbcUpdating: func(context.Context) (bool, error) { f.events = append(f.events, "ack"); return f.ack, f.ackErr },
-		ackTimeout:  10 * time.Millisecond, pollInterval: time.Millisecond, heartbeatInterval: time.Hour,
+		dbcUpdating: func(context.Context) (bool, error) {
+			if !f.lifecycleStarted {
+				return f.existingDBCLifecycle, f.existingDBCLifecycleErr
+			}
+			f.events = append(f.events, "ack")
+			return f.ack, f.ackErr
+		},
+		ackTimeout: 10 * time.Millisecond, pollInterval: time.Millisecond, heartbeatInterval: time.Hour,
 	}
 }
 func newFakeBoot() *fakeBootOperation {
@@ -133,6 +144,79 @@ func TestBootOperationGuardOrder(t *testing.T) {
 	}
 	if f.held {
 		t.Fatal("inhibitor leaked")
+	}
+}
+
+func TestBootOperationDefersForExistingDBCLifecycle(t *testing.T) {
+	f := newFakeBoot()
+	f.existingDBCLifecycle = true
+
+	applied, err := runLocalBootUpdate(context.Background(), "dbc", f.deps())
+
+	if applied || !errors.Is(err, errBootUpdateDeferred) {
+		t.Fatalf("applied=%v err=%v", applied, err)
+	}
+	if f.writes != 0 || f.held || len(f.events) != 0 {
+		t.Fatalf("writes=%d held=%v events=%v", f.writes, f.held, f.events)
+	}
+}
+
+func TestBootOperationExistingDBCLifecycleReadFailsClosed(t *testing.T) {
+	f := newFakeBoot()
+	f.existingDBCLifecycleErr = errBootTest
+
+	applied, err := runLocalBootUpdate(context.Background(), "dbc", f.deps())
+
+	if applied || !errors.Is(err, errBootTest) {
+		t.Fatalf("applied=%v err=%v", applied, err)
+	}
+	if f.writes != 0 || f.held || len(f.events) != 0 {
+		t.Fatalf("writes=%d held=%v events=%v", f.writes, f.held, f.events)
+	}
+}
+
+func TestBootOperationRechecksDBCLifecycleBeforeStarting(t *testing.T) {
+	f := newFakeBoot()
+	d := f.deps()
+	reads := 0
+	d.dbcUpdating = func(context.Context) (bool, error) {
+		reads++
+		return reads == 2, nil
+	}
+
+	applied, err := runLocalBootUpdate(context.Background(), "dbc", d)
+
+	if applied || !errors.Is(err, errBootUpdateDeferred) {
+		t.Fatalf("applied=%v err=%v", applied, err)
+	}
+	if reads != 2 || f.writes != 0 || f.held {
+		t.Fatalf("reads=%d writes=%d held=%v", reads, f.writes, f.held)
+	}
+	if !reflect.DeepEqual(f.events, []string{"acquire", "release"}) {
+		t.Fatalf("events=%v", f.events)
+	}
+}
+
+func TestBootOperationSecondLifecycleDeferralReleaseFailureIsError(t *testing.T) {
+	f := newFakeBoot()
+	f.releaseErr = errBootTest
+	d := f.deps()
+	reads := 0
+	d.dbcUpdating = func(context.Context) (bool, error) {
+		reads++
+		return reads == 2, nil
+	}
+
+	applied, err := runLocalBootUpdate(context.Background(), "dbc", d)
+
+	if applied || !errors.Is(err, errBootTest) || !errors.Is(err, errBootUpdateDeferred) {
+		t.Fatalf("applied=%v err=%v", applied, err)
+	}
+	if reads != 2 || f.writes != 0 || !f.held {
+		t.Fatalf("reads=%d writes=%d held=%v", reads, f.writes, f.held)
+	}
+	if !reflect.DeepEqual(f.events, []string{"acquire", "release", "error"}) {
+		t.Fatalf("events=%v", f.events)
 	}
 }
 
@@ -181,7 +265,13 @@ func TestBootOperationCancellationCleanup(t *testing.T) {
 	f := newFakeBoot()
 	ctx, cancel := context.WithCancel(context.Background())
 	d := f.deps()
-	d.dbcUpdating = func(context.Context) (bool, error) { cancel(); return false, nil }
+	d.dbcUpdating = func(context.Context) (bool, error) {
+		if !f.lifecycleStarted {
+			return false, nil
+		}
+		cancel()
+		return false, nil
+	}
 	applied, err := runLocalBootUpdate(ctx, "dbc", d)
 	if applied || !errors.Is(err, context.Canceled) || f.writes != 0 || f.held {
 		t.Fatalf("applied=%v err=%v events=%v", applied, err, f.events)

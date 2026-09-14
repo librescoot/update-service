@@ -59,6 +59,8 @@ type bootUpdateDeps struct {
 
 const bootGuardTimeout = 10 * time.Second
 
+var errBootUpdateDeferred = errors.New("DBC lifecycle already active")
+
 func waitBootDBC(ctx context.Context, timeout, interval time.Duration, read func(context.Context) (bool, error)) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -143,6 +145,15 @@ func runLocalBootUpdate(ctx context.Context, component string, d bootUpdateDeps)
 	if current {
 		return false, nil
 	}
+	if component == "dbc" {
+		active, err := d.dbcUpdating(ctx)
+		if err != nil {
+			return false, fmt.Errorf("check existing DBC lifecycle: %w", err)
+		}
+		if active {
+			return false, errBootUpdateDeferred
+		}
+	}
 	if d.ackTimeout <= 0 {
 		d.ackTimeout = bootGuardTimeout
 	}
@@ -156,7 +167,7 @@ func runLocalBootUpdate(ctx context.Context, component string, d bootUpdateDeps)
 	defer cancelWrite()
 	cleanupCtx := context.WithoutCancel(ctx)
 	defer func() {
-		if result != nil && !errors.Is(result, context.Canceled) {
+		if result != nil && !errors.Is(result, context.Canceled) && result != errBootUpdateDeferred {
 			c, cancel := context.WithTimeout(cleanupCtx, bootGuardTimeout)
 			defer cancel()
 			result = errors.Join(result, d.status.SetError(c, "install-failed", result.Error()))
@@ -169,7 +180,11 @@ func runLocalBootUpdate(ctx context.Context, component string, d bootUpdateDeps)
 	requestID := fmt.Sprintf("%x", token)
 	// Even an error reply can follow an executed Redis transaction. Attempt to
 	// remove our own key, but never proceed to a write on an ambiguous acquisition.
-	defer func() { result = errors.Join(result, d.guard.RemoveBootInstallInhibit(component)) }()
+	defer func() {
+		if removeErr := d.guard.RemoveBootInstallInhibit(component); removeErr != nil {
+			result = errors.Join(result, removeErr)
+		}
+	}()
 	if err := d.guard.AddBootInstallInhibit(component, requestID); err != nil {
 		return false, fmt.Errorf("acquire boot power block: %w", err)
 	}
@@ -177,6 +192,15 @@ func runLocalBootUpdate(ctx context.Context, component string, d bootUpdateDeps)
 		return d.powerObserved(ctx, requestID)
 	}); err != nil {
 		return false, fmt.Errorf("await processed boot power block: %w", err)
+	}
+	if component == "dbc" {
+		active, err := d.dbcUpdating(ctx)
+		if err != nil {
+			return false, fmt.Errorf("recheck existing DBC lifecycle: %w", err)
+		}
+		if active {
+			return false, errBootUpdateDeferred
+		}
 	}
 	if err := d.status.SetInstalling(ctx); err != nil {
 		return false, fmt.Errorf("publish boot installing: %w", err)
@@ -271,6 +295,10 @@ func (u *Updater) performLocalBootUpdate() {
 		},
 	})
 	if err != nil {
+		if err == errBootUpdateDeferred {
+			u.logger.Printf("[boot-local] boot maintenance deferred because a DBC lifecycle is active; retry on next service/DBC start")
+			return
+		}
 		u.logger.Printf("[boot-local] aborted: %v", err)
 		u.recordBootAbort(err)
 		return
