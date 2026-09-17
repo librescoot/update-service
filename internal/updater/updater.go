@@ -41,6 +41,7 @@ type Updater struct {
 	runningVersion    func() (string, error)
 	commitUpdate      func() error
 	resumeUpdate      func() error
+	rollbackUpdate    func() error
 	installArtifact   func(string, mender.InstallProgressCallback) error
 	applyDeltaChain   func(context.Context, []string, []string, string, mender.DeltaProgressCallback) (string, error)
 	dbcInstallGuard   dbcInstallGuard
@@ -176,6 +177,7 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		runningVersion:  manager.RunningVersion,
 		commitUpdate:    manager.Commit,
 		resumeUpdate:    manager.Resume,
+		rollbackUpdate:  manager.Rollback,
 		installArtifact: manager.Install,
 		applyDeltaChain: manager.ApplyDownloadedDeltaChain,
 		dbcInstallGuard: inhibitorClient,
@@ -271,9 +273,15 @@ func (u *Updater) checkAndCommitPendingUpdate(expectedArtifact string) (needsReb
 							return false, u.pendingCommitError(fmt.Errorf("read current boot ID: %w", bootErr))
 						}
 						if attempted.BootID != bootID {
-							return false, u.pendingCommitError(fmt.Errorf(
-								"DBC activation of %s returned to committed version %s",
-								observation.PendingArtifact, runningVersion))
+							// The reboot for this activation already happened and we
+							// came back on the committed rootfs: Mender's commit-pending
+							// state is stale (the bootloader reverted or never
+							// switched). Finalise the rollback instead of rebooting
+							// forever. See librescoot-rj87.
+							if err := u.finalizeRolledBackActivation(observation); err != nil {
+								return false, err
+							}
+							return false, nil
 						}
 						// The reboot request was never completed. Clear the same-boot
 						// marker and safely retry it instead of declaring rollback.
@@ -435,6 +443,26 @@ func (u *Updater) finishVerifiedUpdate(committedArtifact string) error {
 	if err := u.redis.SetPendingLifecycleCompletion("dbc", ""); err != nil {
 		return fmt.Errorf("clear DBC lifecycle completion: %w", err)
 	}
+	return nil
+}
+
+// finalizeRolledBackActivation closes out an update whose activation reboot
+// completed but left the DBC running the committed rootfs again: the bootloader
+// reverted (or never switched), so Mender's commit-pending state is stale.
+// Discard the pending state and stop, instead of rebooting forever.
+func (u *Updater) finalizeRolledBackActivation(observation mender.UpdateObservation) error {
+	if err := u.rollbackUpdate(); err != nil {
+		// Mender may already have settled the standalone state; that is fine.
+		u.logger.Printf("Mender rollback after failed DBC activation: %v", err)
+	}
+	if err := dbcstate.ClearActivationAttempt(u.activationAttempt); err != nil {
+		return u.pendingCommitError(fmt.Errorf("clear DBC activation attempt after rollback: %w", err))
+	}
+	if err := u.status.SetIdle(u.ctx); err != nil {
+		return u.pendingCommitError(fmt.Errorf("publish rolled-back DBC activation: %w", err))
+	}
+	u.logger.Printf("DBC activation of %s rolled back to %s; not rebooting",
+		observation.PendingArtifact, observation.CommittedArtifact)
 	return nil
 }
 
@@ -3875,11 +3903,12 @@ func (u *Updater) triggerDBCLocalReboot(requireMender bool) error {
 
 	u.logger.Printf("Rebooting DBC locally to activate installed changes")
 	if err := u.localReboot(); err != nil {
-		if requireMender {
-			if clearErr := dbcstate.ClearActivationAttempt(u.activationAttempt); clearErr != nil {
-				u.logger.Printf("Failed to clear rejected DBC activation marker: %v", clearErr)
-			}
-		}
+		// Keep the activation marker on failure. `systemctl --no-block reboot`
+		// returns before shutdown, but a killed or blocked reboot still reports
+		// an error; clearing the marker here would erase the only evidence the
+		// next boot needs to tell "the reboot never happened, retry" from "we
+		// came back on the committed rootfs, the update rolled back". The
+		// boot-ID comparison in checkAndCommitPendingUpdate makes that call.
 		return fmt.Errorf("reboot DBC locally: %w", err)
 	}
 	return nil
