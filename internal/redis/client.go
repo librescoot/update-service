@@ -248,10 +248,26 @@ func (c *Client) HGet(key, field string) (string, error) {
 	return val, nil
 }
 
-// SetLastUpdateCheckTime stores the timestamp of the last update check for a component
+// SetLastUpdateCheckTime stores the timestamp of the last *completed* update
+// check for a component. Failed or unconfigured attempts must not call this;
+// they only update the attempt fields below, so a check time always means a
+// check actually ran to a decision.
 func (c *Client) SetLastUpdateCheckTime(component string, timestamp time.Time) error {
 	key := fmt.Sprintf("updates.%s.last-check-time", component)
 	return c.client.HSet("settings", key, timestamp.Format(time.RFC3339))
+}
+
+// SetLastAttemptTime stores when the most recent check attempt started,
+// regardless of whether it completed.
+func (c *Client) SetLastAttemptTime(component string, timestamp time.Time) error {
+	key := fmt.Sprintf("updates.%s.last-attempt-time", component)
+	return c.client.HSet("settings", key, timestamp.Format(time.RFC3339))
+}
+
+// SetLastAttemptResult stores the outcome of the most recent check attempt.
+func (c *Client) SetLastAttemptResult(component, result string) error {
+	key := fmt.Sprintf("updates.%s.last-attempt-result", component)
+	return c.client.HSet("settings", key, result)
 }
 
 // GetLastUpdateCheckTime retrieves the timestamp of the last update check for a component

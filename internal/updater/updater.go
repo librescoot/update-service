@@ -2533,6 +2533,53 @@ func (u *Updater) resolveCheckSettings() (channel, method string, err error) {
 	return channel, method, err
 }
 
+// Values published as updates.<component>.last-attempt-result. They describe
+// what one check attempt produced: "running" while it is still in flight, and
+// one of the terminal values once it finishes.
+const (
+	checkResultRunning        = "running"
+	checkResultUpdateStarted  = "update-started"
+	checkResultUpToDate       = "up-to-date"
+	checkResultNoRelease      = "no-release"
+	checkResultNoAsset        = "no-asset"
+	checkResultBackedOff      = "backed-off"
+	checkResultReleasesFailed = "releases-unavailable"
+	checkResultSettingsFailed = "settings-unavailable"
+	checkResultNoChannel      = "channel-not-configured"
+)
+
+// startCheckAttempt records that a check attempt is in flight. The attempt
+// timestamp is deliberately separate from last-check-time, which only moves
+// once a check actually completes.
+func (u *Updater) startCheckAttempt() {
+	if err := u.redis.SetLastAttemptTime(u.config.Component, time.Now()); err != nil {
+		u.logger.Printf("Warning: Failed to store attempt time: %v", err)
+	}
+	if err := u.redis.SetLastAttemptResult(u.config.Component, checkResultRunning); err != nil {
+		u.logger.Printf("Warning: Failed to store attempt result: %v", err)
+	}
+}
+
+// finishCheck records a completed check attempt and its result. The result is
+// written before the completion time so anything keyed off last-check-time
+// always sees the result that belongs to it.
+func (u *Updater) finishCheck(result string) {
+	if err := u.redis.SetLastAttemptResult(u.config.Component, result); err != nil {
+		u.logger.Printf("Warning: Failed to store check result %q: %v", result, err)
+	}
+	if err := u.redis.SetLastUpdateCheckTime(u.config.Component, time.Now()); err != nil {
+		u.logger.Printf("Warning: Failed to store last check time: %v", err)
+	}
+}
+
+// failCheck records a result for an attempt that could not complete. It leaves
+// last-check-time untouched so a failed attempt is not mistaken for a check.
+func (u *Updater) failCheck(result string) {
+	if err := u.redis.SetLastAttemptResult(u.config.Component, result); err != nil {
+		u.logger.Printf("Warning: Failed to store check result %q: %v", result, err)
+	}
+}
+
 // checkForUpdates checks for updates and initiates the update process if updates are available.
 // manual is true when the check was requested explicitly (check-now command) rather than by
 // the periodic timer; manual updates skip the 3-minute standby wait before an MDB reboot.
@@ -2570,16 +2617,21 @@ func (u *Updater) checkForUpdates(manual bool) {
 		return
 	}
 
+	// From here on an attempt is in flight: record it before anything that can
+	// fail, so a failed attempt is visible without moving last-check-time.
+	u.startCheckAttempt()
+
 	// Read settings when consuming the check, not from an independently updated
 	// watcher cache. Keep the selected channel for the whole operation.
 	channel, updateMethod, err := u.resolveCheckSettings()
 	if err != nil || !config.IsValidChannel(channel) {
-		code := "settings-unavailable"
+		code := checkResultSettingsFailed
 		if err == nil {
 			err = fmt.Errorf("No valid release channel is configured")
-			code = "channel-not-configured"
+			code = checkResultNoChannel
 		}
 		u.logger.Printf("Skipping update check: %v", err)
+		u.failCheck(code)
 		if manual && u.updateOpMu.TryLock() {
 			defer u.updateOpMu.Unlock()
 			if statusErr := u.status.SetError(u.ctx, code, err.Error()); statusErr != nil {
@@ -2589,9 +2641,6 @@ func (u *Updater) checkForUpdates(manual bool) {
 		return
 	}
 	u.logger.Printf("Checking for updates for component %s on channel %s", u.config.Component, channel)
-	if err := u.redis.SetLastUpdateCheckTime(u.config.Component, time.Now()); err != nil {
-		u.logger.Printf("Warning: Failed to store last check time: %v", err)
-	}
 
 	// Get the currently installed version
 	currentVersion, err := u.getCurrentVersion()
@@ -2605,6 +2654,7 @@ func (u *Updater) checkForUpdates(manual bool) {
 	releases, err := u.githubAPI.GetReleases(channel)
 	if err != nil {
 		u.logger.Printf("Failed to get releases: %v", err)
+		u.failCheck(checkResultReleasesFailed)
 		return
 	}
 
@@ -2656,6 +2706,7 @@ func (u *Updater) checkForUpdates(manual bool) {
 	release, found := u.findLatestRelease(releases, variantID, channel)
 	if !found {
 		u.logger.Printf("No release found for variant_id %s and channel %s", variantID, channel)
+		u.finishCheck(checkResultNoRelease)
 		return
 	}
 
@@ -2670,14 +2721,17 @@ func (u *Updater) checkForUpdates(manual bool) {
 
 	if assetURL == "" {
 		u.logger.Printf("No .mender asset found for variant_id %s in release %s", variantID, release.TagName)
+		u.finishCheck(checkResultNoAsset)
 	} else if !u.isUpdateNeeded(release) {
 		u.logger.Printf("No update needed for component %s", u.config.Component)
+		u.finishCheck(checkResultUpToDate)
 	} else if skip, remaining := u.backoff.ShouldSkip(release.TagName, u.config.CheckInterval); skip {
 		if err := u.status.SetSkipChecksRemaining(u.ctx, remaining); err != nil {
 			u.logger.Printf("Failed to publish remaining backoff checks: %v", err)
 		}
 		u.logger.Printf("Skipping %s for %s: download backed off",
 			release.TagName, u.config.Component)
+		u.finishCheck(checkResultBackedOff)
 	} else {
 		u.logger.Printf("Update needed for %s: %s (using full update)", u.config.Component, release.TagName)
 		u.wg.Add(1)
@@ -2944,6 +2998,7 @@ func (u *Updater) performUpdateLocked(release Release, assetURL string, manual b
 	defer u.startHeartbeat()()
 
 	u.logger.Printf("Starting update process for %s to version %s", u.config.Component, release.TagName)
+	u.finishCheck(checkResultUpdateStarted)
 
 	var version string
 	if config.InferChannelFromVersion(release.TagName) == "stable" {
@@ -3213,27 +3268,34 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		// whose chain will not build re-downloads the full image on every
 		// check and never serves its ladder.
 		latestRelease, found := u.findLatestRelease(releases, variantID, channel)
-		if found {
-			if !u.isUpdateNeeded(latestRelease) {
-				return
-			}
-			if skip, remaining := u.backoff.ShouldSkip(latestRelease.TagName, u.config.CheckInterval); skip {
-				if err := u.status.SetSkipChecksRemaining(u.ctx, remaining); err != nil {
-					u.logger.Printf("Failed to publish remaining backoff checks: %v", err)
-				}
-				return
-			}
-			menderURL := u.findMenderAsset(latestRelease, variantID)
-			if menderURL != "" {
-				u.logger.Printf("Falling back to full update with latest version")
-				u.performUpdateLocked(latestRelease, menderURL, manual)
-			}
+		if !found {
+			u.finishCheck(checkResultNoRelease)
+			return
 		}
+		if !u.isUpdateNeeded(latestRelease) {
+			u.finishCheck(checkResultUpToDate)
+			return
+		}
+		if skip, remaining := u.backoff.ShouldSkip(latestRelease.TagName, u.config.CheckInterval); skip {
+			if err := u.status.SetSkipChecksRemaining(u.ctx, remaining); err != nil {
+				u.logger.Printf("Failed to publish remaining backoff checks: %v", err)
+			}
+			u.finishCheck(checkResultBackedOff)
+			return
+		}
+		menderURL := u.findMenderAsset(latestRelease, variantID)
+		if menderURL == "" {
+			u.finishCheck(checkResultNoAsset)
+			return
+		}
+		u.logger.Printf("Falling back to full update with latest version")
+		u.performUpdateLocked(latestRelease, menderURL, manual)
 		return
 	}
 
 	if len(deltaChain) == 0 {
 		u.logger.Printf("Already at latest version %s (base: %s)", currentVersion, baseVersion)
+		u.finishCheck(checkResultUpToDate)
 		return
 	}
 
@@ -3247,6 +3309,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 			u.logger.Printf("Failed to publish remaining backoff checks: %v", err)
 		}
 		u.logger.Printf("Skipping delta chain to %s: download backed off", chainTarget)
+		u.finishCheck(checkResultBackedOff)
 		return
 	}
 
@@ -3273,9 +3336,11 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 		u.logger.Printf("Total delta size (%d bytes) >= full update size (%d bytes), using full update instead",
 			totalDeltaSize, fullUpdateSize)
 		menderURL := u.findMenderAsset(latestRelease, variantID)
-		if menderURL != "" {
-			u.performUpdateLocked(latestRelease, menderURL, manual)
+		if menderURL == "" {
+			u.finishCheck(checkResultNoAsset)
+			return
 		}
+		u.performUpdateLocked(latestRelease, menderURL, manual)
 		return
 	}
 
@@ -3296,6 +3361,7 @@ func (u *Updater) performDeltaUpdate(releases []Release, currentVersion, variant
 	if err := u.status.SetDownloading(u.ctx, latestVersion, "delta"); err != nil {
 		u.logger.Printf("Failed to set downloading status: %v", err)
 	}
+	u.finishCheck(checkResultUpdateStarted)
 
 	// For DBC updates, notify vehicle-service to keep dashboard power on
 	if u.config.Component == "dbc" {
@@ -3697,16 +3763,21 @@ func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, channel, r
 	}
 
 	latestRelease, found := u.findLatestRelease(releases, variantID, channel)
-	if found {
-		if !u.isUpdateNeeded(latestRelease) {
-			return
-		}
-		menderURL := u.findMenderAsset(latestRelease, variantID)
-		if menderURL != "" {
-			u.logger.Printf("Starting full update to %s", latestRelease.TagName)
-			u.performUpdateLocked(latestRelease, menderURL, manual)
-		}
+	if !found {
+		u.finishCheck(checkResultNoRelease)
+		return
 	}
+	if !u.isUpdateNeeded(latestRelease) {
+		u.finishCheck(checkResultUpToDate)
+		return
+	}
+	menderURL := u.findMenderAsset(latestRelease, variantID)
+	if menderURL == "" {
+		u.finishCheck(checkResultNoAsset)
+		return
+	}
+	u.logger.Printf("Starting full update to %s", latestRelease.TagName)
+	u.performUpdateLocked(latestRelease, menderURL, manual)
 }
 
 const umsMDBRebootOwnerPath = "/run/librescoot/ums-mdb-reboot-owner"
