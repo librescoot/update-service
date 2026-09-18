@@ -114,3 +114,25 @@ func TestTriggerRebootKeepsActivationMarkerOnLocalRebootError(t *testing.T) {
 		t.Fatalf("activation marker was cleared on a failed reboot: %v", err)
 	}
 }
+
+// A fresh install must not inherit an activation marker from an earlier
+// attempt for the same artifact, or the next startup would finalise a rollback
+// before the new activation is attempted.
+func TestFreshInstallClearsStaleActivationMarker(t *testing.T) {
+	events := []string{}
+	u := newInstallGateTestUpdater("dbc", &fakeDBCInstallGuard{events: &events}, nil, &events)
+	u.activationAttempt = filepath.Join(t.TempDir(), "dbc-activation-attempt")
+	if err := dbcstate.SaveActivationAttempt(u.activationAttempt, dbcstate.ActivationAttempt{
+		Artifact: pendingArtifact,
+		BootID:   "boot-previous",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := u.installMender("/tmp/artifact.mender"); err != nil {
+		t.Fatalf("installMender: %v", err)
+	}
+	if _, err := dbcstate.LoadActivationAttempt(u.activationAttempt); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stale activation marker survived a fresh install, got err=%v", err)
+	}
+}

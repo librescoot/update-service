@@ -122,6 +122,13 @@ func (u *Updater) installMender(path string) error {
 				u.logger.Printf("Failed to remove DBC install inhibit: %v", err)
 			}
 		}()
+		// A fresh install supersedes any activation attempt left behind by an
+		// earlier one for the same artifact. Without this, a stale marker whose
+		// boot ID differs from the current one would make the next startup
+		// finalise a rollback before the new activation is even attempted.
+		if err := dbcstate.ClearActivationAttempt(u.activationAttempt); err != nil {
+			return fmt.Errorf("clear stale DBC activation attempt: %w", err)
+		}
 	}
 
 	return u.installArtifact(path, u.menderInstallProgressCb())
