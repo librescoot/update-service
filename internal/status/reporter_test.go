@@ -22,7 +22,15 @@ func newTestReporter(t *testing.T) (*Reporter, *miniredis.Miniredis) {
 	return NewReporter(client, "mdb", log.New(os.Stdout, "test: ", 0)), mr
 }
 
-func TestSetError_PreservesEveryMessageFromTheOperation(t *testing.T) {
+func streamFields(values []string) map[string]string {
+	fields := make(map[string]string, len(values)/2)
+	for i := 0; i+1 < len(values); i += 2 {
+		fields[values[i]] = values[i+1]
+	}
+	return fields
+}
+
+func TestSetError_AppendsEveryMessageFromTheOperation(t *testing.T) {
 	r, mr := newTestReporter(t)
 	ctx := context.Background()
 
@@ -45,29 +53,48 @@ func TestSetError_PreservesEveryMessageFromTheOperation(t *testing.T) {
 	if got := mr.HGet("ota", "error-message:mdb"); got != "full image download timed out" {
 		t.Errorf("error-message:mdb = %q, want latest message", got)
 	}
-	want := "delta checksum mismatch\nfull image download timed out"
-	if got := mr.HGet("ota", "error-history:mdb"); got != want {
-		t.Errorf("error-history:mdb = %q, want %q", got, want)
+	entries, err := mr.Stream("ota:errors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("stream entries = %d, want 2", len(entries))
+	}
+	first := streamFields(entries[0].Values)
+	second := streamFields(entries[1].Values)
+	if first["event"] != "error" || first["component"] != "mdb" || first["code"] != "delta-failed" || first["message"] != "delta checksum mismatch" {
+		t.Errorf("first stream entry = %v", first)
+	}
+	if second["event"] != "error" || second["component"] != "mdb" || second["code"] != "download-failed" || second["message"] != "full image download timed out" {
+		t.Errorf("second stream entry = %v", second)
 	}
 }
 
-func TestSetError_DoesNotDuplicateIdenticalMessage(t *testing.T) {
+func TestSetError_AppendsRepeatedMessages(t *testing.T) {
 	r, mr := newTestReporter(t)
 	ctx := context.Background()
 
 	if err := r.SetError(ctx, "reboot-failed", "reboot unavailable"); err != nil {
 		t.Fatal(err)
 	}
+	firstEvent := mr.HGet("ota", "error-event:mdb")
 	if err := r.SetError(ctx, "reboot-failed", "reboot unavailable"); err != nil {
 		t.Fatal(err)
 	}
+	if secondEvent := mr.HGet("ota", "error-event:mdb"); secondEvent == firstEvent {
+		t.Errorf("error-event:mdb did not change: %q", secondEvent)
+	}
 
-	if got := mr.HGet("ota", "error-history:mdb"); got != "reboot unavailable" {
-		t.Errorf("error-history:mdb = %q, want one copy", got)
+	entries, err := mr.Stream("ota:errors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("stream entries = %d, want both occurrences", len(entries))
 	}
 }
 
-func TestSetIdle_ClearsPreservedErrors(t *testing.T) {
+func TestSetIdle_AppendsErrorReset(t *testing.T) {
 	r, mr := newTestReporter(t)
 	ctx := context.Background()
 
@@ -78,8 +105,16 @@ func TestSetIdle_ClearsPreservedErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := mr.HGet("ota", "error-history:mdb"); got != "" {
-		t.Errorf("error-history:mdb = %q, want cleared", got)
+	entries, err := mr.Stream("ota:errors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("stream entries = %d, want error and reset", len(entries))
+	}
+	reset := streamFields(entries[1].Values)
+	if reset["event"] != "reset" || reset["component"] != "mdb" {
+		t.Errorf("reset stream entry = %v", reset)
 	}
 }
 

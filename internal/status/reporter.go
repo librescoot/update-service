@@ -44,7 +44,9 @@ const (
 // that follow the stock convention, are not written here: see FlatFor and
 // FlatMirror for how the two components' statuses combine into that pair.
 type Reporter struct {
+	client    *ipc.Client
 	pub       *ipc.HashPublisher
+	errors    *ipc.StreamPublisher
 	component string
 	logger    *log.Logger
 	stateMu   sync.Mutex
@@ -53,7 +55,9 @@ type Reporter struct {
 // NewReporter creates a new status reporter for the given component
 func NewReporter(client *ipc.Client, component string, logger *log.Logger) *Reporter {
 	return &Reporter{
+		client:    client,
 		pub:       client.NewHashPublisher("ota"),
+		errors:    client.NewStreamPublisher("ota:errors", ipc.WithMaxLen(200)),
 		component: component,
 		logger:    logger,
 	}
@@ -62,6 +66,16 @@ func NewReporter(client *ipc.Client, component string, logger *log.Logger) *Repo
 // key returns a namespaced Redis hash field for this component.
 func (r *Reporter) key(field string) string {
 	return fmt.Sprintf("%s:%s", field, r.component)
+}
+
+func (r *Reporter) setManyAndResetErrors(fields map[string]any) error {
+	tx := r.client.NewTx()
+	tx.HashSetManyIfChanged(r.pub, fields)
+	tx.StreamAdd(r.errors, map[string]any{
+		"event":     "reset",
+		"component": r.component,
+	})
+	return tx.Exec()
 }
 
 // --- Read ---
@@ -100,9 +114,9 @@ func (r *Reporter) setTerminal(ctx context.Context, st Status) error {
 		r.key("install-progress"):  "",
 		r.key("error"):             "",
 		r.key("error-message"):     "",
-		r.key("error-history"):     "",
+		r.key("error-event"):       "",
 	}
-	err := r.pub.SetMany(m, ipc.Sync())
+	err := r.setManyAndResetErrors(m)
 	if err != nil {
 		return fmt.Errorf("set %s for %s: %w", st, r.component, err)
 	}
@@ -134,11 +148,11 @@ func (r *Reporter) SetAborted(ctx context.Context, reason string, skipChecks int
 		r.key("install-progress"):      "",
 		r.key("error"):                 "",
 		r.key("error-message"):         "",
-		r.key("error-history"):         "",
+		r.key("error-event"):           "",
 		r.key("download-abort-reason"): reason,
 		r.key("download-skip-checks"):  skip,
 	}
-	if err := r.pub.SetMany(m, ipc.Sync()); err != nil {
+	if err := r.setManyAndResetErrors(m); err != nil {
 		return fmt.Errorf("set aborted for %s: %w", r.component, err)
 	}
 	r.logger.Printf("Download abandoned for %s (%s), skip_checks=%q", r.component, reason, skip)
@@ -165,9 +179,8 @@ func (r *Reporter) ClearHeartbeat(ctx context.Context) error {
 }
 
 // SetDownloading atomically sets downloading status with version, method,
-// and resets all progress to 0. The error history is retained until the whole
-// operation reaches a terminal state so a failed delta and failed full-image
-// fallback can both be reported.
+// and resets all progress to 0. Stream entries are retained until a lifecycle
+// reset so a failed delta and failed full-image fallback can both be reported.
 func (r *Reporter) SetDownloading(ctx context.Context, version, method string) error {
 	r.stateMu.Lock()
 	defer r.stateMu.Unlock()
@@ -261,30 +274,32 @@ func (r *Reporter) setPendingReboot(targetVersion string) error {
 	return nil
 }
 
-// SetError atomically transitions to error status with error details and
-// clears progress fields. If the current operation has already reported an
-// error, its message is retained so consumers can present every failure.
+// SetError atomically appends the failure to the error stream and transitions
+// the component to error status. Every XADD is independent, so concurrent
+// writers cannot overwrite one another.
 func (r *Reporter) SetError(ctx context.Context, errorType, errorMessage string) error {
 	r.stateMu.Lock()
 	defer r.stateMu.Unlock()
-
-	errorHistory := errorMessage
-	if previous, err := r.pub.Get(r.key("error-history")); err == nil && previous != "" && previous != errorMessage {
-		errorHistory = previous + "\n" + errorMessage
-	}
 
 	m := map[string]any{
 		r.key("status"):            string(StatusError),
 		r.key("error"):             errorType,
 		r.key("error-message"):     errorMessage,
-		r.key("error-history"):     errorHistory,
+		r.key("error-event"):       strconv.FormatInt(time.Now().UnixNano(), 10),
 		r.key("download-progress"): "",
 		r.key("download-bytes"):    "",
 		r.key("download-total"):    "",
 		r.key("install-progress"):  "",
 	}
-	err := r.pub.SetMany(m, ipc.Sync())
-	if err != nil {
+	tx := r.client.NewTx()
+	tx.HashSetManyIfChanged(r.pub, m)
+	tx.StreamAdd(r.errors, map[string]any{
+		"event":     "error",
+		"component": r.component,
+		"code":      errorType,
+		"message":   errorMessage,
+	})
+	if err := tx.Exec(); err != nil {
 		return fmt.Errorf("set error for %s: %w", r.component, err)
 	}
 	r.logger.Printf("Set error for %s: type=%s message=%s", r.component, errorType, errorMessage)
@@ -390,13 +405,13 @@ func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
 		r.key("install-progress"):  "",
 		r.key("error"):             "",
 		r.key("error-message"):     "",
-		r.key("error-history"):     "",
+		r.key("error-event"):       "",
 		r.key("preview-channel"):   "",
 		r.key("preview-status"):    "",
 		r.key("preview-version"):   "",
 		r.key("preview-size"):      "",
 	}
-	err := r.pub.SetMany(m, ipc.Sync())
+	err := r.setManyAndResetErrors(m)
 	if err != nil {
 		return fmt.Errorf("initialize OTA keys for %s: %w", r.component, err)
 	}
