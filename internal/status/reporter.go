@@ -315,6 +315,31 @@ func (r *Reporter) SetUpdateVersion(ctx context.Context, version string) error {
 	return nil
 }
 
+// DBCPreflightResult is the MDB's preliminary assessment of a DBC release.
+// It is advisory: the DBC's own update service still makes the installation
+// decision after it boots.
+const (
+	DBCPreflightAvailable = "available"
+	DBCPreflightUpToDate  = "up-to-date"
+	DBCPreflightNoRelease = "no-release"
+	DBCPreflightUnknown   = "unknown"
+)
+
+// SetDBCPreflight publishes an MDB-side assessment for the DBC. These fields
+// are separate from update-version/status, which only describe a real DBC
+// update lifecycle.
+func (r *Reporter) SetDBCPreflight(ctx context.Context, result, version string) error {
+	m := map[string]any{
+		r.key("preflight-result"):  result,
+		r.key("preflight-version"): version,
+		r.key("preflight-time"):    time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := r.pub.SetMany(m, ipc.Sync()); err != nil {
+		return fmt.Errorf("set DBC preflight for %s: %w", r.component, err)
+	}
+	return nil
+}
+
 // --- Startup ---
 
 // Initialize sets initial values for OTA keys on service startup.

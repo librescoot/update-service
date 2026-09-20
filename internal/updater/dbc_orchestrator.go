@@ -15,20 +15,43 @@ const (
 	dbcPollInterval    = 5 * time.Second
 )
 
+// dbcPreflight is the MDB's best assessment from the shared release index and
+// cached DBC facts. It is not authoritative: the DBC rechecks independently
+// after boot, because those facts may be absent or stale while it is off.
+type dbcPreflight struct {
+	result  string
+	version string
+	wake    bool
+}
+
 // orchestrateDBC is called from checkForUpdates() on MDB when orchestration is enabled.
-// It checks if a DBC update is available and, if so, powers on the DBC, triggers
-// a check, and monitors for activity.
+// It publishes the DBC preflight first, then powers the DBC only when that
+// assessment says a check is useful and the vehicle is safely in stand-by.
 func (u *Updater) orchestrateDBC(releases []Release) {
-	if u.config.Component != "mdb" {
+	if u.config.Component != "mdb" || !u.getOrchestrateDBC() {
 		return
 	}
 
-	if !u.getOrchestrateDBC() {
+	// Prevent overlapping orchestrations. A skipped duplicate must not replace
+	// the currently running preflight with a result from an older release list.
+	if !u.dbcOrchestrating.TryLock() {
+		u.logger.Printf("[dbc-orchestrate] Already in progress, skipping")
+		return
+	}
+	defer u.dbcOrchestrating.Unlock()
+
+	preflight := u.preflightDBCUpdate(releases)
+	if u.dbcStatus != nil {
+		if err := u.dbcStatus.SetDBCPreflight(u.ctx, preflight.result, preflight.version); err != nil {
+			u.logger.Printf("[dbc-orchestrate] Failed to publish DBC preflight: %v", err)
+		}
+	}
+	if !preflight.wake {
 		return
 	}
 
-	// Only orchestrate in stand-by. In any other state the user may be driving
-	// or otherwise interacting with the DBC, and toggling its power is unsafe.
+	// Only wake the DBC in stand-by. The preflight remains useful to callers
+	// even when this safety gate defers the actual DBC check.
 	state, err := u.redis.GetVehicleState(config.VehicleHashKey)
 	if err != nil {
 		u.logger.Printf("[dbc-orchestrate] Failed to read vehicle state: %v, skipping", err)
@@ -36,17 +59,6 @@ func (u *Updater) orchestrateDBC(releases []Release) {
 	}
 	if state != "stand-by" {
 		u.logger.Printf("[dbc-orchestrate] Vehicle state is '%s' (not stand-by), skipping", state)
-		return
-	}
-
-	// Prevent overlapping orchestrations
-	if !u.dbcOrchestrating.TryLock() {
-		u.logger.Printf("[dbc-orchestrate] Already in progress, skipping")
-		return
-	}
-	defer u.dbcOrchestrating.Unlock()
-
-	if !u.isDBCUpdateAvailable(releases) {
 		return
 	}
 
@@ -107,52 +119,46 @@ func (u *Updater) orchestrateDBC(releases []Release) {
 	}
 }
 
-// isDBCUpdateAvailable checks if a newer release exists for the DBC component.
-func (u *Updater) isDBCUpdateAvailable(releases []Release) bool {
-	// Get DBC variant ID
+// preflightDBCUpdate checks whether cached DBC facts indicate an update. A
+// missing variant/version produces unknown, never a false "up-to-date" answer:
+// Redis is volatile and the DBC is usually off when this runs.
+func (u *Updater) preflightDBCUpdate(releases []Release) dbcPreflight {
 	dbcVariantID, err := u.redis.GetVariantID("dbc")
 	if err != nil {
-		u.logger.Printf("[dbc-orchestrate] Failed to get DBC variant_id: %v", err)
-		return false
+		u.logger.Printf("[dbc-orchestrate] Failed to read DBC variant_id: %v", err)
+		return dbcPreflight{result: status.DBCPreflightUnknown}
 	}
 
-	// Determine DBC channel
 	dbcChannel := u.getDBCChannel()
 	if !config.IsValidChannel(dbcChannel) {
-		return false
+		u.logger.Printf("[dbc-orchestrate] No valid DBC channel")
+		return dbcPreflight{result: status.DBCPreflightUnknown}
 	}
 
-	// Find the latest release for DBC
 	release, found := u.findLatestRelease(releases, dbcVariantID, dbcChannel)
 	if !found {
-		// version:dbc (and with it variant_id) is populated by the DBC itself,
-		// and Redis is wiped on every MDB reboot — with the DBC powered off the
-		// variant lookup falls back to "dbc", which matches no release asset.
-		// Nothing can be proven about the DBC from here: power it on and let
-		// its own update-service decide.
-		if len(releases) > 0 {
-			u.logger.Printf("[dbc-orchestrate] No release matches DBC variant %q on channel %s (variant unknown while DBC is off?) — will power on so the DBC can check itself", dbcVariantID, dbcChannel)
-			return true
+		if len(releases) == 0 {
+			u.logger.Printf("[dbc-orchestrate] No releases available on channel %s", dbcChannel)
+			return dbcPreflight{result: status.DBCPreflightNoRelease}
 		}
-		u.logger.Printf("[dbc-orchestrate] No releases available on channel %s, skipping", dbcChannel)
-		return false
+		// version:dbc (and its variant_id) is written by the DBC. The fallback
+		// "dbc" therefore means no candidate is not an answer; wake it to find
+		// out rather than reporting no update to lsc.
+		u.logger.Printf("[dbc-orchestrate] No release matches DBC variant %q on channel %s; DBC facts may be unavailable", dbcVariantID, dbcChannel)
+		return dbcPreflight{result: status.DBCPreflightUnknown, wake: true}
 	}
 
-	// Get DBC's current version
 	dbcVersion, err := u.redis.GetComponentVersion("dbc")
 	if err != nil || dbcVersion == "" {
-		// DBC version unknown (off, never booted, or version not persisted to MDB Redis).
-		// A release exists for DBC, so power it on and let its own update-service decide.
-		u.logger.Printf("[dbc-orchestrate] DBC version unknown, release %s exists — will power on to check", release.TagName)
-		return true
+		u.logger.Printf("[dbc-orchestrate] DBC version unknown; release %s exists", release.TagName)
+		return dbcPreflight{result: status.DBCPreflightUnknown, version: release.TagName, wake: true}
 	}
 
-	// Compare versions using existing logic
 	if !u.isVersionNewer(release.TagName, dbcVersion, dbcChannel) {
-		u.logger.Printf("[dbc-orchestrate] DBC at %s, latest on %s is %s — up to date, skipping", dbcVersion, dbcChannel, release.TagName)
-		return false
+		u.logger.Printf("[dbc-orchestrate] DBC at %s, latest on %s is %s — up to date", dbcVersion, dbcChannel, release.TagName)
+		return dbcPreflight{result: status.DBCPreflightUpToDate, version: release.TagName}
 	}
-	return true
+	return dbcPreflight{result: status.DBCPreflightAvailable, version: release.TagName, wake: true}
 }
 
 // getDBCChannel determines the effective channel for DBC updates.

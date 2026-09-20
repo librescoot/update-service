@@ -71,6 +71,33 @@ func TestSetAborted_ZeroSkipChecksClearsTheField(t *testing.T) {
 	}
 }
 
+func TestSetDBCPreflight_DoesNotChangeUpdateLifecycle(t *testing.T) {
+	r, mr := newTestReporter(t)
+	ctx := context.Background()
+	if err := r.SetDownloading(ctx, "v1.2.3", "full"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetDBCPreflight(ctx, DBCPreflightAvailable, "v1.3.0"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := mr.HGet("ota", "preflight-result:mdb"); got != DBCPreflightAvailable {
+		t.Errorf("preflight-result:mdb = %q, want %q", got, DBCPreflightAvailable)
+	}
+	if got := mr.HGet("ota", "preflight-version:mdb"); got != "v1.3.0" {
+		t.Errorf("preflight-version:mdb = %q, want v1.3.0", got)
+	}
+	if got := mr.HGet("ota", "preflight-time:mdb"); got == "" {
+		t.Error("preflight-time:mdb was not published")
+	}
+	if got := mr.HGet("ota", "status:mdb"); got != string(StatusDownloading) {
+		t.Errorf("status:mdb = %q, want downloading", got)
+	}
+	if got := mr.HGet("ota", "update-version:mdb"); got != "v1.2.3" {
+		t.Errorf("update-version:mdb = %q, want v1.2.3", got)
+	}
+}
+
 func TestInitialize_LeavesAbortFieldsIntact(t *testing.T) {
 	r, mr := newTestReporter(t)
 	ctx := context.Background()
