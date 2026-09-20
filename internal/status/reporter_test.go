@@ -22,6 +22,67 @@ func newTestReporter(t *testing.T) (*Reporter, *miniredis.Miniredis) {
 	return NewReporter(client, "mdb", log.New(os.Stdout, "test: ", 0)), mr
 }
 
+func TestSetError_PreservesEveryMessageFromTheOperation(t *testing.T) {
+	r, mr := newTestReporter(t)
+	ctx := context.Background()
+
+	if err := r.SetDownloading(ctx, "v1.2.3", "delta"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetError(ctx, "delta-failed", "delta checksum mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetDownloading(ctx, "v1.2.3", "full"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetError(ctx, "download-failed", "full image download timed out"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := mr.HGet("ota", "error:mdb"); got != "download-failed" {
+		t.Errorf("error:mdb = %q, want latest error type", got)
+	}
+	if got := mr.HGet("ota", "error-message:mdb"); got != "full image download timed out" {
+		t.Errorf("error-message:mdb = %q, want latest message", got)
+	}
+	want := "delta checksum mismatch\nfull image download timed out"
+	if got := mr.HGet("ota", "error-history:mdb"); got != want {
+		t.Errorf("error-history:mdb = %q, want %q", got, want)
+	}
+}
+
+func TestSetError_DoesNotDuplicateIdenticalMessage(t *testing.T) {
+	r, mr := newTestReporter(t)
+	ctx := context.Background()
+
+	if err := r.SetError(ctx, "reboot-failed", "reboot unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetError(ctx, "reboot-failed", "reboot unavailable"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := mr.HGet("ota", "error-history:mdb"); got != "reboot unavailable" {
+		t.Errorf("error-history:mdb = %q, want one copy", got)
+	}
+}
+
+func TestSetIdle_ClearsPreservedErrors(t *testing.T) {
+	r, mr := newTestReporter(t)
+	ctx := context.Background()
+
+	if err := r.SetError(ctx, "download-failed", "network unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := mr.HGet("ota", "error-history:mdb"); got != "" {
+		t.Errorf("error-history:mdb = %q, want cleared", got)
+	}
+}
+
 func TestSetAborted_PreservesProgressAndRecordsReason(t *testing.T) {
 	r, mr := newTestReporter(t)
 	ctx := context.Background()

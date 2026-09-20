@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"sync"
 	"time"
 
 	ipc "github.com/librescoot/redis-ipc"
@@ -46,6 +47,7 @@ type Reporter struct {
 	pub       *ipc.HashPublisher
 	component string
 	logger    *log.Logger
+	stateMu   sync.Mutex
 }
 
 // NewReporter creates a new status reporter for the given component
@@ -85,6 +87,9 @@ func (r *Reporter) SetStagedNoop(ctx context.Context) error {
 }
 
 func (r *Reporter) setTerminal(ctx context.Context, st Status) error {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+
 	m := map[string]any{
 		r.key("status"):            string(st),
 		r.key("update-version"):    "",
@@ -95,6 +100,7 @@ func (r *Reporter) setTerminal(ctx context.Context, st Status) error {
 		r.key("install-progress"):  "",
 		r.key("error"):             "",
 		r.key("error-message"):     "",
+		r.key("error-history"):     "",
 	}
 	err := r.pub.SetMany(m, ipc.Sync())
 	if err != nil {
@@ -114,6 +120,9 @@ func (r *Reporter) setTerminal(ctx context.Context, st Status) error {
 //
 // A zero skipChecks clears the field, meaning no backoff applies.
 func (r *Reporter) SetAborted(ctx context.Context, reason string, skipChecks int) error {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+
 	skip := ""
 	if skipChecks > 0 {
 		skip = strconv.Itoa(skipChecks)
@@ -125,6 +134,7 @@ func (r *Reporter) SetAborted(ctx context.Context, reason string, skipChecks int
 		r.key("install-progress"):      "",
 		r.key("error"):                 "",
 		r.key("error-message"):         "",
+		r.key("error-history"):         "",
 		r.key("download-abort-reason"): reason,
 		r.key("download-skip-checks"):  skip,
 	}
@@ -155,8 +165,13 @@ func (r *Reporter) ClearHeartbeat(ctx context.Context) error {
 }
 
 // SetDownloading atomically sets downloading status with version, method,
-// and resets all progress to 0.
+// and resets all progress to 0. The error history is retained until the whole
+// operation reaches a terminal state so a failed delta and failed full-image
+// fallback can both be reported.
 func (r *Reporter) SetDownloading(ctx context.Context, version, method string) error {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+
 	m := map[string]any{
 		r.key("status"):                string(StatusDownloading),
 		r.key("update-version"):        version,
@@ -247,12 +262,22 @@ func (r *Reporter) setPendingReboot(targetVersion string) error {
 }
 
 // SetError atomically transitions to error status with error details and
-// clears progress fields.
+// clears progress fields. If the current operation has already reported an
+// error, its message is retained so consumers can present every failure.
 func (r *Reporter) SetError(ctx context.Context, errorType, errorMessage string) error {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+
+	errorHistory := errorMessage
+	if previous, err := r.pub.Get(r.key("error-history")); err == nil && previous != "" && previous != errorMessage {
+		errorHistory = previous + "\n" + errorMessage
+	}
+
 	m := map[string]any{
 		r.key("status"):            string(StatusError),
 		r.key("error"):             errorType,
 		r.key("error-message"):     errorMessage,
+		r.key("error-history"):     errorHistory,
 		r.key("download-progress"): "",
 		r.key("download-bytes"):    "",
 		r.key("download-total"):    "",
@@ -344,6 +369,9 @@ func (r *Reporter) SetDBCPreflight(ctx context.Context, result, version string) 
 
 // Initialize sets initial values for OTA keys on service startup.
 func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+
 	// download-abort-reason and download-skip-checks are deliberately absent:
 	// they mirror on-disk backoff state that outlives the process. Initialize
 	// runs on every service start, which for the DBC is every dashboard
@@ -362,6 +390,7 @@ func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
 		r.key("install-progress"):  "",
 		r.key("error"):             "",
 		r.key("error-message"):     "",
+		r.key("error-history"):     "",
 		r.key("preview-channel"):   "",
 		r.key("preview-status"):    "",
 		r.key("preview-version"):   "",

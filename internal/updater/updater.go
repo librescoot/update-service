@@ -3758,9 +3758,6 @@ func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, channel, r
 	}
 
 	time.Sleep(2 * time.Second)
-	if err := u.status.SetIdle(u.ctx); err != nil {
-		u.logger.Printf("Failed to clear status before fallback: %v", err)
-	}
 
 	latestRelease, found := u.findLatestRelease(releases, variantID, channel)
 	if !found {
