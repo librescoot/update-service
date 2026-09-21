@@ -58,7 +58,7 @@ Running versions are read from `version:<component>` field `version_id`; the rel
 
 The commit gate defers that commit until the platform has proved itself on the new image, so an update's success is "booted and the vehicle came up on it" rather than only "the running version matches the pending artifact".
 
-It is off by default, and opting in is per component: `updates.mdb.commit-gate` gates MDB commits and `updates.dbc.commit-gate` gates DBC commits. Enabling it changes the failure mode of a commit to fail-closed, so it is switched on per device once that device's probe set has been confirmed.
+It is on for the `nightly` channel and off for `stable` and `testing`, so the feature is exercised by nightly devices before the other channels get it. An explicit choice always wins: `--commit-gate` on the command line, or `updates.mdb.commit-gate` for MDB commits and `updates.dbc.commit-gate` for DBC commits. Clearing the setting returns the device to its channel default, so switching a device to nightly enables the gate and switching it back disables it again. Enabling the gate changes the failure mode of a commit to fail-closed, so on stable and testing it is switched on per device once that device's probe set has been confirmed.
 
 A window opens at startup when the gate is enabled and Mender's pending artifact is the version that is running. The component stays in `pending-reboot` throughout. Once the image has been up past the floor, these probes are evaluated every 15 seconds and every one must hold:
 
@@ -114,13 +114,13 @@ Each release check reads the current component channel and update method from se
 | `--download-max-duration` | `60m` | Per-attempt download wall-clock limit; `0` disables it |
 | `--download-stall-window` | `2m` | Throughput evaluation window; `0` disables it |
 | `--download-stall-min-bytes` | `65536` | Bytes required in each stall window |
-| `--commit-gate` | `false` | Commit a pending update only after the platform proves healthy on it |
+| `--commit-gate` | channel | Commit a pending update only after the platform proves healthy on it (on for nightly, off for stable and testing) |
 | `--commit-gate-floor` | `3m` | Monotonic uptime before the commit gate evaluates its probes |
 | `--commit-gate-deadline` | `20m` | How long the commit gate may wait for its probes before rolling back |
 | `--commit-gate-required-units` | component set | Comma-separated systemd units the commit gate requires active |
 | `--version` | — | Print the build version and exit |
 
-When not overridden by CLI values, the service loads and watches these component-scoped fields in the `settings` hash: `updates.<component>.channel`, `check-interval`, `releases-url`, `dry-run`, `download-max-duration`, `download-stall-window`, and `download-stall-min-bytes`. `never` disables the configured check interval. The update method is read from `updates.<component>.method`; supported values are `full` and `delta`. The commit gate reads `updates.<component>.commit-gate`, `commit-gate-floor`, `commit-gate-deadline`, and `commit-gate-required-units`, with the CLI flag winning as it does for the others.
+When not overridden by CLI values, the service loads and watches these component-scoped fields in the `settings` hash: `updates.<component>.channel`, `check-interval`, `releases-url`, `dry-run`, `download-max-duration`, `download-stall-window`, and `download-stall-min-bytes`. `never` disables the configured check interval. The update method is read from `updates.<component>.method`; supported values are `full` and `delta`. The commit gate reads `updates.<component>.commit-gate`, `commit-gate-floor`, `commit-gate-deadline`, and `commit-gate-required-units`, with the CLI flag winning as it does for the others; clearing `commit-gate` restores the channel default instead of forcing it off.
 
 Enabling the gate on a running vehicle takes effect at the next startup: a window is opened by startup reconciliation, not by the setting changing. Disabling it takes effect immediately, and a window that is already open then commits without a verdict.
 

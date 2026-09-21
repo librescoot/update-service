@@ -38,7 +38,7 @@ var (
 	downloadStallWindow   = flag.Duration("download-stall-window", 2*time.Minute, "Rolling window for the download throughput floor (0 to disable)")
 	downloadStallMinBytes = flag.Int64("download-stall-min-bytes", 64*1024, "Bytes that must arrive within each stall window")
 
-	commitGate              = flag.Bool("commit-gate", false, "Commit a pending update only after the platform proves healthy on it")
+	commitGate              = flag.Bool("commit-gate", false, "Commit a pending update only after the platform proves healthy on it (default: on for the nightly channel)")
 	commitGateFloor         = flag.Duration("commit-gate-floor", config.DefaultCommitGateFloor, "Monotonic uptime before the commit gate evaluates its probes")
 	commitGateDeadline      = flag.Duration("commit-gate-deadline", config.DefaultCommitGateDeadline, "How long the commit gate may wait for its probes before rolling back")
 	commitGateRequiredUnits = flag.String("commit-gate-required-units", "", "Comma-separated systemd units the commit gate requires active (default: component-specific set)")
@@ -96,10 +96,18 @@ func main() {
 		"download-stall-window":    flag.Lookup("download-stall-window").Value.String() != flag.Lookup("download-stall-window").DefValue,
 		"download-stall-min-bytes": flag.Lookup("download-stall-min-bytes").Value.String() != flag.Lookup("download-stall-min-bytes").DefValue,
 	}
-	cliCommitGateEnabledSet := flag.Lookup("commit-gate").Value.String() != flag.Lookup("commit-gate").DefValue
-	cliCommitGateFloorSet := flag.Lookup("commit-gate-floor").Value.String() != flag.Lookup("commit-gate-floor").DefValue
-	cliCommitGateDeadlineSet := flag.Lookup("commit-gate-deadline").Value.String() != flag.Lookup("commit-gate-deadline").DefValue
-	cliCommitGateUnitsSet := flag.Lookup("commit-gate-required-units").Value.String() != flag.Lookup("commit-gate-required-units").DefValue
+	// flag.Visit reports only the flags actually present on the command line.
+	// That is the only reliable "explicit" signal for a boolean whose declared
+	// default is also false: comparing against the default cannot tell an absent
+	// --commit-gate from an explicit --commit-gate=false, and on nightly those
+	// two must not mean the same thing.
+	cliSet := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { cliSet[f.Name] = true })
+
+	cliCommitGateEnabledSet := cliSet["commit-gate"]
+	cliCommitGateFloorSet := cliSet["commit-gate-floor"]
+	cliCommitGateDeadlineSet := cliSet["commit-gate-deadline"]
+	cliCommitGateUnitsSet := cliSet["commit-gate-required-units"]
 	cliCommitGateSet := map[string]bool{
 		"commit-gate":                cliCommitGateEnabledSet,
 		"commit-gate-floor":          cliCommitGateFloorSet,
@@ -174,7 +182,7 @@ func main() {
 		cfg.DownloadStallMinBytes = *downloadStallMinBytes
 	}
 	if cliCommitGateEnabledSet {
-		cfg.CommitGateEnabled = *commitGate
+		cfg.SetCommitGate(*commitGate)
 	}
 	if cliCommitGateFloorSet {
 		cfg.CommitGateFloor = *commitGateFloor

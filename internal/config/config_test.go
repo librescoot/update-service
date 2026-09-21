@@ -107,11 +107,47 @@ func TestConfig_ApplyRedisUpdate_Budget(t *testing.T) {
 }
 
 func TestConfig_CommitGateDefaults(t *testing.T) {
-	mdb := New("localhost:6379", "https://example.invalid", time.Hour, "mdb", "stable", "/data/ota/mdb", false, false, "/uboot", "", 2)
-	mdbGate := mdb.CommitGateSettings()
-	if mdbGate.Enabled {
-		t.Error("the gate must be off unless a device opts in")
+	newConfig := func(channel string) *Config {
+		return New("localhost:6379", "https://example.invalid", time.Hour, "mdb", channel, "/data/ota/mdb", false, false, "/uboot", "", 2)
 	}
+
+	// The gate is proved out on nightly before the other channels get it.
+	if newConfig("nightly").CommitGateSettings().Enabled != true {
+		t.Error("nightly must gate by default")
+	}
+	for _, channel := range []string{"stable", "testing"} {
+		if newConfig(channel).CommitGateSettings().Enabled {
+			t.Errorf("%s must not gate by default", channel)
+		}
+	}
+
+	// An explicit choice wins over the channel default in both directions.
+	offOnNightly := newConfig("nightly")
+	offOnNightly.SetCommitGate(false)
+	if offOnNightly.CommitGateSettings().Enabled {
+		t.Error("an explicit disable must beat the nightly default")
+	}
+	onStable := newConfig("stable")
+	onStable.SetCommitGate(true)
+	if !onStable.CommitGateSettings().Enabled {
+		t.Error("an explicit enable must beat the stable default")
+	}
+
+	// Clearing the explicit choice hands the decision back to the channel, so
+	// a channel switch moves the default with it.
+	onStable.ClearCommitGate()
+	if onStable.CommitGateSettings().Enabled {
+		t.Error("clearing the explicit choice must restore the stable default")
+	}
+	if !onStable.ApplyRedisUpdate("updates.mdb.channel", "nightly") {
+		t.Fatal("a channel change should be recognised")
+	}
+	if !onStable.CommitGateSettings().Enabled {
+		t.Error("moving to nightly must enable the gate again")
+	}
+
+	mdb := newConfig("stable")
+	mdbGate := mdb.CommitGateSettings()
 	if mdbGate.Floor != DefaultCommitGateFloor {
 		t.Errorf("Floor = %v, want %v", mdbGate.Floor, DefaultCommitGateFloor)
 	}
@@ -193,6 +229,15 @@ func TestConfig_ApplyRedisUpdate_CommitGate(t *testing.T) {
 	}
 	if !c.CommitGateSettings().Enabled {
 		t.Error("the previous enabled value should be retained")
+	}
+
+	// Clearing the setting drops the explicit choice and, on this stable
+	// device, turns the gate back off.
+	if !c.ApplyRedisUpdate("updates.mdb.commit-gate", "") {
+		t.Fatal("an empty commit-gate value should clear the explicit choice")
+	}
+	if c.CommitGateSettings().Enabled {
+		t.Error("clearing the setting must return the gate to the channel default")
 	}
 
 	// Another component's setting must not leak across.

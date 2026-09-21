@@ -85,7 +85,7 @@ func newGateHarnessFor(t *testing.T, component string, opts ...func(*gateHarness
 	}
 
 	cfg := config.New("localhost:6379", "https://example.invalid", time.Hour, component, "nightly", "/data/ota/"+component, false, false, "/uboot", "", 2)
-	cfg.CommitGateEnabled = true
+	cfg.SetCommitGate(true)
 
 	h.updater = &Updater{
 		config: cfg,
@@ -310,7 +310,7 @@ func TestCommitGateDisabledAtRuntimeCommits(t *testing.T) {
 	h := newGateHarness(t)
 	h.markStatusPendingReboot(t)
 	h.probes = failingProbe(allGateProbesPassing(), gateProbeUnits, "librescoot-pm.service is not active")
-	h.updater.config.CommitGateEnabled = false
+	h.updater.config.SetCommitGate(false)
 	marker := commitgate.Marker{
 		Artifact: gateArtifact, PendingVersion: gateVersion,
 		BootID: gateBootA, FirstSeen: h.now, Verdict: commitgate.VerdictWaiting,
@@ -417,7 +417,7 @@ func TestReconcileDefersTheCommitToTheGate(t *testing.T) {
 // Mender exactly as it did before the gate existed.
 func TestReconcileWithGateDisabledCommitsImmediately(t *testing.T) {
 	h := newGateHarness(t)
-	h.updater.config.CommitGateEnabled = false
+	h.updater.config.SetCommitGate(false)
 	observations := 0
 	base := h.updater.observeUpdate
 	h.updater.observeUpdate = func() (mender.UpdateObservation, error) {
@@ -545,7 +545,7 @@ func TestRevertedGateWindowFinalisesWithoutRebooting(t *testing.T) {
 // not the current one, and is discarded rather than acted on.
 func TestStaleMarkerForAnotherArtifactIsDiscarded(t *testing.T) {
 	h := newGateHarness(t)
-	h.updater.config.CommitGateEnabled = false
+	h.updater.config.SetCommitGate(false)
 	if err := h.store.Save(commitgate.Marker{
 		Artifact: "release-nightly-20260920T003447", PendingVersion: "nightly-20260920t003447",
 		BootID: gateBootB, FirstSeen: h.now.Add(-time.Hour), Verdict: commitgate.VerdictWaiting,

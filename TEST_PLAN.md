@@ -617,6 +617,7 @@ With proper interfaces, mocks, and test utilities, you can achieve good test cov
 - the quarantine keeps a rejected version out of the staged path and out of release selection, and leaves a newer release alone
 - the window flag is observable while the gate runs and closed with it, under `-race`
 - the component split: the MDB gates on its own power-manager state while the DBC does not read it, the required units are component-scoped, the DBC's window closes its activation-attempt marker on commit, on a revert and when the gate holds, and a verified DBC commit still hands `complete-dbc` to vehicle-service
+- the channel default in the gate snapshot: `nightly` gates, `stable` and `testing` do not, an explicit setting wins in both directions, clearing `commit-gate` returns the device to its channel default, and a channel change moves that default with it
 
 What unit tests cannot reach, and what a bench run has to confirm before the gate is enabled on a board:
 
@@ -625,3 +626,4 @@ What unit tests cannot reach, and what a bench run has to confirm before the gat
 3. The probe set against a real boot: which required units are genuinely always active, and how long after `multi-user.target` the other services publish their state. A floor that is too short is a false rollback. The MDB list has been observed on a healthy MDB; the DBC list comes from the DBC image's package list and has not been observed on a DBC yet, so extend it from a real boot before enabling the gate there.
 4. `systemctl is-system-running` on a real board: confirm it reaches `running` or `degraded` rather than staying `starting`, and that no routinely failing unit forces the wrong verdict. Also confirm the oneshot acceptance on a real `Type=oneshot` unit: `is-active` must not be the only answer the probe takes.
 5. The UMS and vehicle-service side of a window: `ota[heartbeat]` keeps ticking for the whole window, and both tolerate a commit that settles minutes after a reboot instead of seconds. On the DBC the watchdog that matters is vehicle-service's, which resets on any `ota:dbc` field change and shortens to three minutes once it has seen a heartbeat.
+6. On a nightly device, the `Config: commit gate` line in the startup log with no gate setting and no flag, and then with `--commit-gate=false` passed explicitly: an absent flag must leave the channel default on, while the explicit flag must turn it off.

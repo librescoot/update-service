@@ -57,7 +57,8 @@ type Config struct {
 	// Written by ApplyRedisUpdate and read once per probe tick by the gate
 	// goroutine, so gateMu guards it independently of channelMu and budgetMu.
 	gateMu                  sync.RWMutex
-	CommitGateEnabled       bool
+	commitGateEnabled       bool
+	commitGateExplicit      bool
 	CommitGateFloor         time.Duration
 	CommitGateDeadline      time.Duration
 	CommitGateRequiredUnits []string
@@ -120,16 +121,43 @@ type CommitGateSettings struct {
 	RequiredUnits []string
 }
 
-// CommitGateSettings returns the current gate configuration.
+// CommitGateSettings returns the current gate configuration. The gate is
+// enabled by an explicit choice when one exists, and otherwise by the release
+// channel: the gate is tested on nightly first, while stable and testing keep
+// the historical commit behaviour until it is turned on there deliberately.
 func (c *Config) CommitGateSettings() CommitGateSettings {
+	// GetChannel takes channelMu, so resolve it before gateMu. Nothing ever
+	// takes gateMu and then channelMu, which keeps the order one-way.
+	enabled := c.GetChannel() == "nightly"
+
 	c.gateMu.RLock()
 	defer c.gateMu.RUnlock()
+	if c.commitGateExplicit {
+		enabled = c.commitGateEnabled
+	}
 	return CommitGateSettings{
-		Enabled:       c.CommitGateEnabled,
+		Enabled:       enabled,
 		Floor:         c.CommitGateFloor,
 		Deadline:      c.CommitGateDeadline,
 		RequiredUnits: slices.Clone(c.CommitGateRequiredUnits),
 	}
+}
+
+// SetCommitGate pins the commit gate to enabled or disabled. An explicit choice
+// from a CLI flag or a setting wins over the channel default.
+func (c *Config) SetCommitGate(enabled bool) {
+	c.gateMu.Lock()
+	defer c.gateMu.Unlock()
+	c.commitGateEnabled = enabled
+	c.commitGateExplicit = true
+}
+
+// ClearCommitGate drops an explicit setting so the channel default applies
+// again. It does not change the channel itself.
+func (c *Config) ClearCommitGate() {
+	c.gateMu.Lock()
+	defer c.gateMu.Unlock()
+	c.commitGateExplicit = false
 }
 
 func New(
@@ -159,9 +187,9 @@ func New(
 		DownloadStallWindow:    2 * time.Minute,
 		DownloadStallMinBytes:  64 * 1024,
 		DryRun:                 dryRun,
-		// Off unless a device opts in: enabling it changes the commit failure
-		// mode to fail-closed, which rolls an image back.
-		CommitGateEnabled:       false,
+		// No explicit choice here: CommitGateSettings derives the default from
+		// the channel, so a nightly device starts gated without anyone opting
+		// in twice.
 		CommitGateFloor:         DefaultCommitGateFloor,
 		CommitGateDeadline:      DefaultCommitGateDeadline,
 		CommitGateRequiredUnits: defaultCommitGateUnits(component),
@@ -252,7 +280,7 @@ func (c *Config) LoadFromRedis(redis RedisSettings) error {
 
 	if v, err := redis.HGet(SettingsHashKey, prefix+"commit-gate"); err == nil && v != "" {
 		if enabled, err := strconv.ParseBool(v); err == nil {
-			c.CommitGateEnabled = enabled
+			c.SetCommitGate(enabled)
 		}
 	}
 	if v, err := redis.HGet(SettingsHashKey, prefix+"commit-gate-floor"); err == nil && v != "" {
@@ -370,10 +398,12 @@ func (c *Config) ApplyRedisUpdate(key, value string) bool {
 			return true
 		}
 	case "commit-gate":
+		if value == "" {
+			c.ClearCommitGate()
+			return true
+		}
 		if enabled, err := strconv.ParseBool(value); err == nil {
-			c.gateMu.Lock()
-			c.CommitGateEnabled = enabled
-			c.gateMu.Unlock()
+			c.SetCommitGate(enabled)
 			return true
 		}
 	case "commit-gate-floor":
