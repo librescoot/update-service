@@ -56,6 +56,18 @@ func (a *DeltaApplier) ApplyDeltaChain(ctx context.Context, oldMenderPath string
 		}
 	}
 
+	oldAbs, err := filepath.Abs(oldMenderPath)
+	if err != nil {
+		return fmt.Errorf("resolve old mender path: %w", err)
+	}
+	newAbs, err := filepath.Abs(newMenderPath)
+	if err != nil {
+		return fmt.Errorf("resolve output mender path: %w", err)
+	}
+	if oldAbs == newAbs {
+		return fmt.Errorf("output mender path must differ from the base artifact")
+	}
+
 	if err := os.MkdirAll(filepath.Dir(newMenderPath), 0755); err != nil {
 		return fmt.Errorf("create output directory: %w", err)
 	}

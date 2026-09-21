@@ -19,14 +19,24 @@ func UnpackMender(menderPath, extractDir string) error {
 // RepackMender creates a .mender tar from files in sourceDir.
 // Enforces mender ordering: version, manifest, header.tar.gz, then data/*.
 func RepackMender(sourceDir, menderPath string) error {
-	f, err := os.Create(menderPath)
+	dir := filepath.Dir(menderPath)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(menderPath)+".tmp-")
 	if err != nil {
-		return fmt.Errorf("create mender: %w", err)
+		return fmt.Errorf("create temporary mender: %w", err)
 	}
-	defer f.Close()
+	tmpPath := f.Name()
+	published := false
+	defer func() {
+		if !published {
+			_ = f.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := f.Chmod(0o644); err != nil {
+		return fmt.Errorf("set temporary mender permissions: %w", err)
+	}
 
 	tw := tar.NewWriter(f)
-	defer tw.Close()
 
 	// Fixed ordering
 	items := []string{"version", "manifest", "header.tar.gz"}
@@ -60,6 +70,27 @@ func RepackMender(sourceDir, menderPath string) error {
 		}
 	}
 
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("close mender archive: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync temporary mender: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close temporary mender: %w", err)
+	}
+	if err := os.Rename(tmpPath, menderPath); err != nil {
+		return fmt.Errorf("publish mender: %w", err)
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open mender directory: %w", err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("sync mender directory: %w", err)
+	}
+	published = true
 	return nil
 }
 

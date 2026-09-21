@@ -96,6 +96,77 @@ func assertVerbatim(t *testing.T, srcPath, gzPath string) {
 	}
 }
 
+func TestRepackMenderPublishesCompleteArchive(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source")
+	if err := os.MkdirAll(filepath.Join(source, "data"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{
+		"version":          "3\n",
+		"manifest":         "manifest\n",
+		"header.tar.gz":    "header",
+		"data/0000.tar.gz": "payload",
+	} {
+		if err := os.WriteFile(filepath.Join(source, name), []byte(contents), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	output := filepath.Join(dir, "output.mender")
+	if err := RepackMender(source, output); err != nil {
+		t.Fatalf("RepackMender: %v", err)
+	}
+	f, err := os.Open(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	tr := tar.NewReader(f)
+	var names []string
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read output archive: %v", err)
+		}
+		names = append(names, hdr.Name)
+	}
+	want := []string{"version", "manifest", "header.tar.gz", "data/0000.tar.gz"}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Errorf("archive entries = %v, want %v", names, want)
+	}
+}
+
+func TestRepackMenderFailurePreservesExistingOutput(t *testing.T) {
+	dir := t.TempDir()
+	output := filepath.Join(dir, "output.mender")
+	const previous = "known-good-artifact"
+	if err := os.WriteFile(output, []byte(previous), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RepackMender(filepath.Join(dir, "missing-input"), output); err == nil {
+		t.Fatal("RepackMender succeeded with missing input")
+	}
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != previous {
+		t.Errorf("output = %q, want preserved %q", got, previous)
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, ".output.mender.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("temporary files remain: %v", matches)
+	}
+}
+
 func TestCompressPayloadAndHash(t *testing.T) {
 	rootfs := bytes.Repeat([]byte("rootfs-content-"), 5000)
 	want := sha256.Sum256(rootfs)
