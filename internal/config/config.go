@@ -91,13 +91,10 @@ func defaultCommitGateUnits(component string) []string {
 	// or are absent depending on SIM, card and fitted hardware, and a required
 	// unit that is wrongly listed turns a good update into a rollback.
 	if component == "dbc" {
-		// The DBC's own services, from the DBC image's package list: local valkey
-		// (dbc-dispatcher and the dashboard talk to it), version-service, and the
-		// dispatcher every DBC service is reached through. vehicle, settings and
-		// pm-service live on the MDB, so they cannot be required here; what the DBC
-		// needs from the MDB is checked separately by the vehicle probe.
+		// The DBC talks to the MDB's valkey and ships valkey only for its
+		// client, so its valkey server is disabled and never runs. vehicle,
+		// settings and pm-service live on the MDB.
 		return []string{
-			"valkey.service",
 			"librescoot-version.service",
 			"dbc-dispatcher.service",
 		}
@@ -121,13 +118,10 @@ type CommitGateSettings struct {
 	RequiredUnits []string
 }
 
-// CommitGateSettings returns the current gate configuration. The gate is
-// enabled by an explicit choice when one exists, and otherwise by the release
-// channel: the gate is tested on nightly first, while stable and testing keep
-// the historical commit behaviour until it is turned on there deliberately.
+// CommitGateSettings returns the current gate configuration. Absent an explicit
+// choice the release channel decides: nightly gates, stable and testing do not.
 func (c *Config) CommitGateSettings() CommitGateSettings {
-	// GetChannel takes channelMu, so resolve it before gateMu. Nothing ever
-	// takes gateMu and then channelMu, which keeps the order one-way.
+	// channelMu before gateMu; nothing takes them the other way round.
 	enabled := c.GetChannel() == "nightly"
 
 	c.gateMu.RLock()
@@ -143,8 +137,8 @@ func (c *Config) CommitGateSettings() CommitGateSettings {
 	}
 }
 
-// SetCommitGate pins the commit gate to enabled or disabled. An explicit choice
-// from a CLI flag or a setting wins over the channel default.
+// SetCommitGate pins the gate to enabled or disabled. A CLI flag or setting
+// made explicitly wins over the channel default.
 func (c *Config) SetCommitGate(enabled bool) {
 	c.gateMu.Lock()
 	defer c.gateMu.Unlock()
@@ -152,7 +146,7 @@ func (c *Config) SetCommitGate(enabled bool) {
 	c.commitGateExplicit = true
 }
 
-// ClearCommitGate drops an explicit setting so the channel default applies
+// ClearCommitGate drops an explicit choice so the channel default applies
 // again. It does not change the channel itself.
 func (c *Config) ClearCommitGate() {
 	c.gateMu.Lock()
@@ -187,9 +181,7 @@ func New(
 		DownloadStallWindow:    2 * time.Minute,
 		DownloadStallMinBytes:  64 * 1024,
 		DryRun:                 dryRun,
-		// No explicit choice here: CommitGateSettings derives the default from
-		// the channel, so a nightly device starts gated without anyone opting
-		// in twice.
+		// No explicit choice: the channel decides (see CommitGateSettings).
 		CommitGateFloor:         DefaultCommitGateFloor,
 		CommitGateDeadline:      DefaultCommitGateDeadline,
 		CommitGateRequiredUnits: defaultCommitGateUnits(component),

@@ -96,11 +96,8 @@ func main() {
 		"download-stall-window":    flag.Lookup("download-stall-window").Value.String() != flag.Lookup("download-stall-window").DefValue,
 		"download-stall-min-bytes": flag.Lookup("download-stall-min-bytes").Value.String() != flag.Lookup("download-stall-min-bytes").DefValue,
 	}
-	// flag.Visit reports only the flags actually present on the command line.
-	// That is the only reliable "explicit" signal for a boolean whose declared
-	// default is also false: comparing against the default cannot tell an absent
-	// --commit-gate from an explicit --commit-gate=false, and on nightly those
-	// two must not mean the same thing.
+	// Only flags actually on the command line count as explicit: a bool whose
+	// default is false cannot otherwise be told from an explicit --commit-gate=false.
 	cliSet := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { cliSet[f.Name] = true })
 

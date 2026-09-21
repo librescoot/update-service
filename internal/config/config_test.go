@@ -164,8 +164,15 @@ func TestConfig_CommitGateDefaults(t *testing.T) {
 
 	dbc := New("localhost:6379", "https://example.invalid", time.Hour, "dbc", "stable", "/data/ota/dbc", false, false, "/uboot", "", 2)
 	dbcGate := dbc.CommitGateSettings()
-	if slices.Contains(dbcGate.RequiredUnits, "librescoot-pm.service") {
-		t.Errorf("dbc required units must not include pm-service: %v", dbcGate.RequiredUnits)
+	for _, notOurs := range []string{"librescoot-pm.service", "librescoot-vehicle.service", "librescoot-settings.service"} {
+		if slices.Contains(dbcGate.RequiredUnits, notOurs) {
+			t.Errorf("dbc required units must not include the MDB's %s: %v", notOurs, dbcGate.RequiredUnits)
+		}
+	}
+	// valkey ships on the DBC for its client only; requiring it would expire
+	// every DBC window.
+	if slices.Contains(dbcGate.RequiredUnits, "valkey.service") {
+		t.Errorf("dbc required units must not include valkey: %v", dbcGate.RequiredUnits)
 	}
 }
 

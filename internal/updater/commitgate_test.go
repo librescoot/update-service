@@ -1115,18 +1115,18 @@ func TestStuckGateOnTheDBCClosesTheActivationAttempt(t *testing.T) {
 	}
 }
 
-// The DBC's required units are the DBC's own services: vehicle, settings and
-// pm-service live on the MDB and cannot be required from here.
+// The DBC requires only its own units: the MDB's services cannot be required
+// from here, and the DBC's valkey server is disabled.
 func TestCommitGateUnitsAreComponentScoped(t *testing.T) {
 	dbc := newGateHarnessFor(t, "dbc")
 	units := dbc.updater.config.CommitGateSettings().RequiredUnits
-	want := []string{"valkey.service", "librescoot-version.service", "dbc-dispatcher.service"}
+	want := []string{"librescoot-version.service", "dbc-dispatcher.service"}
 	if !slices.Equal(units, want) {
 		t.Errorf("dbc required units = %v, want %v", units, want)
 	}
-	for _, forbidden := range []string{"librescoot-vehicle.service", "librescoot-pm.service", "librescoot-settings.service"} {
+	for _, forbidden := range []string{"librescoot-vehicle.service", "librescoot-pm.service", "librescoot-settings.service", "valkey.service"} {
 		if slices.Contains(units, forbidden) {
-			t.Errorf("dbc required units must not include the MDB's %s", forbidden)
+			t.Errorf("dbc required units must not include %s", forbidden)
 		}
 	}
 }

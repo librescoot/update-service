@@ -842,10 +842,9 @@ func (u *Updater) installPendingMenderFile(holdsPendingArtifact bool) {
 		return
 	}
 
-	// A staged file whose version the gate rolled back stays on disk as the
-	// delta base and as evidence, but it is not a target: reinstalling it would
-	// reproduce the image that just failed and be rolled back again. This is
-	// checked after the version comparison so that a version already running is
+	// A staged file the gate rolled back stays on disk as the delta base and as
+	// evidence, but reinstalling it would reproduce the image that just failed.
+	// Checked after the version comparison so a version already running is
 	// skipped as current rather than reported as rejected.
 	if u.gateQuarantinedVersions()[strings.ToLower(menderVersion)] {
 		u.logger.Printf("Not installing staged %s: the commit gate rolled this version back", menderVersion)
