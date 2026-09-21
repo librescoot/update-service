@@ -25,13 +25,14 @@ import (
 	"time"
 )
 
-// Marker state verdicts. A marker carries the verdict it reached, so a restart
+// Marker state verdicts. A marker carries the state it reached, so a restart
 // after a decision can tell "we already decided" from "we are still deciding".
+// Only the states a marker is kept in are named here: once a verdict has been
+// carried out the marker has served its purpose and is removed, and the verdict
+// itself is published in the ota hash instead.
 const (
-	VerdictWaiting       = "waiting"
-	VerdictCommitted     = "committed"
-	VerdictRolledBack    = "rolled-back"
-	VerdictRollbackStuck = "rollback-stuck"
+	VerdictWaiting    = "waiting"
+	VerdictRolledBack = "rolled-back"
 )
 
 // Marker records one gated commit attempt.
@@ -54,8 +55,8 @@ type Marker struct {
 	// Probes is the last observed state of each probe, keyed by name, so a
 	// timeout can name the probe that never became true.
 	Probes map[string]bool `json:"probes,omitempty"`
-	// Verdict and Reason are the last decision, kept for post-mortem after the
-	// marker stops being the live state.
+	// Verdict and Reason are the last decision, kept for post-mortem alongside
+	// the probe states while the marker is still the live state.
 	Verdict   string    `json:"verdict,omitempty"`
 	Reason    string    `json:"reason,omitempty"`
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
