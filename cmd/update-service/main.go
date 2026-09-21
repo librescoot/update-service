@@ -39,7 +39,7 @@ var (
 	downloadStallMinBytes = flag.Int64("download-stall-min-bytes", 64*1024, "Bytes that must arrive within each stall window")
 
 	commitGate              = flag.Bool("commit-gate", false, "Commit a pending update only after the platform proves healthy on it (default: on for the nightly channel)")
-	commitGateFloor         = flag.Duration("commit-gate-floor", config.DefaultCommitGateFloor, "Monotonic uptime before the commit gate evaluates its probes")
+	commitGateFloor         = flag.Duration("commit-gate-floor", config.DefaultCommitGateFloor, "Monotonic uptime before the commit gate evaluates its probes (default: 3m on the MDB, 1m on the DBC)")
 	commitGateDeadline      = flag.Duration("commit-gate-deadline", config.DefaultCommitGateDeadline, "How long the commit gate may wait for its probes before rolling back")
 	commitGateRequiredUnits = flag.String("commit-gate-required-units", "", "Comma-separated systemd units the commit gate requires active (default: component-specific set)")
 )

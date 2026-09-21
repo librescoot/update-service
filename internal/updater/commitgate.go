@@ -148,11 +148,6 @@ func (u *Updater) reconcileCommitGate() (*GatedCommit, bool, error) {
 	}
 
 	if marker.BootID != bootID {
-		// This boot is not the one that opened the window, with the same
-		// artifact still pending. The window never spans a reboot: an
-		// uncommitted slot is reverted by the bootloader on the next attempt, so
-		// still running the pending artifact a boot later means no revert
-		// happened.
 		if sameObservedVersion(running, observation.CommittedVersion) {
 			return nil, true, u.finalizeRevertedGate(marker, observation)
 		}
@@ -160,8 +155,17 @@ func (u *Updater) reconcileCommitGate() (*GatedCommit, bool, error) {
 			return nil, true, u.finalizeStuckGate(marker,
 				"the image is still running after a requested rollback")
 		}
-		return nil, true, u.rollbackGatedUpdate(marker,
-			"the image rebooted before the gate reached a verdict")
+		// The component rebooted while the window was open: a power cycle, a
+		// crash, or someone turning the vehicle off and straight back on. That is
+		// not a verdict about the image, and a quick off-and-on must not cost a
+		// good update, so adopt this boot and keep waiting. What bounds the
+		// attempt is the deadline, which still runs from when the window opened.
+		u.logger.Printf("Commit gate window for %s continues across a reboot", marker.Artifact)
+		marker.BootID = bootID
+		marker.UpdatedAt = u.gateClock()
+		if err := u.saveGateMarker(marker); err != nil {
+			return nil, false, u.pendingCommitError(fmt.Errorf("record the rebooted commit gate window: %w", err))
+		}
 	}
 
 	if !sameObservedVersion(running, observation.PendingVersion) {
@@ -172,8 +176,9 @@ func (u *Updater) reconcileCommitGate() (*GatedCommit, bool, error) {
 		return nil, false, u.clearGateMarker()
 	}
 
-	// Resume: the process restarted inside the window, so the deadline still
-	// runs from when the window opened and not from this startup.
+	// Resume: the process restarted, or the component rebooted, inside the
+	// window, so the deadline still runs from when the window opened and not from
+	// this startup.
 	if err := u.reconstructPendingState(observation); err != nil {
 		return nil, false, err
 	}

@@ -442,8 +442,57 @@ func TestReconcileWithGateDisabledCommitsImmediately(t *testing.T) {
 
 // A second boot presenting the same uncommitted artifact means the bootloader
 // did not revert. With no rollback attempted yet, that rolls back once.
-func TestSecondBootOnTheSameSlotRollsBackOnce(t *testing.T) {
+// A reboot inside the window is not a verdict: the component comes back on the
+// same uncommitted artifact and the window carries on where it left off.
+func TestRebootDuringTheWindowResumesIt(t *testing.T) {
 	h := newGateHarness(t)
+	h.markStatusPendingReboot(t)
+	h.bootID = gateBootB
+	opened := h.now.Add(-2 * time.Minute)
+	if err := h.store.Save(commitgate.Marker{
+		Artifact: gateArtifact, PendingVersion: gateVersion,
+		BootID: gateBootA, FirstSeen: opened, Verdict: commitgate.VerdictWaiting,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := h.updater.ReconcilePendingUpdate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Gated == nil {
+		t.Fatalf("reconciliation = %+v, want the window to continue", rec)
+	}
+	if h.rollbacks != 0 || h.reboots != 0 {
+		t.Fatalf("a reboot cost the window %d rollbacks and %d reboots, want none", h.rollbacks, h.reboots)
+	}
+	resumed, err := h.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.BootID != gateBootB {
+		t.Errorf("marker boot ID = %q, want %q", resumed.BootID, gateBootB)
+	}
+	if !resumed.FirstSeen.Equal(opened) {
+		t.Errorf("marker FirstSeen = %s, want %s: a reboot must not restart the deadline",
+			resumed.FirstSeen, opened)
+	}
+
+	// And the window that survived the reboot still commits.
+	if done := h.updater.commitGateStep(&resumed, h.gated()); !done {
+		t.Fatal("the resumed window did not reach a verdict")
+	}
+	if h.commits != 1 {
+		t.Fatalf("commit calls = %d, want 1", h.commits)
+	}
+}
+
+// A reboot does not extend the window either: the deadline runs from when it
+// opened, so an image that never earns its verdict across reboots still fails
+// closed.
+func TestRebootPastTheDeadlineRollsBack(t *testing.T) {
+	h := newGateHarness(t)
+	h.markStatusPendingReboot(t)
 	h.bootID = gateBootB
 	if err := h.store.Save(commitgate.Marker{
 		Artifact: gateArtifact, PendingVersion: gateVersion,
@@ -456,14 +505,23 @@ func TestSecondBootOnTheSameSlotRollsBackOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.Gated != nil || rec.NeedsReboot {
-		t.Fatalf("reconciliation = %+v, want a settled rollback", rec)
+	if rec.Gated == nil {
+		t.Fatalf("reconciliation = %+v, want the window to continue", rec)
 	}
-	if h.rollbacks != 1 {
-		t.Fatalf("rollback calls = %d, want 1", h.rollbacks)
+
+	h.probes = failingProbe(allGateProbesPassing(), gateProbeUptime, "up to 10s, need 3m0s")
+	marker, err := h.store.Load()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if h.reboots != 1 {
-		t.Fatalf("reboot requests = %d, want 1", h.reboots)
+	if done := h.updater.commitGateStep(&marker, h.gated()); !done {
+		t.Fatal("an expired window did not reach a verdict")
+	}
+	if h.rollbacks != 1 || h.reboots != 1 {
+		t.Fatalf("rollbacks = %d, reboots = %d, want 1 and 1", h.rollbacks, h.reboots)
+	}
+	if got := h.gateField("commit-gate-reason:mdb"); !strings.Contains(got, "no health verdict within") {
+		t.Errorf("commit-gate-reason:mdb = %q, want the deadline named", got)
 	}
 	if quarantined, err := h.store.Quarantined(gateArtifact); err != nil || !quarantined {
 		t.Errorf("Quarantined(%s) = %v (err %v), want true", gateArtifact, quarantined, err)

@@ -69,6 +69,10 @@ A window opens at startup when the gate is enabled and Mender's pending artifact
 - `power-manager[state]` is `running`, not a power transition — MDB only
 - the component still holds its image: `status:<component>` is `pending-reboot` with no error recorded
 
+The floor is per component: three minutes on the MDB, one minute on the DBC, which reaches multi-user about 22 seconds after boot. On the DBC that keeps the window short, because the question the DBC has to answer is mostly whether it can reach the MDB again.
+
+A reboot inside the window is not a verdict. A quick off-and-on, or any crash, comes back on the same uncommitted artifact and the window carries on from where it left off, with the new boot recorded in the marker. It does not restart the deadline either: the deadline runs from when the window opened, so an image that never earns its verdict still fails closed. Only a boot that has already asked for a rollback, or one that comes back on the committed slot, is treated as an outcome.
+
 The required units default to `valkey`, `librescoot-vehicle`, `librescoot-settings` and `librescoot-version`, plus `librescoot-pm` on the MDB. On the DBC they default to `librescoot-version` and `dbc-dispatcher`: vehicle, settings and pm-service run on the MDB and cannot be required from there, and although the DBC image ships valkey for its `redis-cli`, the DBC talks to the valkey instance on the MDB, so the recipe disables the DBC's valkey service and its unit never runs. What the DBC needs from the MDB is covered by the vehicle probe instead, which reads through the MDB's Redis, and its power state is deliberately not a probe: the MDB holds dashboard power for a DBC update and resumes suspending once the lifecycle completes, so that state may change while the window is still open without saying anything about the dashboard's image.
 
 Modem, uplink, battery, ecu and keycard are deliberately absent: they legitimately fail or are absent depending on SIM, card and fitted hardware, and a required unit that is wrongly listed turns a good update into a rollback. Listing a oneshot is safe because the probe accepts a unit that ran successfully during this boot even when it is inactive afterwards, which is what `Type=oneshot` with `RemainAfterExit=no` always reports. A unit list that is wrong for a device is the main way this feature costs an update attempt, which is why each component's default is only as large as what its image guarantees.
@@ -115,7 +119,7 @@ Each release check reads the current component channel and update method from se
 | `--download-stall-window` | `2m` | Throughput evaluation window; `0` disables it |
 | `--download-stall-min-bytes` | `65536` | Bytes required in each stall window |
 | `--commit-gate` | channel | Commit a pending update only after the platform proves healthy on it (on for nightly, off for stable and testing) |
-| `--commit-gate-floor` | `3m` | Monotonic uptime before the commit gate evaluates its probes |
+| `--commit-gate-floor` | component | Monotonic uptime before the commit gate evaluates its probes (`3m` on the MDB, `1m` on the DBC) |
 | `--commit-gate-deadline` | `20m` | How long the commit gate may wait for its probes before rolling back |
 | `--commit-gate-required-units` | component set | Comma-separated systemd units the commit gate requires active |
 | `--version` | — | Print the build version and exit |

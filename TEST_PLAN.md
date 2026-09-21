@@ -610,7 +610,8 @@ With proper interfaces, mocks, and test utilities, you can achieve good test cov
 - the deadline rolls back exactly once, records the rollback attempt, quarantines the artifact, and reboots
 - reopening the marker resumes the window without moving `FirstSeen`, so a service restart cannot extend the deadline
 - the kill switch commits without a verdict
-- a second boot on the same uncommitted artifact rolls back once, and a second boot after a requested rollback holds and reports without rebooting
+- a reboot inside the window resumes it, keeping the original deadline and adopting the new boot, and the resumed window still commits; the same reboot past the deadline rolls back once
+- a boot after a requested rollback holds and reports without rebooting
 - a second boot on the committed slot finalises the revert to `idle` and does not reboot
 - a stale marker for another artifact is discarded
 - a failed commit, an artifact Mender replaced, and a marker that cannot be written each reach their own terminal outcome
@@ -618,6 +619,7 @@ With proper interfaces, mocks, and test utilities, you can achieve good test cov
 - the window flag is observable while the gate runs and closed with it, under `-race`
 - the component split: the MDB gates on its own power-manager state while the DBC does not read it, the required units are component-scoped, the DBC's window closes its activation-attempt marker on commit, on a revert and when the gate holds, and a verified DBC commit still hands `complete-dbc` to vehicle-service
 - the channel default in the gate snapshot: `nightly` gates, `stable` and `testing` do not, an explicit setting wins in both directions, clearing `commit-gate` returns the device to its channel default, and a channel change moves that default with it
+- the floor is component-scoped: three minutes on the MDB and one minute on the DBC
 
 What unit tests cannot reach, and what a bench run has to confirm before the gate is enabled on a board:
 

@@ -74,10 +74,25 @@ const (
 	// probes are evaluated. The floor is not a probe of its own: it keeps a
 	// boot that is still assembling itself from being judged.
 	DefaultCommitGateFloor = 3 * time.Minute
+	// DefaultCommitGateFloorDBC is the DBC's floor. The DBC reaches multi-user
+	// about 22s after boot and its health questions are answered by then, so its
+	// window is kept short: the whole point on the DBC is to commit as soon as it
+	// can reach the MDB's Redis again.
+	DefaultCommitGateFloorDBC = 1 * time.Minute
 	// DefaultCommitGateDeadline is how long the gate may wait for every probe
 	// before it fails closed and rolls the update back.
 	DefaultCommitGateDeadline = 20 * time.Minute
 )
+
+// defaultCommitGateFloor is the per-boot settling time before the gate judges an
+// image, which differs by component because the two boards boot at very
+// different speeds.
+func defaultCommitGateFloor(component string) time.Duration {
+	if component == "dbc" {
+		return DefaultCommitGateFloorDBC
+	}
+	return DefaultCommitGateFloor
+}
 
 // defaultCommitGateUnits lists the services a healthy boot must have brought
 // up. Deliberately excluded: modem, uplink, battery, ecu and keycard. Those
@@ -182,7 +197,7 @@ func New(
 		DownloadStallMinBytes:  64 * 1024,
 		DryRun:                 dryRun,
 		// No explicit choice: the channel decides (see CommitGateSettings).
-		CommitGateFloor:         DefaultCommitGateFloor,
+		CommitGateFloor:         defaultCommitGateFloor(component),
 		CommitGateDeadline:      DefaultCommitGateDeadline,
 		CommitGateRequiredUnits: defaultCommitGateUnits(component),
 		BootEnabled:             bootEnabled,

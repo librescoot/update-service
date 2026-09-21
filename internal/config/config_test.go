@@ -174,6 +174,13 @@ func TestConfig_CommitGateDefaults(t *testing.T) {
 	if slices.Contains(dbcGate.RequiredUnits, "valkey.service") {
 		t.Errorf("dbc required units must not include valkey: %v", dbcGate.RequiredUnits)
 	}
+	// The DBC boots in seconds, so its window opens sooner than the MDB's.
+	if dbcGate.Floor != DefaultCommitGateFloorDBC {
+		t.Errorf("dbc Floor = %v, want %v", dbcGate.Floor, DefaultCommitGateFloorDBC)
+	}
+	if DefaultCommitGateFloorDBC >= DefaultCommitGateFloor {
+		t.Errorf("the DBC floor %v must be shorter than the MDB's %v", DefaultCommitGateFloorDBC, DefaultCommitGateFloor)
+	}
 }
 
 func TestConfig_ApplyRedisUpdate_CommitGate(t *testing.T) {
