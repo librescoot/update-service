@@ -100,6 +100,27 @@ func (r *Reporter) SetStagedNoop(ctx context.Context) error {
 	return r.setTerminal(ctx, StatusStagedNoop)
 }
 
+// SetCommitGate publishes what the commit gate is doing. It is not a status
+// transition: the component stays in pending-reboot while the gate decides, so
+// this only adds why the update has not settled and, while waiting, when the
+// verdict is due. reason is empty for a verdict that needs no explanation, and
+// deadline is the zero time when there is nothing left to wait for.
+func (r *Reporter) SetCommitGate(ctx context.Context, state, reason string, deadline time.Time) error {
+	deadlineValue := ""
+	if !deadline.IsZero() {
+		deadlineValue = deadline.UTC().Format(time.RFC3339)
+	}
+	m := map[string]any{
+		r.key("commit-gate"):          state,
+		r.key("commit-gate-reason"):   reason,
+		r.key("commit-gate-deadline"): deadlineValue,
+	}
+	if err := r.pub.SetMany(m, ipc.Sync()); err != nil {
+		return fmt.Errorf("publish commit gate state for %s: %w", r.component, err)
+	}
+	return nil
+}
+
 func (r *Reporter) setTerminal(ctx context.Context, st Status) error {
 	r.stateMu.Lock()
 	defer r.stateMu.Unlock()
@@ -115,6 +136,12 @@ func (r *Reporter) setTerminal(ctx context.Context, st Status) error {
 		r.key("error"):             "",
 		r.key("error-message"):     "",
 		r.key("error-event"):       "",
+		// A component that reached a terminal status is not being gated. The
+		// gate republishes its verdict after the transition, so the last word on
+		// a gated attempt is the verdict, not this clearing.
+		r.key("commit-gate"):          "",
+		r.key("commit-gate-reason"):   "",
+		r.key("commit-gate-deadline"): "",
 	}
 	err := r.setManyAndResetErrors(m)
 	if err != nil {
@@ -410,6 +437,11 @@ func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
 		r.key("preview-status"):    "",
 		r.key("preview-version"):   "",
 		r.key("preview-size"):      "",
+		// Gate fields describe one attempt at one artifact. With no status to
+		// hold them, they are leftovers from a previous boot.
+		r.key("commit-gate"):          "",
+		r.key("commit-gate-reason"):   "",
+		r.key("commit-gate-deadline"): "",
 	}
 	err := r.setManyAndResetErrors(m)
 	if err != nil {

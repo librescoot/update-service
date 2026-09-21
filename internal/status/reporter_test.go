@@ -373,3 +373,68 @@ func TestInitialize_ClearsPreviewFields(t *testing.T) {
 		}
 	}
 }
+
+func TestSetCommitGate(t *testing.T) {
+	r, mr := newTestReporter(t)
+	ctx := context.Background()
+
+	deadline := time.Date(2026, 9, 21, 19, 3, 31, 0, time.UTC)
+	if err := r.SetCommitGate(ctx, "waiting", "units: librescoot-pm.service", deadline); err != nil {
+		t.Fatal(err)
+	}
+	if got := mr.HGet("ota", "commit-gate:mdb"); got != "waiting" {
+		t.Errorf("commit-gate:mdb = %q, want waiting", got)
+	}
+	if got := mr.HGet("ota", "commit-gate-reason:mdb"); got != "units: librescoot-pm.service" {
+		t.Errorf("commit-gate-reason:mdb = %q", got)
+	}
+	if got := mr.HGet("ota", "commit-gate-deadline:mdb"); got != "2026-09-21T19:03:31Z" {
+		t.Errorf("commit-gate-deadline:mdb = %q, want the RFC3339 deadline", got)
+	}
+
+	// A verdict has nothing left to wait for.
+	if err := r.SetCommitGate(ctx, "rolled-back", "deadline", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mr.HGet("ota", "commit-gate:mdb"); got != "rolled-back" {
+		t.Errorf("commit-gate:mdb = %q, want rolled-back", got)
+	}
+	if got := mr.HGet("ota", "commit-gate-deadline:mdb"); got != "" {
+		t.Errorf("commit-gate-deadline:mdb = %q, want cleared", got)
+	}
+}
+
+// A terminal transition means the component is not being gated any more.
+func TestTerminalStatusClearsCommitGateFields(t *testing.T) {
+	r, mr := newTestReporter(t)
+	ctx := context.Background()
+
+	if err := r.SetCommitGate(ctx, "waiting", "uptime", time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"commit-gate:mdb", "commit-gate-reason:mdb", "commit-gate-deadline:mdb"} {
+		if got := mr.HGet("ota", field); got != "" {
+			t.Errorf("%s = %q, want cleared by a terminal status", field, got)
+		}
+	}
+}
+
+func TestInitializeClearsCommitGateFields(t *testing.T) {
+	r, mr := newTestReporter(t)
+	ctx := context.Background()
+
+	if err := r.SetCommitGate(ctx, "waiting", "uptime", time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Initialize(ctx, "delta"); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"commit-gate:mdb", "commit-gate-reason:mdb", "commit-gate-deadline:mdb"} {
+		if got := mr.HGet("ota", field); got != "" {
+			t.Errorf("%s = %q, want cleared after Initialize", field, got)
+		}
+	}
+}
