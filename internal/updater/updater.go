@@ -833,20 +833,22 @@ func (u *Updater) installPendingMenderFile(holdsPendingArtifact bool) {
 		return
 	}
 
-	// A staged file whose version the gate rolled back stays on disk as the
-	// delta base and as evidence, but it is not a target: reinstalling it would
-	// reproduce the image that just failed and be rolled back again.
-	if u.gateQuarantinedVersions()[strings.ToLower(menderVersion)] {
-		u.logger.Printf("Not installing staged %s: the commit gate rolled this version back", menderVersion)
-		return
-	}
-
 	// Skip unless the pending file is strictly newer than the running version.
 	// version.Compare is semver-aware for stable (v0.9.0 < v0.10.0) and
 	// lexicographic for timestamp-based nightly/testing. The old lexicographic
 	// compare wrongly treated a stale stable build (v0.9.0 > v0.10.0) as newer
 	// and downgraded the scooter at startup.
 	if version.Compare(strings.ToLower(menderVersion), strings.ToLower(currentVersion)) <= 0 {
+		return
+	}
+
+	// A staged file whose version the gate rolled back stays on disk as the
+	// delta base and as evidence, but it is not a target: reinstalling it would
+	// reproduce the image that just failed and be rolled back again. This is
+	// checked after the version comparison so that a version already running is
+	// skipped as current rather than reported as rejected.
+	if u.gateQuarantinedVersions()[strings.ToLower(menderVersion)] {
+		u.logger.Printf("Not installing staged %s: the commit gate rolled this version back", menderVersion)
 		return
 	}
 
