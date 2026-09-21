@@ -49,10 +49,73 @@ type Config struct {
 
 	DryRun bool // Do not reboot; notify only.
 
+	// Commit gate. When enabled, a pending Mender update is committed only
+	// after the platform has proven itself on the new image, so a commit means
+	// "booted and healthy" rather than only "the running version matches the
+	// pending artifact". See internal/commitgate.
+	//
+	// Written by ApplyRedisUpdate and read once per probe tick by the gate
+	// goroutine, so gateMu guards it independently of channelMu and budgetMu.
+	gateMu                  sync.RWMutex
+	CommitGateEnabled       bool
+	CommitGateFloor         time.Duration
+	CommitGateDeadline      time.Duration
+	CommitGateRequiredUnits []string
+
 	BootEnabled    bool
 	BootMountPoint string
 	BootDevice     string
 	BootUBootSeek  int64 // 512-byte blocks before the U-Boot image.
+}
+
+const (
+	// DefaultCommitGateFloor is how long the image must have been up before the
+	// probes are evaluated. The floor is not a probe of its own: it keeps a
+	// boot that is still assembling itself from being judged.
+	DefaultCommitGateFloor = 3 * time.Minute
+	// DefaultCommitGateDeadline is how long the gate may wait for every probe
+	// before it fails closed and rolls the update back.
+	DefaultCommitGateDeadline = 20 * time.Minute
+)
+
+// defaultCommitGateUnits lists the services a healthy boot must have brought
+// up. Deliberately excluded: modem, uplink, battery, ecu and keycard. Those
+// legitimately fail or are absent depending on SIM, card and fitted hardware,
+// and a required unit that is wrongly listed turns a good update into a
+// fail-closed rollback.
+func defaultCommitGateUnits(component string) []string {
+	units := []string{
+		"valkey.service",
+		"librescoot-vehicle.service",
+		"librescoot-settings.service",
+		"librescoot-version.service",
+	}
+	if component == "mdb" {
+		units = append(units, "librescoot-pm.service")
+	}
+	return units
+}
+
+// CommitGateSettings is one coherent snapshot of the gate configuration. The
+// gate reads it once per tick so a settings change applies to the next
+// evaluation rather than partway through one.
+type CommitGateSettings struct {
+	Enabled       bool
+	Floor         time.Duration
+	Deadline      time.Duration
+	RequiredUnits []string
+}
+
+// CommitGateSettings returns the current gate configuration.
+func (c *Config) CommitGateSettings() CommitGateSettings {
+	c.gateMu.RLock()
+	defer c.gateMu.RUnlock()
+	return CommitGateSettings{
+		Enabled:       c.CommitGateEnabled,
+		Floor:         c.CommitGateFloor,
+		Deadline:      c.CommitGateDeadline,
+		RequiredUnits: slices.Clone(c.CommitGateRequiredUnits),
+	}
 }
 
 func New(
@@ -82,10 +145,16 @@ func New(
 		DownloadStallWindow:    2 * time.Minute,
 		DownloadStallMinBytes:  64 * 1024,
 		DryRun:                 dryRun,
-		BootEnabled:            bootEnabled,
-		BootMountPoint:         bootMountPoint,
-		BootDevice:             bootDevice,
-		BootUBootSeek:          bootUBootSeek,
+		// Off unless a device opts in: enabling it changes the commit failure
+		// mode to fail-closed, which rolls an image back.
+		CommitGateEnabled:       false,
+		CommitGateFloor:         DefaultCommitGateFloor,
+		CommitGateDeadline:      DefaultCommitGateDeadline,
+		CommitGateRequiredUnits: defaultCommitGateUnits(component),
+		BootEnabled:             bootEnabled,
+		BootMountPoint:          bootMountPoint,
+		BootDevice:              bootDevice,
+		BootUBootSeek:           bootUBootSeek,
 	}
 }
 
@@ -167,7 +236,45 @@ func (c *Config) LoadFromRedis(redis RedisSettings) error {
 		}
 	}
 
+	if v, err := redis.HGet(SettingsHashKey, prefix+"commit-gate"); err == nil && v != "" {
+		if enabled, err := strconv.ParseBool(v); err == nil {
+			c.CommitGateEnabled = enabled
+		}
+	}
+	if v, err := redis.HGet(SettingsHashKey, prefix+"commit-gate-floor"); err == nil && v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			c.CommitGateFloor = d
+		}
+	}
+	if v, err := redis.HGet(SettingsHashKey, prefix+"commit-gate-deadline"); err == nil && v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			c.CommitGateDeadline = d
+		}
+	}
+	if v, err := redis.HGet(SettingsHashKey, prefix+"commit-gate-required-units"); err == nil && v != "" {
+		if units := ParseUnitList(v); len(units) > 0 {
+			c.CommitGateRequiredUnits = units
+		}
+	}
+
 	return nil
+}
+
+// ParseUnitList splits a systemd unit list on commas and whitespace, so both
+// "a.service,b.service" and "a.service b.service" are accepted. Entries
+// without a recognized unit suffix are kept verbatim and rejected by systemd
+// at probe time rather than silently dropped.
+func ParseUnitList(value string) []string {
+	fields := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+	units := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if field != "" {
+			units = append(units, field)
+		}
+	}
+	return units
 }
 
 // DownloadBudget returns a coherent snapshot of the three download-budget
@@ -248,6 +355,36 @@ func (c *Config) ApplyRedisUpdate(key, value string) bool {
 			c.budgetMu.Unlock()
 			return true
 		}
+	case "commit-gate":
+		if enabled, err := strconv.ParseBool(value); err == nil {
+			c.gateMu.Lock()
+			c.CommitGateEnabled = enabled
+			c.gateMu.Unlock()
+			return true
+		}
+	case "commit-gate-floor":
+		if d, err := time.ParseDuration(value); err == nil && d >= 0 {
+			c.gateMu.Lock()
+			c.CommitGateFloor = d
+			c.gateMu.Unlock()
+			return true
+		}
+	case "commit-gate-deadline":
+		if d, err := time.ParseDuration(value); err == nil && d > 0 {
+			c.gateMu.Lock()
+			c.CommitGateDeadline = d
+			c.gateMu.Unlock()
+			return true
+		}
+	case "commit-gate-required-units":
+		units := ParseUnitList(value)
+		if len(units) == 0 {
+			units = defaultCommitGateUnits(c.Component)
+		}
+		c.gateMu.Lock()
+		c.CommitGateRequiredUnits = units
+		c.gateMu.Unlock()
+		return true
 	}
 
 	return false
