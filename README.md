@@ -11,6 +11,7 @@ The Update Service manages component-specific operating-system updates for MDB a
 - Supports full and delta update methods; delta installation requires a compatible local base artifact.
 - Accepts local-file and URL update requests, with optional SHA-256 verification.
 - Recovers pending state from Mender at startup, verifies the active rootfs, commits it, and verifies the resulting Mender state.
+- Optionally commits only after the new image proves healthy on the vehicle (`--commit-gate`): a window that fails or expires is rolled back through Mender and the bootloader.
 - Optionally updates the U-Boot boot region from local boot assets when `--boot-update` is enabled.
 - Publishes component status, progress, errors, heartbeats, and channel-preview results in the `ota` hash.
 - Uses Redis/Valkey inhibitors and vehicle state to coordinate downloads, installation, and reboots.
@@ -53,6 +54,40 @@ The service stores component-scoped data in the `ota` hash, including `status:<c
 
 Running versions are read from `version:<component>` field `version_id`; the release variant is read from `variant_id`. During startup recovery, Mender's committed artifact and `standalone-state.ArtifactName` are the durable sources for committed and installed-but-uncommitted identity. The active rootfs `/etc/os-release` `VERSION_ID` must match the pending artifact before commit.
 
+### Commit gate
+
+The commit gate defers that commit until the platform has proved itself on the new image, so an update's success is "booted and the vehicle came up on it" rather than only "the running version matches the pending artifact".
+
+It is off by default and MDB-only. On the DBC it is reported and ignored: the dashboard already carries its own activation-attempt machinery for a reboot whose outcome it cannot observe, and the two have to be reconciled before the dashboard can be gated. Enabling it changes the failure mode of a commit to fail-closed, so it is opted into per device with `updates.<component>.commit-gate`.
+
+A window opens at startup when the gate is enabled and Mender's pending artifact is the version that is running. The component stays in `pending-reboot` throughout. Once the image has been up past the floor, these probes are evaluated every 15 seconds and every one must hold:
+
+- uptime, from `/proc/uptime`, so the wall clock is not involved
+- `systemctl is-system-running` is `running` or `degraded`
+- every configured required unit is active
+- vehicle-service has published a `vehicle` state
+- `power-manager[state]` is `running`, not a power transition
+- the component still holds its image: `status:<component>` is `pending-reboot` with no error recorded
+
+The required units default to `valkey`, `librescoot-vehicle`, `librescoot-settings` and `librescoot-version`, plus `librescoot-pm` on the MDB. Modem, uplink, battery, ecu and keycard are deliberately absent: they legitimately fail or are absent depending on SIM, card and fitted hardware, and a required unit that is wrongly listed turns a good update into a rollback. A unit list that is wrong for a device is the main way this feature costs an update attempt.
+
+All probes holding commits the update through the same path as an ungated startup. A hard failure, or the deadline expiring with a probe still failing, fails the window closed:
+
+- the attempt is recorded in `/data/ota/commit-gate-<component>.json` with the probe that never passed
+- Mender is asked to discard the pending state and the artifact is added to `/data/ota/commit-gate-quarantine-<component>.json`
+- the component is set to `error` with code `commit-gate-rollback`
+- a reboot is requested, which the bootloader answers by booting the previously committed slot
+
+The record survives the reboot, and the next boot reads it: still running the pending artifact means the rollback did not land, so the gate clears Mender's stale state, keeps the artifact quarantined and reports `commit-gate-stuck` instead of rebooting again. Running the committed artifact instead means the bootloader reverted, which closes the window out to `idle`; without that, the MDB would hold `pending-reboot` for good, because the generic recovery path answers "reboot still required" and nothing on the MDB ever reboots.
+
+A quarantined artifact is not installed by the staged-file path and is not selected by a release check. It is dropped from the quarantine once the running version reaches or passes it, so a newer release is never affected.
+
+Consumers read `commit-gate:<component>` for `waiting`, `committed`, `rolled-back`, `rollback-stuck`, `abandoned` or `disabled-runtime`, plus `commit-gate-reason:<component>` and `commit-gate-deadline:<component>`. Terminal statuses and startup initialization clear all three. A running window keeps the ordinary `heartbeat` field ticking, so consumers such as vehicle-service's update watchdog can tell a settling update from a wedged one.
+
+While a window is open, `update-from-file`, `update-from-url` and `apply-staged-updates` are refused. The refusal is logged and deliberately does not write a status, because those handlers' own failure paths publish the same fields the gate reads as evidence about the image under test. Release checks already defer while the component is not idle.
+
+The gate needs the bootloader to revert an uncommitted slot, which is what lands a rollback. Mender's U-Boot integration provides it with `bootlimit=1`, `bootcount` and `altbootcmd` in the boot environment, and both machines enable `mender-uboot`; confirm it on the specific board with `fw_printenv bootcount bootlimit upgrade_available` across a plain reboot, an install-and-reboot, and a commit. If a board does not revert, the rollback has no way to land and the gate falls back to clearing Mender's state, quarantining the artifact and reporting, without rebooting.
+
 The MDB instance atomically maintains `/data/ota/dbc-state.json` after stable live DBC observations. If Redis data is lost while the DBC is powered off, it restores `version:dbc[version_id]` and the DBC OTA status/target with `ota[state-origin:dbc]=cached`. A running DBC instance sets that marker to `live`.
 
 Each release check reads the current component channel and update method from settings before selecting a release; an explicit `--channel` still takes precedence. The selected channel stays fixed for that operation, including delta rechecks. Switching between recognized channels requests a full image, including nightly/testing to stable; same-channel stable checks still reject version downgrades. A settings read failure aborts the check instead of silently using a stale channel.
@@ -75,9 +110,15 @@ Each release check reads the current component channel and update method from se
 | `--download-max-duration` | `60m` | Per-attempt download wall-clock limit; `0` disables it |
 | `--download-stall-window` | `2m` | Throughput evaluation window; `0` disables it |
 | `--download-stall-min-bytes` | `65536` | Bytes required in each stall window |
+| `--commit-gate` | `false` | Commit a pending update only after the platform proves healthy on it (MDB only) |
+| `--commit-gate-floor` | `3m` | Monotonic uptime before the commit gate evaluates its probes |
+| `--commit-gate-deadline` | `20m` | How long the commit gate may wait for its probes before rolling back |
+| `--commit-gate-required-units` | component set | Comma-separated systemd units the commit gate requires active |
 | `--version` | — | Print the build version and exit |
 
-When not overridden by CLI values, the service loads and watches these component-scoped fields in the `settings` hash: `updates.<component>.channel`, `check-interval`, `releases-url`, `dry-run`, `download-max-duration`, `download-stall-window`, and `download-stall-min-bytes`. `never` disables the configured check interval. The update method is read from `updates.<component>.method`; supported values are `full` and `delta`.
+When not overridden by CLI values, the service loads and watches these component-scoped fields in the `settings` hash: `updates.<component>.channel`, `check-interval`, `releases-url`, `dry-run`, `download-max-duration`, `download-stall-window`, and `download-stall-min-bytes`. `never` disables the configured check interval. The update method is read from `updates.<component>.method`; supported values are `full` and `delta`. The commit gate reads `updates.<component>.commit-gate`, `commit-gate-floor`, `commit-gate-deadline`, and `commit-gate-required-units`, with the CLI flag winning as it does for the others.
+
+Enabling the gate on a running vehicle takes effect at the next startup: a window is opened by startup reconciliation, not by the setting changing. Disabling it takes effect immediately, and a window that is already open then commits without a verdict.
 
 ## Build and test
 
@@ -109,6 +150,7 @@ journalctl -u librescoot-update.service
 - Update artifacts are privileged inputs. Use trusted release endpoints, protect local staging directories, and provide SHA-256 checksums for manually supplied artifacts.
 - The service can invoke Mender and, with boot updates enabled, write and verify a U-Boot image in the boot region. Do not enable or run it with untrusted configuration or device paths.
 - A pending Mender update is committed on the next successful startup after reboot. Inspect the `ota` hash and journal before clearing errors or replacing staged artifacts.
+- With `--commit-gate` enabled, that commit also has to earn a health verdict, and a window that fails or expires rolls the update back and reboots. Treat the U-Boot boot counter check above as a prerequisite for enabling it on a board, and watch `commit-gate:<component>` and the `ota:errors` stream across the first real boots.
 - `--dry-run` suppresses rebooting; it does not turn remote discovery, downloads, or all installation preparation into a no-op. Use it only with an appropriate test environment.
 
 ## Boot-write safeguards

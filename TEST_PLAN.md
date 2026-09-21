@@ -600,3 +600,27 @@ The update-service is **moderately difficult to test** but not impossible. The m
 **Recommendation:** Start with unit tests for pure logic and well-isolated components. Gradually build up to integration tests for the orchestration layer. Consider refactoring suggestions to improve testability before writing comprehensive tests.
 
 With proper interfaces, mocks, and test utilities, you can achieve good test coverage (70-80% overall). Some components (external commands, complex timing) may be better suited for integration/E2E tests rather than unit tests.
+
+## Commit Gate
+
+`internal/commitgate/store.go` is pure file state and is covered directly: round trips, an absent marker, refusing an incomplete marker, idempotent quarantine adds, pruning that keeps entries at or above the running version, and the component-scoped paths. `internal/updater/commitgate_test.go` drives the decision with a scripted probe set, an injected clock, an injected reboot, and a store in a temporary directory:
+
+- every probe holding commits, clears the marker and publishes `committed`
+- a failing probe waits, names itself in `commit-gate-reason` and the deadline field, and commits once it recovers
+- the deadline rolls back exactly once, records the rollback attempt, quarantines the artifact, and reboots
+- reopening the marker resumes the window without moving `FirstSeen`, so a service restart cannot extend the deadline
+- the kill switch commits without a verdict
+- a second boot on the same uncommitted artifact rolls back once, and a second boot after a requested rollback holds and reports without rebooting
+- a second boot on the committed slot finalises the revert to `idle` and does not reboot
+- a stale marker for another artifact is discarded
+- a failed commit, an artifact Mender replaced, and a marker that cannot be written each reach their own terminal outcome
+- the quarantine keeps a rejected version out of the staged path and out of release selection, and leaves a newer release alone
+- the window flag is observable while the gate runs and closed with it, under `-race`
+
+What unit tests cannot reach, and what a bench run has to confirm before the gate is enabled on a board:
+
+1. `fw_printenv bootcount bootlimit upgrade_available` across a plain reboot, an install-and-reboot, and a `mender-update commit`. The rollback is landed by the bootloader, so a board whose boot counter is not wired cannot honour a fail-closed verdict.
+2. `mender-update rollback` on a board that has just failed a window: confirm it clears the standalone state and that the following reboot lands the previous slot.
+3. The probe set against a real boot: which required units are genuinely always active, and how long after `multi-user.target` vehicle-service and pm-service publish their state. A floor that is too short is a false rollback.
+4. `systemctl is-system-running` on a real MDB: confirm it reaches `running` or `degraded` rather than staying `starting`, and that no routinely failing unit forces the wrong verdict.
+5. The UMS and vehicle-service side of a window: `ota[heartbeat]` keeps ticking, and both tolerate a commit that settles minutes after a reboot instead of seconds.
