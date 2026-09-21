@@ -208,7 +208,7 @@ const defaultOsReleasePath = "/etc/os-release"
 // the committed artifact, LMDB key "artifact-name", which is a different fact:
 // while an update is installed but not yet committed it legitimately still
 // names the PREVIOUS version, and it stays there if the commit fails
-// (CheckAndCommitPendingUpdate logs and startup continues regardless). Keying
+// (startup reconciliation reports the failure as a recovery error). Keying
 // the cleanup on it meant keeping the file nothing would ever look up while
 // deleting the one that would.
 //

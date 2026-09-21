@@ -15,6 +15,7 @@ import (
 
 	"github.com/librescoot/update-service/internal/backoff"
 	"github.com/librescoot/update-service/internal/boot"
+	"github.com/librescoot/update-service/internal/commitgate"
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/dbcstate"
 	"github.com/librescoot/update-service/internal/inhibitor"
@@ -49,18 +50,32 @@ type Updater struct {
 	dbcStateCache     string
 	activationAttempt string
 	bootID            func() (string, error)
-	backoff           *backoff.Store
-	status            *status.Reporter
-	bootUpdater       *boot.BootUpdater  // nil if --boot-update not set
-	bootStatus        *status.Reporter   // reporter for "{component}-boot" keys
-	dbcStatus         *status.Reporter   // reporter for "dbc" keys (MDB-only, for clearing stale DBC state)
-	flatMirror        *status.FlatMirror // mirrors mdb+dbc status into the flat pair (MDB-only)
-	githubAPI         *GitHubAPI
-	logger            *log.Logger
-	ctx               context.Context
-	cancel            context.CancelFunc
-	standbyMu         sync.RWMutex
-	standbyStartTime  time.Time // Tracks when vehicle entered standby state
+	// Commit gate. gateEvaluate is nil in production and falls back to
+	// evaluateCommitGateProbes; the gate tests substitute it, as they do
+	// observeUpdate and runningVersion above.
+	gateStore    *commitgate.Store
+	gateEvaluate func(config.CommitGateSettings) []gateProbeResult
+	gateNow      func() time.Time
+	gateReboot   func() error
+
+	// gateWindow guards gateWindowOpen, which is true while the gate is
+	// evaluating a pending artifact. Commands that would install on top of it
+	// consult this rather than the component status, because their own refusal
+	// paths write the status and error fields the gate reads as health.
+	gateWindowMu     sync.RWMutex
+	gateWindowOpen   bool
+	backoff          *backoff.Store
+	status           *status.Reporter
+	bootUpdater      *boot.BootUpdater  // nil if --boot-update not set
+	bootStatus       *status.Reporter   // reporter for "{component}-boot" keys
+	dbcStatus        *status.Reporter   // reporter for "dbc" keys (MDB-only, for clearing stale DBC state)
+	flatMirror       *status.FlatMirror // mirrors mdb+dbc status into the flat pair (MDB-only)
+	githubAPI        *GitHubAPI
+	logger           *log.Logger
+	ctx              context.Context
+	cancel           context.CancelFunc
+	standbyMu        sync.RWMutex
+	standbyStartTime time.Time // Tracks when vehicle entered standby state
 
 	// Update method configuration
 	updateMethodMu sync.RWMutex
@@ -197,6 +212,8 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 			data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 			return strings.TrimSpace(string(data)), err
 		},
+		gateStore:            commitgate.NewStore(cfg.Component),
+		gateNow:              time.Now,
 		backoff:              backoff.NewStore(downloadDir, logger),
 		status:               statusReporter,
 		bootUpdater:          bootUpdater,
@@ -227,14 +244,11 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 	return u
 }
 
-// CheckAndCommitPendingUpdate reconstructs pending state from Mender, verifies
-// that the pending artifact is actually running, commits it, then verifies the
-// durable Mender state again. Redis is an output of this reconciliation, not
-// its source of truth.
-func (u *Updater) CheckAndCommitPendingUpdate() (needsReboot bool, err error) {
-	return u.checkAndCommitPendingUpdate("")
-}
-
+// checkAndCommitPendingUpdate is the immediate-commit half of reconciliation,
+// used when the commit gate is not running a window: reconstruct pending state
+// from Mender, verify that the pending artifact is actually running, commit it,
+// then verify the durable Mender state again. The gate reaches the same commit
+// and verification tail through commitVerifiedUpdate.
 func (u *Updater) checkAndCommitPendingUpdate(expectedArtifact string) (needsReboot bool, err error) {
 	observation, err := u.observeUpdate()
 	if err != nil {
@@ -247,13 +261,8 @@ func (u *Updater) checkAndCommitPendingUpdate(expectedArtifact string) (needsReb
 	}
 
 	if observation.PendingVersion != "" {
-		if err := u.status.SetPendingRebootForVersion(u.ctx, observation.PendingVersion); err != nil {
+		if err := u.reconstructPendingState(observation); err != nil {
 			return false, err
-		}
-		if u.config.Component == "dbc" {
-			if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
-				return false, fmt.Errorf("restore DBC update lifecycle: %w", err)
-			}
 		}
 	}
 
@@ -309,25 +318,9 @@ func (u *Updater) checkAndCommitPendingUpdate(expectedArtifact string) (needsReb
 		}
 
 		u.logger.Printf("Verified running version %s; committing %s", runningVersion, observation.PendingArtifact)
-		if err := u.commitUpdate(); err != nil {
-			return false, u.pendingCommitError(fmt.Errorf("commit pending update: %w", err))
-		}
-
-		verified, err := u.observeUpdate()
-		if err != nil {
-			return false, u.pendingCommitError(fmt.Errorf("verify committed Mender state: %w", err))
-		}
-		if verified.State != mender.StateNoUpdate || verified.PendingArtifact != "" ||
-			verified.CommittedArtifact != observation.PendingArtifact {
-			return false, u.pendingCommitError(fmt.Errorf(
-				"commit verification failed: pending=%q committed=%q state=%d",
-				verified.PendingArtifact, verified.CommittedArtifact, verified.State))
-		}
-
-		if err := u.finishVerifiedUpdate(verified.CommittedArtifact); err != nil {
+		if err := u.commitVerifiedUpdate(observation); err != nil {
 			return false, err
 		}
-		u.logger.Printf("Update %s committed and verified", verified.CommittedArtifact)
 		return false, nil
 
 	case mender.StateNeedsResume:
@@ -427,6 +420,49 @@ func (u *Updater) pendingCommitError(err error) error {
 		u.logger.Printf("Also failed to publish recovery error: %v", statusErr)
 	}
 	return err
+}
+
+// reconstructPendingState publishes the pending artifact's identity and, on the
+// DBC, restores the update lifecycle a reboot interrupted. Redis is an output of
+// this reconstruction: Mender's store is the source.
+func (u *Updater) reconstructPendingState(observation mender.UpdateObservation) error {
+	if observation.PendingVersion == "" {
+		return nil
+	}
+	if err := u.status.SetPendingRebootForVersion(u.ctx, observation.PendingVersion); err != nil {
+		return err
+	}
+	if u.config.Component == "dbc" {
+		if err := u.redis.PushUpdateCommand("start-dbc"); err != nil {
+			return fmt.Errorf("restore DBC update lifecycle: %w", err)
+		}
+	}
+	return nil
+}
+
+// commitVerifiedUpdate runs the commit and proves Mender recorded it: nothing is
+// pending any more and the committed artifact is the one that was running.
+func (u *Updater) commitVerifiedUpdate(observation mender.UpdateObservation) error {
+	if err := u.commitUpdate(); err != nil {
+		return u.pendingCommitError(fmt.Errorf("commit pending update: %w", err))
+	}
+
+	verified, err := u.observeUpdate()
+	if err != nil {
+		return u.pendingCommitError(fmt.Errorf("verify committed Mender state: %w", err))
+	}
+	if verified.State != mender.StateNoUpdate || verified.PendingArtifact != "" ||
+		verified.CommittedArtifact != observation.PendingArtifact {
+		return u.pendingCommitError(fmt.Errorf(
+			"commit verification failed: pending=%q committed=%q state=%d",
+			verified.PendingArtifact, verified.CommittedArtifact, verified.State))
+	}
+
+	if err := u.finishVerifiedUpdate(verified.CommittedArtifact); err != nil {
+		return err
+	}
+	u.logger.Printf("Update %s committed and verified", verified.CommittedArtifact)
+	return nil
 }
 
 func (u *Updater) finishVerifiedUpdate(committedArtifact string) error {
@@ -621,9 +657,17 @@ func (u *Updater) monitorLocalDurableState() {
 	}
 }
 
-// Start starts the updater. The menderNeedsReboot parameter indicates if
-// CheckAndCommitPendingUpdate detected that mender has an update waiting for reboot.
-func (u *Updater) Start(menderNeedsReboot bool) error {
+// Start starts the updater. rec carries what startup reconciliation decided:
+// whether Mender is holding an update for a reboot this startup did not perform,
+// and whether the commit gate owns a commit that is owed.
+func (u *Updater) Start(rec Reconciliation) error {
+	menderNeedsReboot := rec.NeedsReboot
+	// Mender holds a pending artifact in either case. Nothing may install on top
+	// of it, and a pending-reboot status is not a completed update.
+	holdsPendingArtifact := menderNeedsReboot || rec.Gated != nil
+
+	u.pruneCommitGateQuarantine()
+
 	if u.config.Component == "mdb" {
 		u.restoreDBCStateCache()
 	}
@@ -667,7 +711,7 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 	}
 
 	// Recover from any stuck status on startup
-	if err := u.recoverFromStuckState(menderNeedsReboot); err != nil {
+	if err := u.recoverFromStuckState(menderNeedsReboot, rec.Gated != nil); err != nil {
 		u.logger.Printf("Warning: Failed to recover from stuck state: %v", err)
 	}
 
@@ -695,7 +739,14 @@ func (u *Updater) Start(menderNeedsReboot bool) error {
 
 	// Check if we have a mender file newer than the running version (e.g., from
 	// an interrupted update). If so, install it directly without re-downloading.
-	u.installPendingMenderFile(menderNeedsReboot)
+	u.installPendingMenderFile(holdsPendingArtifact)
+
+	// Run the commit gate window in the background when a commit is owed and the
+	// gate owns the decision. Started after recoverFromStuckState so the status
+	// the gate publishes is not cleared by startup recovery.
+	if rec.Gated != nil {
+		u.startCommitGate(rec.Gated)
+	}
 
 	// Start monitoring for settings changes
 	go u.monitorSettingsChanges()
@@ -763,10 +814,11 @@ func (u *Updater) setUpdateMethod(method string) {
 
 // installPendingMenderFile checks if a mender file newer than the running
 // version exists on disk (e.g., from an interrupted update) and installs it.
-// When menderNeedsReboot is true, mender already has a staged update in its
-// LMDB — attempting another install would fail with "already in progress".
-func (u *Updater) installPendingMenderFile(menderNeedsReboot bool) {
-	if menderNeedsReboot {
+// When Mender already holds a pending artifact, attempting another install would
+// fail with "already in progress", and when the commit gate owns that artifact,
+// installing over it would discard an image that still owes a verdict.
+func (u *Updater) installPendingMenderFile(holdsPendingArtifact bool) {
+	if holdsPendingArtifact {
 		u.logger.Printf("Skipping pending mender file check (mender has an active update)")
 		return
 	}
@@ -778,6 +830,14 @@ func (u *Updater) installPendingMenderFile(menderNeedsReboot bool) {
 
 	menderPath, menderVersion, found := u.mender.FindLatestMenderFile(u.config.GetChannel())
 	if !found || menderVersion == "" {
+		return
+	}
+
+	// A staged file whose version the gate rolled back stays on disk as the
+	// delta base and as evidence, but it is not a target: reinstalling it would
+	// reproduce the image that just failed and be rolled back again.
+	if u.gateQuarantinedVersions()[strings.ToLower(menderVersion)] {
+		u.logger.Printf("Not installing staged %s: the commit gate rolled this version back", menderVersion)
 		return
 	}
 
@@ -824,7 +884,14 @@ func dbcStateIsStaleOnPowerOff(dbcStatus string) bool {
 
 // recoverFromStuckState recovers from any stuck status on startup.
 // The menderNeedsReboot parameter indicates if mender has an update waiting for reboot.
-func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
+// recoverFromStuckState recovers from any stuck status on startup.
+//
+// gateOpen reports that the commit gate is running a window over the pending
+// artifact. That matters at pending-reboot: without it, "menderNeedsReboot is
+// false" reads as "the reboot happened and commit recovery already handled it",
+// which clears the status and, on the DBC, tells vehicle-service the dashboard
+// update is complete while the image still owes a health verdict.
+func (u *Updater) recoverFromStuckState(menderNeedsReboot, gateOpen bool) error {
 	currentStatus, err := u.status.GetStatus(u.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get current status: %w", err)
@@ -871,8 +938,12 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot bool) error {
 		if menderNeedsReboot {
 			// Mender still has a staged update waiting for reboot — keep status
 			u.logger.Printf("Keeping pending-reboot status (mender still needs reboot)")
+		} else if gateOpen {
+			// The reboot happened but the commit has not been earned yet, so this
+			// is not a completed update and no lifecycle may be completed for it.
+			u.logger.Printf("Keeping pending-reboot status (commit gate is evaluating the new image)")
 		} else {
-			// Reboot happened, commit was already attempted by CheckAndCommitPendingUpdate
+			// Reboot happened, commit was already attempted by startup reconciliation
 			u.logger.Printf("Clearing pending-reboot status (reboot completed)")
 			if err := u.status.SetIdle(u.ctx); err != nil {
 				return fmt.Errorf("failed to clear pending-reboot status: %w", err)
@@ -1326,6 +1397,14 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 	}
 	defer u.updateOpMu.Unlock()
 
+	// Refused without touching the status: this is not a failure of the image
+	// under test, and the gate reads the component's status and error fields as
+	// evidence about that image.
+	if u.gateWindowIsOpen() {
+		u.logger.Printf("Ignoring file update %s: the commit gate is evaluating a pending update", source)
+		return
+	}
+
 	u.logger.Printf("Processing update from local file: %s", source)
 
 	if _, err := os.Stat(source); err != nil {
@@ -1701,6 +1780,13 @@ func (u *Updater) handleApplyStagedUpdates() {
 	defer u.updateOpMu.Unlock()
 	defer u.startHeartbeat()()
 
+	// Refused without touching the status, for the same reason as a file
+	// install: a refusal here must not look like a failed image to the gate.
+	if u.gateWindowIsOpen() {
+		u.logger.Printf("Ignoring apply-staged-updates: the commit gate is evaluating a pending update")
+		return
+	}
+
 	dir := u.mender.GetDownloadDir()
 	menders, deltas, err := listStagedArtifacts(dir)
 	if err != nil {
@@ -2034,6 +2120,13 @@ func (u *Updater) handleUpdateFromURL(url string) {
 	}
 	defer u.updateOpMu.Unlock()
 	defer u.startHeartbeat()()
+
+	// Refused without touching the status, for the same reason as a file
+	// install: a refusal here must not look like a failed image to the gate.
+	if u.gateWindowIsOpen() {
+		u.logger.Printf("Ignoring URL update %s: the commit gate is evaluating a pending update", source)
+		return
+	}
 
 	if checksum != "" {
 		u.logger.Printf("Checksum provided: %s", checksum)
@@ -2703,7 +2796,7 @@ func (u *Updater) checkForUpdates(manual bool) {
 	}
 
 	// Find the latest release for our variant and channel
-	release, found := u.findLatestRelease(releases, variantID, channel)
+	release, found := u.findLatestRelease(u.withoutGateRejectedReleases(releases), variantID, channel)
 	if !found {
 		u.logger.Printf("No release found for variant_id %s and channel %s", variantID, channel)
 		u.finishCheck(checkResultNoRelease)

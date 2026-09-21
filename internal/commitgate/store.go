@@ -129,6 +129,13 @@ func (s *Store) Clear() error {
 	return nil
 }
 
+// List returns the quarantined artifact names. Callers that compare a
+// candidate, which is named by version rather than by artifact, translate the
+// entries with the same helper the gate used to record them.
+func (s *Store) List() ([]string, error) {
+	return s.quarantineList()
+}
+
 // Quarantined reports whether artifact is on the rejected list.
 func (s *Store) Quarantined(artifact string) (bool, error) {
 	list, err := s.quarantineList()

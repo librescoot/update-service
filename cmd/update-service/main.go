@@ -37,6 +37,11 @@ var (
 	downloadMaxDuration   = flag.Duration("download-max-duration", 60*time.Minute, "Wall clock cap on a single download attempt (0 to disable)")
 	downloadStallWindow   = flag.Duration("download-stall-window", 2*time.Minute, "Rolling window for the download throughput floor (0 to disable)")
 	downloadStallMinBytes = flag.Int64("download-stall-min-bytes", 64*1024, "Bytes that must arrive within each stall window")
+
+	commitGate              = flag.Bool("commit-gate", false, "Commit a pending update only after the platform proves healthy on it")
+	commitGateFloor         = flag.Duration("commit-gate-floor", config.DefaultCommitGateFloor, "Monotonic uptime before the commit gate evaluates its probes")
+	commitGateDeadline      = flag.Duration("commit-gate-deadline", config.DefaultCommitGateDeadline, "How long the commit gate may wait for its probes before rolling back")
+	commitGateRequiredUnits = flag.String("commit-gate-required-units", "", "Comma-separated systemd units the commit gate requires active (default: component-specific set)")
 )
 
 func main() {
@@ -90,6 +95,16 @@ func main() {
 		"download-max-duration":    flag.Lookup("download-max-duration").Value.String() != flag.Lookup("download-max-duration").DefValue,
 		"download-stall-window":    flag.Lookup("download-stall-window").Value.String() != flag.Lookup("download-stall-window").DefValue,
 		"download-stall-min-bytes": flag.Lookup("download-stall-min-bytes").Value.String() != flag.Lookup("download-stall-min-bytes").DefValue,
+	}
+	cliCommitGateEnabledSet := flag.Lookup("commit-gate").Value.String() != flag.Lookup("commit-gate").DefValue
+	cliCommitGateFloorSet := flag.Lookup("commit-gate-floor").Value.String() != flag.Lookup("commit-gate-floor").DefValue
+	cliCommitGateDeadlineSet := flag.Lookup("commit-gate-deadline").Value.String() != flag.Lookup("commit-gate-deadline").DefValue
+	cliCommitGateUnitsSet := flag.Lookup("commit-gate-required-units").Value.String() != flag.Lookup("commit-gate-required-units").DefValue
+	cliCommitGateSet := map[string]bool{
+		"commit-gate":                cliCommitGateEnabledSet,
+		"commit-gate-floor":          cliCommitGateFloorSet,
+		"commit-gate-deadline":       cliCommitGateDeadlineSet,
+		"commit-gate-required-units": cliCommitGateUnitsSet,
 	}
 
 	detectedChannel := ""
@@ -158,6 +173,20 @@ func main() {
 	if cliBudgetSet["download-stall-min-bytes"] {
 		cfg.DownloadStallMinBytes = *downloadStallMinBytes
 	}
+	if cliCommitGateEnabledSet {
+		cfg.CommitGateEnabled = *commitGate
+	}
+	if cliCommitGateFloorSet {
+		cfg.CommitGateFloor = *commitGateFloor
+	}
+	if cliCommitGateDeadlineSet {
+		cfg.CommitGateDeadline = *commitGateDeadline
+	}
+	if cliCommitGateUnitsSet {
+		if units := config.ParseUnitList(*commitGateRequiredUnits); len(units) > 0 {
+			cfg.CommitGateRequiredUnits = units
+		}
+	}
 
 	if !config.IsValidChannel(cfg.Channel) {
 		logger.Printf("No update channel configured for %s (installed version: %q); periodic and check-now requests are disabled, explicit file and URL installs remain available",
@@ -186,19 +215,19 @@ func main() {
 	updater := updater.New(ctx, cfg, redisClient, inhibitorClient, powerClient, bootUpdater, logger)
 	defer updater.Close()
 
-	menderNeedsReboot, err := updater.CheckAndCommitPendingUpdate()
+	reconciliation, err := updater.ReconcilePendingUpdate()
 	if err != nil {
 		logger.Fatalf("Failed to reconcile pending update: %v", err)
 	}
 
-	if err := updater.Start(menderNeedsReboot); err != nil {
+	if err := updater.Start(reconciliation); err != nil {
 		logger.Fatalf("Failed to start updater: %v", err)
 	}
 
 	// Start watching for settings changes in the background. Must be after
 	// updater.Start so the watcher can notify the updater when check-interval
 	// changes at runtime.
-	go watchSettingsChanges(ctx, redisClient, cfg, logger, updater, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet, cliBudgetSet)
+	go watchSettingsChanges(ctx, redisClient, cfg, logger, updater, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet, cliBudgetSet, cliCommitGateSet)
 
 	channelSource := "default"
 	if cliChannelSet {
@@ -218,12 +247,19 @@ func main() {
 	}
 	logger.Printf("Config: download budget max=%v stall=%v/%d bytes",
 		cfg.DownloadMaxDuration, cfg.DownloadStallWindow, cfg.DownloadStallMinBytes)
+	gate := cfg.CommitGateSettings()
+	if gate.Enabled {
+		logger.Printf("Config: commit gate on, floor=%v deadline=%v required=%v",
+			gate.Floor, gate.Deadline, gate.RequiredUnits)
+	} else {
+		logger.Printf("Config: commit gate off; a pending update commits on the next successful startup")
+	}
 
 	<-ctx.Done()
 	logger.Printf("Shutting down update service")
 }
 
-func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger, upd *updater.Updater, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet bool, cliBudgetSet map[string]bool) {
+func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *config.Config, logger *log.Logger, upd *updater.Updater, cliChannelSet, cliCheckIntervalSet, cliReleasesURLSet, cliDryRunSet bool, cliBudgetSet map[string]bool, cliCommitGateSet map[string]bool) {
 	watcher := redisClient.NewSettingsWatcher()
 	watcher.OnAny(func(settingKey, value string) error {
 		logger.Printf("Settings change notification received for key: %s", settingKey)
@@ -265,6 +301,11 @@ func watchSettingsChanges(ctx context.Context, redisClient *redis.Client, cfg *c
 			case "download-stall-min-bytes":
 				if cliBudgetSet["download-stall-min-bytes"] {
 					logger.Printf("Ignoring Redis update for download-stall-min-bytes (overridden by CLI flag)")
+					return nil
+				}
+			case "commit-gate", "commit-gate-floor", "commit-gate-deadline", "commit-gate-required-units":
+				if cliCommitGateSet[settingName] {
+					logger.Printf("Ignoring Redis update for %s (overridden by CLI flag)", settingName)
 					return nil
 				}
 			}

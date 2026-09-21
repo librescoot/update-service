@@ -56,11 +56,11 @@ func TestPendingCommitVerifiesBeforeAndAfterCommit(t *testing.T) {
 		return nil
 	}
 
-	needsReboot, err := u.CheckAndCommitPendingUpdate()
+	reconciliation, err := u.ReconcilePendingUpdate()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if needsReboot {
+	if reconciliation.NeedsReboot {
 		t.Fatal("commit-complete update still needs reboot")
 	}
 	if want := []string{"observe", "running", "commit", "observe"}; !reflect.DeepEqual(calls, want) {
@@ -86,11 +86,11 @@ func TestPendingCommitRecognizesPreRebootCommittedRootfs(t *testing.T) {
 	committed := false
 	u.commitUpdate = func() error { committed = true; return nil }
 
-	needsReboot, err := u.CheckAndCommitPendingUpdate()
+	reconciliation, err := u.ReconcilePendingUpdate()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !needsReboot {
+	if !reconciliation.NeedsReboot {
 		t.Fatal("pre-reboot Mender commit-enter state did not request reboot")
 	}
 	if committed {
@@ -106,7 +106,7 @@ func TestPendingRedisTargetMustMatchCommittedArtifact(t *testing.T) {
 		return mender.UpdateObservation{State: mender.StateNoUpdate, CommittedArtifact: "release-v1.3.1", CommittedVersion: "v1.3.1"}, nil
 	}
 
-	if _, err := u.CheckAndCommitPendingUpdate(); err == nil {
+	if _, err := u.ReconcilePendingUpdate(); err == nil {
 		t.Fatal("expected committed artifact mismatch to fail")
 	}
 	if got := mr.HGet("ota", "status:mdb"); got != "error" {
@@ -122,7 +122,7 @@ func TestPendingCommitRejectsWrongRunningVersion(t *testing.T) {
 	u.runningVersion = func() (string, error) { return "v1.3.1", nil }
 	u.commitUpdate = func() error { return errors.New("must not be called") }
 
-	if _, err := u.CheckAndCommitPendingUpdate(); err == nil {
+	if _, err := u.ReconcilePendingUpdate(); err == nil {
 		t.Fatal("expected mismatched running version to fail")
 	}
 	if got := mr.HGet("ota", "status:mdb"); got != "error" {

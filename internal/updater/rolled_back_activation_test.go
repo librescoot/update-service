@@ -56,11 +56,11 @@ func TestRolledBackActivationFinalizesWithoutReboot(t *testing.T) {
 	rolledBack := false
 	u.rollbackUpdate = func() error { rolledBack = true; return nil }
 
-	needsReboot, err := u.CheckAndCommitPendingUpdate()
+	reconciliation, err := u.ReconcilePendingUpdate()
 	if err != nil {
-		t.Fatalf("CheckAndCommitPendingUpdate returned error: %v", err)
+		t.Fatalf("ReconcilePendingUpdate returned error: %v", err)
 	}
-	if needsReboot {
+	if reconciliation.NeedsReboot {
 		t.Fatal("rolled-back activation still requested a reboot")
 	}
 	if !rolledBack {
@@ -87,11 +87,11 @@ func TestSameBootActivationRetriesReboot(t *testing.T) {
 		return nil
 	}
 
-	needsReboot, err := u.CheckAndCommitPendingUpdate()
+	reconciliation, err := u.ReconcilePendingUpdate()
 	if err != nil {
-		t.Fatalf("CheckAndCommitPendingUpdate returned error: %v", err)
+		t.Fatalf("ReconcilePendingUpdate returned error: %v", err)
 	}
-	if !needsReboot {
+	if !reconciliation.NeedsReboot {
 		t.Fatal("same-boot activation should still request the reboot")
 	}
 	if _, err := dbcstate.LoadActivationAttempt(marker); !errors.Is(err, os.ErrNotExist) {
