@@ -684,11 +684,11 @@ func (u *Updater) evaluateCommitGateProbes(cfg config.CommitGateSettings) []gate
 	}
 
 	inactiveUnit, unitsErr := u.gateProbeUnits(cfg.RequiredUnits)
-	unitsDetail := "all required units active"
+	unitsDetail := "all required units satisfied"
 	if unitsErr != nil {
 		unitsDetail = fmt.Sprintf("cannot read unit state: %v", unitsErr)
 	} else if inactiveUnit != "" {
-		unitsDetail = fmt.Sprintf("%s is not active", inactiveUnit)
+		unitsDetail = fmt.Sprintf("%s is neither active nor has it run successfully this boot", inactiveUnit)
 	}
 
 	vehicleState, vehicleErr := u.gateProbeVehicleState()
@@ -755,20 +755,61 @@ func (u *Updater) gateProbeSystemdState() (string, error) {
 	return state, nil
 }
 
-// gateProbeUnits returns the first required unit that is not active.
+// gateProbeUnits returns the first required unit that is neither active nor a
+// oneshot that ran successfully during this boot.
+//
+// is-active alone is not enough: a Type=oneshot unit with RemainAfterExit=no
+// reports inactive the instant it has done its job, so a list checked only for
+// "active" would reject every window on a healthy system. InvocationID is what
+// separates "ran this boot" from "never ran", because Result alone does not:
+// systemd reports Result=success for a unit that has never been invoked.
 func (u *Updater) gateProbeUnits(units []string) (string, error) {
 	for _, unit := range units {
-		cmd := exec.Command("systemctl", "is-active", "--quiet", unit)
-		if err := cmd.Run(); err != nil {
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) {
-				// An inactive unit is the answer, not a failure to ask.
-				return unit, nil
-			}
+		err := exec.Command("systemctl", "is-active", "--quiet", unit).Run()
+		if err == nil {
+			continue
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			return "", fmt.Errorf("read state of %s: %w", unit, err)
+		}
+		ran, err := unitRanSuccessfully(unit)
+		if err != nil {
 			return "", err
+		}
+		if !ran {
+			return unit, nil
 		}
 	}
 	return "", nil
+}
+
+// unitRanSuccessfully reports whether a unit has been invoked during this boot
+// and ended with a zero exit status.
+func unitRanSuccessfully(unit string) (bool, error) {
+	out, err := exec.Command("systemctl", "show", unit,
+		"-p", "InvocationID", "-p", "Result", "-p", "ExecMainStatus").Output()
+	if err != nil {
+		return false, fmt.Errorf("show %s: %w", unit, err)
+	}
+	return unitRanState(string(out)), nil
+}
+
+// unitRanState judges a `systemctl show` dump for those three properties.
+//
+// InvocationID is the discriminator: it is set for a unit that has been invoked
+// in this boot and stays set after a oneshot exits, while a unit that never ran
+// has none. Result must also be success with a zero exit status, so a failed or
+// killed invocation does not count as "ran".
+func unitRanState(output string) bool {
+	props := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if ok {
+			props[key] = value
+		}
+	}
+	return props["InvocationID"] != "" && props["Result"] == "success" && props["ExecMainStatus"] == "0"
 }
 
 // gateProbeVehicleState reports whether vehicle-service has published a state.

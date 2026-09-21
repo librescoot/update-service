@@ -846,3 +846,74 @@ func TestGateWindowFlagIsGuarded(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+// The units probe must accept a oneshot that has done its job and left, and
+// must not accept one that never ran: on a healthy device the version service
+// is Type=oneshot with RemainAfterExit=no, so it reports inactive forever after
+// a successful run, while systemd reports Result=success even for a unit that
+// has never been invoked at all.
+func TestUnitRanStateDistinguishesRanFromNeverRan(t *testing.T) {
+	cases := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{
+			name:   "oneshot ran and exited cleanly",
+			output: "InvocationID=fdaf38e462944333bceaf6f160f8d9a4\nResult=success\nExecMainStatus=0",
+			want:   true,
+		},
+		{
+			name:   "never invoked, empty property",
+			output: "InvocationID=\nResult=success\nExecMainStatus=0",
+			want:   false,
+		},
+		{
+			name:   "never invoked, property omitted",
+			output: "Result=success\nExecMainStatus=0",
+			want:   false,
+		},
+		{
+			name:   "invoked but failed",
+			output: "InvocationID=fdaf38e462944333bceaf6f160f8d9a4\nResult=exit-code\nExecMainStatus=1",
+			want:   false,
+		},
+		{
+			name:   "invoked, zero status, non-success result",
+			output: "InvocationID=fdaf38e462944333bceaf6f160f8d9a4\nResult=start-limit-hit\nExecMainStatus=0",
+			want:   false,
+		},
+		{
+			name:   "empty output",
+			output: "",
+			want:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unitRanState(tc.output); got != tc.want {
+				t.Errorf("unitRanState(%q) = %v, want %v", tc.output, got, tc.want)
+			}
+		})
+	}
+}
+
+// The failing probe names the unit, in whichever of the two states it was in.
+func TestGateProbeUnitsReportsTheOffendingUnit(t *testing.T) {
+	h := newGateHarness(t)
+	// On a developer host the required units do not exist at all, which is the
+	// same as never having run: the probe must name the unit rather than fail.
+	inactive, err := h.updater.gateProbeUnits([]string{"librescoot-gate-test-nonexistent.service"})
+	if err != nil {
+		t.Fatalf("gateProbeUnits: %v", err)
+	}
+	if inactive != "librescoot-gate-test-nonexistent.service" {
+		t.Errorf("gateProbeUnits = %q, want the offending unit", inactive)
+	}
+
+	// An empty list satisfies the probe.
+	inactive, err = h.updater.gateProbeUnits(nil)
+	if err != nil || inactive != "" {
+		t.Errorf("gateProbeUnits(nil) = (%q, %v), want no failure", inactive, err)
+	}
+}

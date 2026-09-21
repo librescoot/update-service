@@ -64,12 +64,12 @@ A window opens at startup when the gate is enabled and Mender's pending artifact
 
 - uptime, from `/proc/uptime`, so the wall clock is not involved
 - `systemctl is-system-running` is `running` or `degraded`
-- every configured required unit is active
+- every configured required unit is satisfied: active, or a oneshot that ran successfully during this boot
 - vehicle-service has published a `vehicle` state
 - `power-manager[state]` is `running`, not a power transition
 - the component still holds its image: `status:<component>` is `pending-reboot` with no error recorded
 
-The required units default to `valkey`, `librescoot-vehicle`, `librescoot-settings` and `librescoot-version`, plus `librescoot-pm` on the MDB. Modem, uplink, battery, ecu and keycard are deliberately absent: they legitimately fail or are absent depending on SIM, card and fitted hardware, and a required unit that is wrongly listed turns a good update into a rollback. A unit list that is wrong for a device is the main way this feature costs an update attempt.
+The required units default to `valkey`, `librescoot-vehicle`, `librescoot-settings` and `librescoot-version`, plus `librescoot-pm` on the MDB. Modem, uplink, battery, ecu and keycard are deliberately absent: they legitimately fail or are absent depending on SIM, card and fitted hardware, and a required unit that is wrongly listed turns a good update into a rollback. Listing a oneshot is safe because the probe accepts a unit that ran successfully during this boot even when it is inactive afterwards, which is what `Type=oneshot` with `RemainAfterExit=no` always reports. A unit list that is wrong for a device is the main way this feature costs an update attempt.
 
 All probes holding commits the update through the same path as an ungated startup. A hard failure, or the deadline expiring with a probe still failing, fails the window closed:
 
