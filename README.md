@@ -41,7 +41,7 @@ For `update-from-file` and `update-from-url`, append `#sha256=<hex>` to request 
 
 `apply-staged-updates` is path-free. UMS stages artifacts in the canonical component download dir (`/data/ota/mdb`, or `/data/ota/dbc` on the DBC) and pushes this one command, and update-service owns the discovery. It resolves what to install as follows:
 
-- `.mender` files that are not newer than the running version are the delta bases and old full images; as candidates they are ignored, so they never make a set ambiguous. The base for the running version has to be present for a delta to apply, so it is never a conflict. Retention is the startup sweep's keep-set described below, not this rule: an old full image that is neither the running version's base nor a staged target is removed at the next startup.
+- `.mender` files that are not newer than the running version are the delta bases and old full images; as candidates they are ignored, so they never make a set ambiguous. The base for the running version has to be present for a delta to apply, so it is never a conflict. Retention is the startup sweep's keep-set described below, not this rule: that sweep keeps the running version's base plus a staged target and drops what is neither at the next startup.
 - a `.mender` newer than the running version together with any delta that counts as a real candidate (one that parses as a newer artifact on the running version's channel), or two or more newer `.mender` files, is ambiguous: the whole set is refused (`staged-updates-refused`) and nothing is installed. A `.mender` on another channel is never a target and is ignored, however new its timestamp. A `.delta` the version test cannot judge — a cross-channel orphan, an unparsable name, or a partial transfer — is not a candidate: it is ignored rather than counted, so it neither joins a chain nor blocks a legitimately staged image, and it is left to the retention sweep below.
 - one newer `.mender` on the running channel is installed as a full image. Otherwise the deltas newer than the running version are validated as one channel, strictly increasing chain that starts at the running version.
 - when nothing in the dir is newer than the running version — the normal post-success state, since the staged image has become the running version — the command logs it and goes idle. It is not a refusal.
@@ -58,7 +58,7 @@ Running versions are read from `version:<component>` field `version_id`; the rel
 
 The commit gate defers that commit until the platform has proved itself on the new image, so an update's success is "booted and the vehicle came up on it" rather than only "the running version matches the pending artifact".
 
-It is off by default and MDB-only. On the DBC it is reported and ignored: the dashboard already carries its own activation-attempt machinery for a reboot whose outcome it cannot observe, and the two have to be reconciled before the dashboard can be gated. Enabling it changes the failure mode of a commit to fail-closed, so it is opted into per device with `updates.<component>.commit-gate`.
+It is off by default, and opting in is per component: `updates.mdb.commit-gate` gates MDB commits and `updates.dbc.commit-gate` gates DBC commits. Enabling it changes the failure mode of a commit to fail-closed, so it is switched on per device once that device's probe set has been confirmed.
 
 A window opens at startup when the gate is enabled and Mender's pending artifact is the version that is running. The component stays in `pending-reboot` throughout. Once the image has been up past the floor, these probes are evaluated every 15 seconds and every one must hold:
 
@@ -66,10 +66,12 @@ A window opens at startup when the gate is enabled and Mender's pending artifact
 - `systemctl is-system-running` is `running` or `degraded`
 - every configured required unit is satisfied: active, or a oneshot that ran successfully during this boot
 - vehicle-service has published a `vehicle` state
-- `power-manager[state]` is `running`, not a power transition
+- `power-manager[state]` is `running`, not a power transition — MDB only
 - the component still holds its image: `status:<component>` is `pending-reboot` with no error recorded
 
-The required units default to `valkey`, `librescoot-vehicle`, `librescoot-settings` and `librescoot-version`, plus `librescoot-pm` on the MDB. Modem, uplink, battery, ecu and keycard are deliberately absent: they legitimately fail or are absent depending on SIM, card and fitted hardware, and a required unit that is wrongly listed turns a good update into a rollback. Listing a oneshot is safe because the probe accepts a unit that ran successfully during this boot even when it is inactive afterwards, which is what `Type=oneshot` with `RemainAfterExit=no` always reports. A unit list that is wrong for a device is the main way this feature costs an update attempt.
+The required units default to `valkey`, `librescoot-vehicle`, `librescoot-settings` and `librescoot-version`, plus `librescoot-pm` on the MDB. On the DBC they default to `valkey`, `librescoot-version` and `dbc-dispatcher`, taken from the DBC image's package list: vehicle, settings and pm-service run on the MDB and cannot be required from there. What the DBC needs from the MDB is covered by the vehicle probe instead, which reads through the MDB's Redis, and its power state is deliberately not a probe: the MDB holds dashboard power for a DBC update and resumes suspending once the lifecycle completes, so that state may change while the window is still open without saying anything about the dashboard's image.
+
+Modem, uplink, battery, ecu and keycard are deliberately absent: they legitimately fail or are absent depending on SIM, card and fitted hardware, and a required unit that is wrongly listed turns a good update into a rollback. Listing a oneshot is safe because the probe accepts a unit that ran successfully during this boot even when it is inactive afterwards, which is what `Type=oneshot` with `RemainAfterExit=no` always reports. A unit list that is wrong for a device is the main way this feature costs an update attempt, which is why each component's default is only as large as what its image guarantees.
 
 All probes holding commits the update through the same path as an ungated startup. A hard failure, or the deadline expiring with a probe still failing, fails the window closed:
 
@@ -79,6 +81,8 @@ All probes holding commits the update through the same path as an ungated startu
 - a reboot is requested, which the bootloader answers by booting the previously committed slot
 
 The record survives the reboot, and the next boot reads it: still running the pending artifact means the rollback did not land, so the gate clears Mender's stale state, keeps the artifact quarantined and reports `commit-gate-stuck` instead of rebooting again. Running the committed artifact instead means the bootloader reverted, which closes the window out to `idle`; without that, the MDB would hold `pending-reboot` for good, because the generic recovery path answers "reboot still required" and nothing on the MDB ever reboots.
+
+On the DBC the window replaces the activation-attempt marker as the authority on this activation's outcome. The gate owns both records: a verified commit clears the activation attempt through the same path an ungated commit does and emits `complete-dbc`; a revert or a stuck rollback closes it as well, because that record is only read in the pending-commit branch and would otherwise outlive the decision without ever being examined again. A window therefore delays `complete-dbc` until its verdict, which is safe against vehicle-service's DBC update watchdog: that watchdog resets on any `ota:dbc` field change and the window keeps `heartbeat:dbc` ticking for its whole duration.
 
 A quarantined artifact is not installed by the staged-file path and is not selected by a release check. It is dropped from the quarantine once the running version reaches or passes it, so a newer release is never affected.
 
@@ -110,7 +114,7 @@ Each release check reads the current component channel and update method from se
 | `--download-max-duration` | `60m` | Per-attempt download wall-clock limit; `0` disables it |
 | `--download-stall-window` | `2m` | Throughput evaluation window; `0` disables it |
 | `--download-stall-min-bytes` | `65536` | Bytes required in each stall window |
-| `--commit-gate` | `false` | Commit a pending update only after the platform proves healthy on it (MDB only) |
+| `--commit-gate` | `false` | Commit a pending update only after the platform proves healthy on it |
 | `--commit-gate-floor` | `3m` | Monotonic uptime before the commit gate evaluates its probes |
 | `--commit-gate-deadline` | `20m` | How long the commit gate may wait for its probes before rolling back |
 | `--commit-gate-required-units` | component set | Comma-separated systemd units the commit gate requires active |

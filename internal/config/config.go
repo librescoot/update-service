@@ -84,16 +84,30 @@ const (
 // and a required unit that is wrongly listed turns a good update into a
 // fail-closed rollback.
 func defaultCommitGateUnits(component string) []string {
-	units := []string{
+	// The MDB list is the one this service must have up to do its own work, and
+	// every unit in it has been observed active on a healthy MDB. Modem, uplink,
+	// battery, ecu and keycard are deliberately absent: those legitimately fail
+	// or are absent depending on SIM, card and fitted hardware, and a required
+	// unit that is wrongly listed turns a good update into a rollback.
+	if component == "dbc" {
+		// The DBC's own services, from the DBC image's package list: local valkey
+		// (dbc-dispatcher and the dashboard talk to it), version-service, and the
+		// dispatcher every DBC service is reached through. vehicle, settings and
+		// pm-service live on the MDB, so they cannot be required here; what the DBC
+		// needs from the MDB is checked separately by the vehicle probe.
+		return []string{
+			"valkey.service",
+			"librescoot-version.service",
+			"dbc-dispatcher.service",
+		}
+	}
+	return []string{
 		"valkey.service",
 		"librescoot-vehicle.service",
 		"librescoot-settings.service",
 		"librescoot-version.service",
+		"librescoot-pm.service",
 	}
-	if component == "mdb" {
-		units = append(units, "librescoot-pm.service")
-	}
-	return units
 }
 
 // CommitGateSettings is one coherent snapshot of the gate configuration. The

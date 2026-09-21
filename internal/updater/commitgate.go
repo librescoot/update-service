@@ -11,6 +11,7 @@ import (
 
 	"github.com/librescoot/update-service/internal/commitgate"
 	"github.com/librescoot/update-service/internal/config"
+	"github.com/librescoot/update-service/internal/dbcstate"
 	"github.com/librescoot/update-service/internal/mender"
 	"github.com/librescoot/update-service/internal/version"
 )
@@ -100,18 +101,12 @@ func (u *Updater) ReconcilePendingUpdate() (Reconciliation, error) {
 // nothing for the ordinary startup path to do, and a GatedCommit when the gate
 // must now earn the commit.
 //
-// The gate is MDB-only until it has been proved on hardware. The DBC already
-// carries its own activation-attempt machinery for a reboot whose outcome it
-// cannot observe, and the two would have to be reconciled before the dashboard
-// can be gated. On any other component the setting is reported and ignored.
+// The component shows up in three places: which units are required, whether the
+// MDB's power state is a health signal at all, and which finaliser closes out a
+// window the bootloader reverted. The DBC additionally carries an
+// activation-attempt marker from before its reboot, which the gate now owns the
+// outcome of.
 func (u *Updater) reconcileCommitGate() (*GatedCommit, bool, error) {
-	if u.config.Component != "mdb" {
-		if u.config.CommitGateSettings().Enabled {
-			u.logger.Printf("Commit gate is not supported for %s yet; committing on startup as before", u.config.Component)
-		}
-		return nil, false, nil
-	}
-
 	cfg := u.config.CommitGateSettings()
 	marker, haveMarker, err := u.loadGateMarker()
 	if err != nil {
@@ -435,21 +430,29 @@ func (u *Updater) rollbackGatedUpdate(marker commitgate.Marker, reason string) e
 
 // finalizeRevertedGate closes out a window the bootloader ended by reverting to
 // the previously committed slot. Mender's standalone state is stale in that
-// case, and on the MDB nothing else can clear it: the generic recovery path
-// answers "reboot still required" and no MDB path ever reboots, so the vehicle
-// would hold pending-reboot for good.
+// case, and nothing else can clear it: the generic recovery path answers
+// "reboot still required", and no MDB path ever reboots.
 func (u *Updater) finalizeRevertedGate(marker commitgate.Marker, observation mender.UpdateObservation) error {
 	if err := u.quarantineArtifact(marker.Artifact); err != nil {
 		u.logger.Printf("Commit gate cannot quarantine the reverted artifact %s: %v", marker.Artifact, err)
 	}
-	if err := u.rollbackUpdate(); err != nil {
-		u.logger.Printf("Mender rollback after a reverted gate window: %v", err)
+	if u.config.Component == "dbc" {
+		// The activation-attempt marker from before the reboot is the other half
+		// of this window's record, and the DBC finaliser already owns closing it:
+		// it rolls Mender back, clears that marker and publishes idle together.
+		if err := u.finalizeRolledBackActivation(observation); err != nil {
+			return err
+		}
+	} else {
+		if err := u.rollbackUpdate(); err != nil {
+			u.logger.Printf("Mender rollback after a reverted gate window: %v", err)
+		}
+		if err := u.status.SetIdle(u.ctx); err != nil {
+			return u.pendingCommitError(fmt.Errorf("publish reverted gate window: %w", err))
+		}
 	}
 	if err := u.clearGateMarker(); err != nil {
 		return u.pendingCommitError(fmt.Errorf("clear reverted commit gate marker: %w", err))
-	}
-	if err := u.status.SetIdle(u.ctx); err != nil {
-		return u.pendingCommitError(fmt.Errorf("publish reverted gate window: %w", err))
 	}
 	u.publishGateState(gateStateRolledBack, "the bootloader reverted to the committed slot", "")
 	u.logger.Printf("Commit gate: %s reverted to %s; not rebooting", marker.Artifact, observation.CommittedArtifact)
@@ -479,6 +482,13 @@ func (u *Updater) holdGatedUpdate(marker commitgate.Marker, reason, detail strin
 	}
 	if err := u.clearGateMarker(); err != nil {
 		u.logger.Printf("Commit gate cannot clear its marker: %v", err)
+	}
+	// The gate has decided this activation's outcome, so the DBC's record of
+	// having asked for it must go too: left behind it would outlive its purpose
+	// and, being read only in the pending-commit branch, would never be examined
+	// again either.
+	if err := u.clearActivationMarker(); err != nil {
+		u.logger.Printf("Commit gate cannot clear the DBC activation attempt: %v", err)
 	}
 	message := reason
 	if detail != "" && detail != reason {
@@ -527,6 +537,16 @@ func (u *Updater) pruneCommitGateQuarantine() {
 	if err != nil {
 		u.logger.Printf("Cannot prune the commit gate quarantine: %v", err)
 	}
+}
+
+// clearActivationMarker closes the DBC activation-attempt record. The gate owns
+// that record's outcome while a window is open, and there is no such record on
+// the MDB.
+func (u *Updater) clearActivationMarker() error {
+	if u.config.Component != "dbc" {
+		return nil
+	}
+	return dbcstate.ClearActivationAttempt(u.activationAttempt)
 }
 
 // quarantineArtifact records an artifact the gate rejected.
@@ -697,22 +717,36 @@ func (u *Updater) evaluateCommitGateProbes(cfg config.CommitGateSettings) []gate
 		vehicleDetail = fmt.Sprintf("cannot read vehicle state: %v", vehicleErr)
 	}
 
-	powerState, powerErr := u.gateProbePowerManagerState()
-	powerDetail := fmt.Sprintf("power-manager state %q", powerState)
-	if powerErr != nil {
-		powerDetail = fmt.Sprintf("cannot read power-manager state: %v", powerErr)
-	}
-
 	otaStatus, otaDetail := u.gateProbeOTAStatus()
 
-	return []gateProbeResult{
+	results := []gateProbeResult{
 		{Name: gateProbeUptime, Passed: uptimeErr == nil && uptime >= cfg.Floor, Detail: uptimeDetail},
 		{Name: gateProbeSystemd, Passed: systemdErr == nil && systemdRunning(systemdState), Detail: systemdDetail},
 		{Name: gateProbeUnits, Passed: unitsErr == nil && inactiveUnit == "", Detail: unitsDetail},
 		{Name: gateProbeVehicle, Passed: vehicleErr == nil && vehicleState != "", Detail: vehicleDetail},
-		{Name: gateProbePowerManager, Passed: powerErr == nil && powerState == "running", Detail: powerDetail},
-		{Name: gateProbeOTAStatus, Passed: otaStatus, Detail: otaDetail},
 	}
+
+	// The MDB's own power state is a health signal for the MDB and only for the
+	// MDB: pm-service and the hash it publishes to both live there. On the DBC
+	// that hash is the MDB's, whose power state may legitimately leave "running"
+	// while the DBC is still evaluating — it holds dashboard power for the DBC
+	// update and resumes suspending once the lifecycle completes — so gating the
+	// DBC's commit on it would fail closed on a picture unrelated to the image
+	// under test. The DBC does not read it at all.
+	if u.config.Component == "mdb" {
+		powerState, powerErr := u.gateProbePowerManagerState()
+		powerDetail := fmt.Sprintf("power-manager state %q", powerState)
+		if powerErr != nil {
+			powerDetail = fmt.Sprintf("cannot read power-manager state: %v", powerErr)
+		}
+		results = append(results, gateProbeResult{
+			Name: gateProbePowerManager, Passed: powerErr == nil && powerState == "running", Detail: powerDetail,
+		})
+	}
+
+	return append(results, gateProbeResult{
+		Name: gateProbeOTAStatus, Passed: otaStatus, Detail: otaDetail,
+	})
 }
 
 // gateProbeUptime reads time since boot from /proc/uptime. This is monotonic and

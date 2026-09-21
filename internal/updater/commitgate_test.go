@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/librescoot/update-service/internal/commitgate"
 	"github.com/librescoot/update-service/internal/config"
+	"github.com/librescoot/update-service/internal/dbcstate"
 	"github.com/librescoot/update-service/internal/mender"
 	"github.com/librescoot/update-service/internal/redis"
 	"github.com/librescoot/update-service/internal/status"
@@ -51,6 +53,14 @@ type gateHarness struct {
 
 func newGateHarness(t *testing.T, opts ...func(*gateHarness)) *gateHarness {
 	t.Helper()
+	return newGateHarnessFor(t, "mdb", opts...)
+}
+
+// newGateHarnessFor is newGateHarness for an explicit component: the gate's
+// probe set, the ota hash fields it publishes, and the DBC activation marker all
+// follow the component.
+func newGateHarnessFor(t *testing.T, component string, opts ...func(*gateHarness)) *gateHarness {
+	t.Helper()
 	mr := miniredis.RunT(t)
 	rc, err := redis.New(mr.Addr())
 	if err != nil {
@@ -74,19 +84,20 @@ func newGateHarness(t *testing.T, opts ...func(*gateHarness)) *gateHarness {
 		probes:  allGateProbesPassing(),
 	}
 
-	cfg := config.New("localhost:6379", "https://example.invalid", time.Hour, "mdb", "nightly", "/data/ota/mdb", false, false, "/uboot", "", 2)
+	cfg := config.New("localhost:6379", "https://example.invalid", time.Hour, component, "nightly", "/data/ota/"+component, false, false, "/uboot", "", 2)
 	cfg.CommitGateEnabled = true
 
 	h.updater = &Updater{
 		config: cfg,
 		redis:  rc,
-		status: status.NewReporter(rc.GetClient(), "mdb", logger),
+		status: status.NewReporter(rc.GetClient(), component, logger),
 		logger: logger,
 		ctx:    context.Background(),
 		// A cancelled-but-present context keeps TriggerReboot out of the test:
 		// gateReboot is substituted below.
-		gateStore: store,
-		gateNow:   func() time.Time { return h.now },
+		gateStore:         store,
+		activationAttempt: filepath.Join(dir, "dbc-activation-attempt"),
+		gateNow:           func() time.Time { return h.now },
 		gateEvaluate: func(config.CommitGateSettings) []gateProbeResult {
 			return h.probes
 		},
@@ -915,5 +926,207 @@ func TestGateProbeUnitsReportsTheOffendingUnit(t *testing.T) {
 	inactive, err = h.updater.gateProbeUnits(nil)
 	if err != nil || inactive != "" {
 		t.Errorf("gateProbeUnits(nil) = (%q, %v), want no failure", inactive, err)
+	}
+}
+
+// saveActivation writes the record triggerDBCLocalReboot leaves behind before
+// asking the DBC to reboot into the installed image.
+func (h *gateHarness) saveActivation(t *testing.T) {
+	t.Helper()
+	if err := dbcstate.SaveActivationAttempt(h.updater.activationAttempt, dbcstate.ActivationAttempt{
+		Artifact: gateArtifact,
+		BootID:   gateBootA,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (h *gateHarness) activationOpen() bool {
+	_, err := dbcstate.LoadActivationAttempt(h.updater.activationAttempt)
+	return err == nil
+}
+
+func (h *gateHarness) pushedCommands() []string {
+	commands, err := h.updater.redis.GetClient().Raw().LRange(context.Background(), "scooter:update", 0, -1).Result()
+	if err != nil {
+		return nil
+	}
+	return commands
+}
+
+// The probe set follows the component: the MDB gates on its own power state,
+// the DBC does not read it at all, because the hash belongs to the MDB there.
+func TestCommitGateProbesAreComponentAware(t *testing.T) {
+	mdb := newGateHarness(t)
+	mdbProbes := probePassMap(mdb.updater.evaluateCommitGateProbes(mdb.updater.config.CommitGateSettings()))
+	if _, ok := mdbProbes[gateProbePowerManager]; !ok {
+		t.Error("the MDB must gate on its own power-manager state")
+	}
+
+	dbc := newGateHarnessFor(t, "dbc")
+	dbcProbes := probePassMap(dbc.updater.evaluateCommitGateProbes(dbc.updater.config.CommitGateSettings()))
+	if _, ok := dbcProbes[gateProbePowerManager]; ok {
+		t.Error("the DBC must not gate on the MDB's power-manager state")
+	}
+	for _, name := range []string{gateProbeUptime, gateProbeSystemd, gateProbeUnits, gateProbeVehicle, gateProbeOTAStatus} {
+		if _, ok := dbcProbes[name]; !ok {
+			t.Errorf("the DBC must evaluate %s", name)
+		}
+	}
+}
+
+// The DBC gets a window like the MDB, and the activation attempt it asked for is
+// still open while the gate decides.
+func TestReconcileOpensAGateWindowOnTheDBC(t *testing.T) {
+	h := newGateHarnessFor(t, "dbc")
+	h.saveActivation(t)
+
+	rec, err := h.updater.ReconcilePendingUpdate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.NeedsReboot || rec.Gated == nil {
+		t.Fatalf("reconciliation = %+v, want a gated commit", rec)
+	}
+	if h.commits != 0 {
+		t.Fatalf("commit calls = %d, want 0: the gate owns the decision", h.commits)
+	}
+	if got := h.redis.HGet("ota", "status:dbc"); got != "pending-reboot" {
+		t.Errorf("status:dbc = %q, want pending-reboot", got)
+	}
+	if !h.activationOpen() {
+		t.Error("the activation attempt must stay open while the gate decides")
+	}
+	// reconstructPendingState restores the DBC lifecycle for the window.
+	if !slices.Contains(h.pushedCommands(), "start-dbc") {
+		t.Errorf("pushed commands = %v, want start-dbc restored", h.pushedCommands())
+	}
+}
+
+// A DBC window that earns its commit completes the lifecycle exactly as an
+// ungated startup commit does: activation attempt closed, status idle, and
+// complete-dbc handed to vehicle-service.
+func TestDBCGateCommitCompletesTheLifecycle(t *testing.T) {
+	h := newGateHarnessFor(t, "dbc")
+	h.saveActivation(t)
+	h.markStatusPendingReboot(t)
+	marker := commitgate.Marker{
+		Artifact: gateArtifact, PendingVersion: gateVersion,
+		BootID: gateBootB, FirstSeen: h.now, Verdict: commitgate.VerdictWaiting,
+	}
+
+	if done := h.updater.commitGateStep(&marker, h.gated()); !done {
+		t.Fatal("a passing DBC window did not reach a verdict")
+	}
+	if h.commits != 1 {
+		t.Fatalf("commit calls = %d, want 1", h.commits)
+	}
+	if h.activationOpen() {
+		t.Error("the activation attempt must be closed by a verified commit")
+	}
+	if got := h.redis.HGet("ota", "status:dbc"); got != "idle" {
+		t.Errorf("status:dbc = %q, want idle", got)
+	}
+	if !slices.Contains(h.pushedCommands(), "complete-dbc") {
+		t.Errorf("pushed commands = %v, want complete-dbc", h.pushedCommands())
+	}
+	if _, err := h.store.Load(); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("marker should be cleared after a commit, got err=%v", err)
+	}
+	if quarantined, err := h.store.Quarantined(gateArtifact); err != nil || quarantined {
+		t.Errorf("a committed artifact must not be quarantined, got %v (err %v)", quarantined, err)
+	}
+}
+
+// A DBC window the bootloader reverted: Mender's commit-pending state is stale,
+// and both halves of the record — the gate marker and the activation attempt —
+// have to close.
+func TestRevertedGateWindowOnTheDBCClosesTheActivationAttempt(t *testing.T) {
+	h := newGateHarnessFor(t, "dbc")
+	h.bootID = gateBootB
+	h.running = gatePrevious
+	h.saveActivation(t)
+	if err := h.store.Save(commitgate.Marker{
+		Artifact: gateArtifact, PendingVersion: gateVersion,
+		BootID: gateBootA, FirstSeen: h.now.Add(-time.Hour), Verdict: commitgate.VerdictWaiting,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := h.updater.ReconcilePendingUpdate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Gated != nil || rec.NeedsReboot {
+		t.Fatalf("reconciliation = %+v, want a settled revert", rec)
+	}
+	if h.reboots != 0 {
+		t.Errorf("reboot requests = %d, want 0", h.reboots)
+	}
+	if h.rollbacks != 1 {
+		t.Errorf("rollback calls = %d, want 1", h.rollbacks)
+	}
+	if h.activationOpen() {
+		t.Error("the activation attempt must be closed by a revert")
+	}
+	if _, err := h.store.Load(); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("gate marker should be cleared, got err=%v", err)
+	}
+	if got := h.redis.HGet("ota", "status:dbc"); got != "idle" {
+		t.Errorf("status:dbc = %q, want idle", got)
+	}
+	if quarantined, err := h.store.Quarantined(gateArtifact); err != nil || !quarantined {
+		t.Errorf("the reverted artifact should be quarantined, got %v (err %v)", quarantined, err)
+	}
+}
+
+// A second boot still on the pending artifact after a requested rollback: the
+// DBC activation record has to go too, or it would outlive the gate's decision
+// and never be examined again.
+func TestStuckGateOnTheDBCClosesTheActivationAttempt(t *testing.T) {
+	h := newGateHarnessFor(t, "dbc")
+	h.bootID = gateBootB
+	h.saveActivation(t)
+	if err := h.store.Save(commitgate.Marker{
+		Artifact: gateArtifact, PendingVersion: gateVersion,
+		BootID: gateBootA, FirstSeen: h.now.Add(-time.Hour),
+		RollbackAttempted: true, Verdict: commitgate.VerdictRolledBack,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := h.updater.ReconcilePendingUpdate(); err != nil {
+		t.Fatal(err)
+	}
+	if h.reboots != 0 {
+		t.Errorf("reboot requests = %d, want 0: an unlanded rollback must not loop", h.reboots)
+	}
+	if h.rollbacks != 1 {
+		t.Errorf("rollback calls = %d, want 1", h.rollbacks)
+	}
+	if h.activationOpen() {
+		t.Error("the activation attempt must be closed when the gate holds")
+	}
+	if got := h.redis.HGet("ota", "error:dbc"); got != gateErrorStuck {
+		t.Errorf("error:dbc = %q, want %q", got, gateErrorStuck)
+	}
+	if _, err := h.store.Load(); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("gate marker should be cleared, got err=%v", err)
+	}
+}
+
+// The DBC's required units are the DBC's own services: vehicle, settings and
+// pm-service live on the MDB and cannot be required from here.
+func TestCommitGateUnitsAreComponentScoped(t *testing.T) {
+	dbc := newGateHarnessFor(t, "dbc")
+	units := dbc.updater.config.CommitGateSettings().RequiredUnits
+	want := []string{"valkey.service", "librescoot-version.service", "dbc-dispatcher.service"}
+	if !slices.Equal(units, want) {
+		t.Errorf("dbc required units = %v, want %v", units, want)
+	}
+	for _, forbidden := range []string{"librescoot-vehicle.service", "librescoot-pm.service", "librescoot-settings.service"} {
+		if slices.Contains(units, forbidden) {
+			t.Errorf("dbc required units must not include the MDB's %s", forbidden)
+		}
 	}
 }
