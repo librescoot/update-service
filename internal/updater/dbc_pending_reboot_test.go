@@ -63,7 +63,7 @@ func TestTriggerRebootDBCRunsLocalReboot(t *testing.T) {
 func TestTriggerBootRebootDBCDoesNotRequireMender(t *testing.T) {
 	u, mr := newPendingCommitUpdater(t)
 	u.config.Component = "dbc"
-	mr.HSet("vehicle", "state", "parked")
+	mr.HSet("vehicle", "state", "stand-by")
 	called := false
 	u.localReboot = func() error { called = true; return nil }
 	if err := u.TriggerBootReboot("dbc", true); err != nil {
@@ -88,12 +88,12 @@ func TestTriggerRebootMDBDefersToUMSOwner(t *testing.T) {
 }
 
 func TestDBCRebootAllowedState(t *testing.T) {
-	for _, state := range []string{"stand-by", "parked", "shutting-down"} {
+	for _, state := range []string{"stand-by"} {
 		if !dbcRebootAllowedState(state) {
 			t.Errorf("state %q should allow DBC reboot", state)
 		}
 	}
-	for _, state := range []string{"driving", "ready-to-drive", "", "hibernating"} {
+	for _, state := range []string{"driving", "ready-to-drive", "parked", "shutting-down", "", "hibernating", "updating"} {
 		if dbcRebootAllowedState(state) {
 			t.Errorf("state %q should not allow DBC reboot", state)
 		}

@@ -3961,13 +3961,12 @@ func (u *Updater) skipTerminalErrorOnShutdown(where string) bool {
 	return true
 }
 
+// dbcRebootAllowedState: only stand-by. Parked is the kickstand-down moment
+// and shutting-down is the rider's own power-off; POWER_STATES.md requires
+// reboots from stand-by only, and a pending artifact also activates on the
+// power cycle stand-by causes.
 func dbcRebootAllowedState(state string) bool {
-	switch state {
-	case "stand-by", "parked", "shutting-down":
-		return true
-	default:
-		return false
-	}
+	return state == "stand-by"
 }
 
 // TriggerReboot triggers a reboot or restart of the specified component.
