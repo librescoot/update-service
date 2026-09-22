@@ -16,6 +16,7 @@ import (
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/redis"
 	"github.com/librescoot/update-service/internal/status"
+	"github.com/librescoot/update-service/internal/version"
 )
 
 // newTestUpdaterForPreview builds an Updater with a real GitHubAPI pointed at
@@ -23,10 +24,32 @@ import (
 // miniredis. previewChannel only reads, so this is everything it touches.
 func newTestUpdaterForPreview(t *testing.T, index map[string][]Release) (*Updater, *miniredis.Miniredis) {
 	t.Helper()
+	var manifest map[string]Release
+	if index != nil {
+		manifest = latestManifest(index)
+	}
+	return newTestUpdaterForPreviewWithManifest(t, index, manifest)
+}
+
+// newTestUpdaterForPreviewWithManifest serves a manifest that need not match the
+// per-channel lists, so a test can exercise the two disagreeing.
+func newTestUpdaterForPreviewWithManifest(t *testing.T, index map[string][]Release, manifest map[string]Release) (*Updater, *miniredis.Miniredis) {
+	t.Helper()
 	mr := miniredis.RunT(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The index is served as /{channel}.json, matching downloads.librescoot.org.
+		// latest.json carries one release per channel, as the release job
+		// publishes it. A nil index stands in for an index that is not there.
+		if r.URL.Path == "/latest.json" {
+			if manifest == nil {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(manifest)
+			return
+		}
+
+		// The index is also served as /{channel}.json, matching downloads.librescoot.org.
 		channel := r.URL.Path
 		channel = channel[1:]                         // strip leading /
 		channel = channel[:len(channel)-len(".json")] // strip extension
@@ -62,6 +85,32 @@ func newTestUpdaterForPreview(t *testing.T, index map[string][]Release) (*Update
 		ctx:       ctx,
 	}
 	return u, mr
+}
+
+// latestManifest derives latest.json from the per-channel index: one release per
+// channel, chosen the way the release job chooses it. Stable orders by version,
+// the other channels by publish time.
+func latestManifest(index map[string][]Release) map[string]Release {
+	out := make(map[string]Release, len(index))
+	for channel, releases := range index {
+		if len(releases) == 0 {
+			continue
+		}
+		newest := releases[0]
+		for _, release := range releases[1:] {
+			if channel == "stable" {
+				if version.Compare(release.TagName, newest.TagName) > 0 {
+					newest = release
+				}
+				continue
+			}
+			if release.PublishedAt.After(newest.PublishedAt) {
+				newest = release
+			}
+		}
+		out[channel] = newest
+	}
+	return out
 }
 
 func stableIndex() map[string][]Release {
@@ -126,10 +175,53 @@ func TestPreviewChannel_UnavailableForUnknownVariant(t *testing.T) {
 	}
 }
 
-// An unreachable or missing channel index must not leave the UI waiting on
-// "checking" forever.
-func TestPreviewChannel_ErrorOnMissingIndex(t *testing.T) {
+// A channel whose newest release carries no image for this variant — a board
+// that failed to build that night — still offers the release before it.
+func TestPreviewChannelFallsBackToTheChannelList(t *testing.T) {
+	index := map[string][]Release{
+		"stable": {
+			{
+				TagName:     "v1.4.0",
+				PublishedAt: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+				Assets:      []Asset{{Name: "librescoot-unu-dbc-v1.4.0.mender", Size: 1, URL: "http://example/dbc.mender"}},
+			},
+			{
+				TagName:     "v1.3.5",
+				PublishedAt: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+				Assets:      []Asset{{Name: "librescoot-unu-mdb-v1.3.5.mender", Size: 401234432, URL: "http://example/mdb.mender"}},
+			},
+		},
+	}
+	manifest := map[string]Release{"stable": index["stable"][0]}
+	u, mr := newTestUpdaterForPreviewWithManifest(t, index, manifest)
+	mr.HSet("version:mdb", "variant_id", "unu-mdb")
+
+	u.previewChannel("stable")
+
+	if got := mr.HGet("ota", "preview-status:mdb"); got != status.PreviewReady {
+		t.Errorf("preview-status:mdb = %q, want %q", got, status.PreviewReady)
+	}
+	if got := mr.HGet("ota", "preview-version:mdb"); got != "v1.3.5" {
+		t.Errorf("preview-version:mdb = %q, want v1.3.5", got)
+	}
+}
+
+// A channel the manifest does not carry has nothing to switch to, which is not
+// an error the UI should retry.
+func TestPreviewChannel_UnavailableForChannelMissingFromManifest(t *testing.T) {
 	u, mr := newTestUpdaterForPreview(t, stableIndex())
+	mr.HSet("version:mdb", "variant_id", "unu-mdb")
+
+	u.previewChannel("testing")
+
+	if got := mr.HGet("ota", "preview-status:mdb"); got != status.PreviewUnavailable {
+		t.Errorf("preview-status:mdb = %q, want %q", got, status.PreviewUnavailable)
+	}
+}
+
+// An unreachable index must not leave the UI waiting on "checking" forever.
+func TestPreviewChannel_ErrorOnUnreachableIndex(t *testing.T) {
+	u, mr := newTestUpdaterForPreview(t, nil)
 	mr.HSet("version:mdb", "variant_id", "unu-mdb")
 	// previewChannel derives its deadline from u.ctx, so a short parent
 	// stands in for previewTimeout without making the test wait for it.

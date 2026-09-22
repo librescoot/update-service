@@ -27,7 +27,10 @@ type dbcPreflight struct {
 // orchestrateDBC is called from checkForUpdates() on MDB when orchestration is enabled.
 // It publishes the DBC preflight first, then powers the DBC only when that
 // assessment says a check is useful and the vehicle is safely in stand-by.
-func (u *Updater) orchestrateDBC(releases []Release) {
+// orchestrateDBC preflights the DBC's update and wakes the dashboard when one is
+// waiting. The manifest carries every channel, so the DBC is judged against its
+// own channel rather than the MDB's.
+func (u *Updater) orchestrateDBC(manifest map[string]Release) {
 	if u.config.Component != "mdb" || !u.getOrchestrateDBC() {
 		return
 	}
@@ -40,7 +43,7 @@ func (u *Updater) orchestrateDBC(releases []Release) {
 	}
 	defer u.dbcOrchestrating.Unlock()
 
-	preflight := u.preflightDBCUpdate(releases)
+	preflight := u.preflightDBCUpdate(manifest)
 	if u.dbcStatus != nil {
 		if err := u.dbcStatus.SetDBCPreflight(u.ctx, preflight.result, preflight.version); err != nil {
 			u.logger.Printf("[dbc-orchestrate] Failed to publish DBC preflight: %v", err)
@@ -122,7 +125,10 @@ func (u *Updater) orchestrateDBC(releases []Release) {
 // preflightDBCUpdate checks whether cached DBC facts indicate an update. A
 // missing variant/version produces unknown, never a false "up-to-date" answer:
 // Redis is volatile and the DBC is usually off when this runs.
-func (u *Updater) preflightDBCUpdate(releases []Release) dbcPreflight {
+// preflightDBCUpdate answers whether the DBC has an update waiting, from the
+// manifest: the MDB's own channel list says nothing about the DBC's channel when
+// the two differ.
+func (u *Updater) preflightDBCUpdate(manifest map[string]Release) dbcPreflight {
 	dbcVariantID, err := u.redis.GetVariantID("dbc")
 	if err != nil {
 		u.logger.Printf("[dbc-orchestrate] Failed to read DBC variant_id: %v", err)
@@ -135,9 +141,9 @@ func (u *Updater) preflightDBCUpdate(releases []Release) dbcPreflight {
 		return dbcPreflight{result: status.DBCPreflightUnknown}
 	}
 
-	release, found := u.findLatestRelease(releases, dbcVariantID, dbcChannel)
+	release, found := u.findLatestRelease(manifestReleases(manifest, dbcChannel), dbcVariantID, dbcChannel)
 	if !found {
-		if len(releases) == 0 {
+		if _, carried := manifest[dbcChannel]; !carried {
 			u.logger.Printf("[dbc-orchestrate] No releases available on channel %s", dbcChannel)
 			return dbcPreflight{result: status.DBCPreflightNoRelease}
 		}

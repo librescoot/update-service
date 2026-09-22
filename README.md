@@ -37,6 +37,8 @@ Each instance accepts commands on `scooter:update:<component>`:
 
 For `update-from-file` and `update-from-url`, append `#sha256=<hex>` to request checksum verification. The legacy `:sha256:<hex>` suffix is also accepted. An unverified source is allowed when no checksum is supplied.
 
+Release discovery reads `latest.json`, the release index's one release per channel, which is also what lets the MDB judge the DBC against the DBC's own channel rather than its own. A channel's `<channel>.json` list is fetched only where it adds something: a delta chain is built across several releases, and when a channel's newest release carries no image for this variant (a board that failed to build that night) the list is consulted for an older one. A channel absent from the manifest is not consulted at all.
+
 `update-from-file` behaves as before apart from the power holds: one `.mender` is a full image and one `.delta` is applied against the base image of the running version. A single delta is the one-file case of the chain path below, so it is prechecked the same way and takes the suspend hold the chain path takes for the duration of the apply. Both branches install through the same inhibit/tail as the staged path. For a full image the install inhibit is now taken before the checksum verification, so `installing` is published after the verification instead of before it; the delta success log line still names the base -> target it assembled.
 
 `apply-staged-updates` is path-free. UMS stages artifacts in the canonical component download dir (`/data/ota/mdb`, or `/data/ota/dbc` on the DBC) and pushes this one command, and update-service owns the discovery. It resolves what to install as follows:

@@ -2,9 +2,48 @@ package updater
 
 import (
 	"testing"
+	"time"
 
 	"github.com/librescoot/update-service/internal/status"
 )
+
+// A DBC release with an image for the dashboard variant.
+func dbcRelease(tag, publishedAt string, size int64) Release {
+	published, err := time.Parse(time.RFC3339, publishedAt)
+	if err != nil {
+		panic(err)
+	}
+	return Release{
+		TagName:     tag,
+		PublishedAt: published,
+		Prerelease:  true,
+		Assets: []Asset{
+			{Name: "librescoot-unu-dbc-" + tag + ".mender", Size: size, URL: "http://example/dbc.mender"},
+		},
+	}
+}
+
+// The DBC is judged against its own channel: the MDB's own list says nothing
+// about a channel the MDB is not on.
+func TestPreflightDBCUpdateUsesTheDBCChannel(t *testing.T) {
+	index := map[string][]Release{
+		"nightly": {dbcRelease("nightly-20260921T003447", "2026-09-21T00:45:55Z", 2)},
+		"testing": {dbcRelease("testing-20260920T211120", "2026-09-20T21:23:44Z", 1)},
+	}
+	u, mr := newTestUpdaterForPreview(t, index)
+	mr.HSet("settings", "updates.dbc.channel", "testing")
+	mr.HSet("version:dbc", "variant_id", "unu-dbc")
+	mr.HSet("version:dbc", "version_id", "testing-20260919T000000")
+
+	got := u.preflightDBCUpdate(latestManifest(index))
+
+	if got.result != status.DBCPreflightAvailable || got.version != "testing-20260920T211120" {
+		t.Fatalf("preflight = %#v, want the testing release available", got)
+	}
+	if !got.wake {
+		t.Error("a DBC update must wake the dashboard")
+	}
+}
 
 func TestPreflightDBCUpdate(t *testing.T) {
 	tests := []struct {
@@ -65,7 +104,7 @@ func TestPreflightDBCUpdate(t *testing.T) {
 				mr.HSet("version:dbc", "version_id", tt.version)
 			}
 
-			got := u.preflightDBCUpdate(tt.releases["stable"])
+			got := u.preflightDBCUpdate(latestManifest(tt.releases))
 			if got.result != tt.wantResult || got.version != tt.wantVersion || got.wake != tt.wantWake {
 				t.Fatalf("preflight = %#v, want result=%q version=%q wake=%v", got, tt.wantResult, tt.wantVersion, tt.wantWake)
 			}

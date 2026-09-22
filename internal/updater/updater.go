@@ -2745,8 +2745,9 @@ func (u *Updater) checkForUpdates(manual bool) {
 		currentVersion = ""
 	}
 
-	// Get releases from GitHub
-	releases, err := u.githubAPI.GetReleases(channel)
+	// The manifest carries the newest release of every channel in one document,
+	// which is also what lets the MDB preflight the DBC on the DBC's own channel.
+	manifest, err := u.githubAPI.GetLatestByChannel()
 	if err != nil {
 		u.logger.Printf("Failed to get releases: %v", err)
 		u.failCheck(checkResultReleasesFailed)
@@ -2758,7 +2759,7 @@ func (u *Updater) checkForUpdates(manual bool) {
 		u.wg.Add(1)
 		go func() {
 			defer u.wg.Done()
-			u.orchestrateDBC(releases)
+			u.orchestrateDBC(manifest)
 		}()
 	}
 
@@ -2782,6 +2783,15 @@ func (u *Updater) checkForUpdates(manual bool) {
 
 	// If delta updates are configured and we have a current version
 	if updateMethod == "delta" && currentVersion != "" {
+		// A delta chain is built across several releases, so this path needs the
+		// channel's release list and not only its newest entry.
+		releases, err := u.githubAPI.GetReleases(channel)
+		if err != nil {
+			u.logger.Printf("Failed to get releases: %v", err)
+			u.failCheck(checkResultReleasesFailed)
+			return
+		}
+
 		// Attempt delta update for rootfs
 		u.wg.Add(1)
 		go func() {
@@ -2797,8 +2807,13 @@ func (u *Updater) checkForUpdates(manual bool) {
 		u.logger.Printf("No current version found, using full update for initial installation")
 	}
 
-	// Find the latest release for our variant and channel
-	release, found := u.findLatestRelease(u.withoutGateRejectedReleases(releases), variantID, channel)
+	// Find the latest release for our variant and channel.
+	release, found, err := u.latestReleaseFor(manifest, channel, variantID)
+	if err != nil {
+		u.logger.Printf("Failed to get releases: %v", err)
+		u.failCheck(checkResultReleasesFailed)
+		return
+	}
 	if !found {
 		u.logger.Printf("No release found for variant_id %s and channel %s", variantID, channel)
 		u.finishCheck(checkResultNoRelease)
@@ -2884,9 +2899,9 @@ func (u *Updater) previewChannel(channel string) {
 	ctx, cancel := context.WithTimeout(u.ctx, previewTimeout)
 	defer cancel()
 
-	releases, err := u.githubAPI.GetReleasesContext(ctx, channel)
+	releases, err := u.githubAPI.GetLatestByChannelContext(ctx)
 	if err != nil {
-		u.logger.Printf("Preview for %s failed to fetch %s releases: %v", u.config.Component, channel, err)
+		u.logger.Printf("Preview for %s failed to fetch the release manifest: %v", u.config.Component, err)
 		publish(status.PreviewError, "", 0)
 		return
 	}
@@ -2898,7 +2913,12 @@ func (u *Updater) previewChannel(channel string) {
 		variantID = u.config.Component
 	}
 
-	release, found := u.findLatestRelease(releases, variantID, channel)
+	release, found, err := u.latestReleaseFor(releases, channel, variantID)
+	if err != nil {
+		u.logger.Printf("Preview for %s failed to fetch %s releases: %v", u.config.Component, channel, err)
+		publish(status.PreviewError, "", 0)
+		return
+	}
 	if !found {
 		u.logger.Printf("Preview: no %s release for variant_id %s", channel, variantID)
 		publish(status.PreviewUnavailable, "", 0)
@@ -2935,38 +2955,62 @@ func (u *Updater) inferChannelFromVersion(version string) string {
 	return ""
 }
 
-// findLatestRelease finds the latest release for the given variant and channel
+// latestReleaseFor returns the newest release a channel offers for a variant.
+// The manifest carries one release per channel, so when that entry holds no image
+// for this variant, or the gate rolled it back, the channel's release list is
+// fetched: an older release may still carry one. A channel the manifest does not
+// carry at all has nothing on its list either.
+func (u *Updater) latestReleaseFor(manifest map[string]Release, channel, variantID string) (Release, bool, error) {
+	if release, found := u.findLatestRelease(u.withoutGateRejectedReleases(manifestReleases(manifest, channel)), variantID, channel); found {
+		return release, true, nil
+	}
+	if _, carried := manifest[channel]; !carried {
+		return Release{}, false, nil
+	}
+
+	releases, err := u.githubAPI.GetReleases(channel)
+	if err != nil {
+		return Release{}, false, err
+	}
+	release, found := u.findLatestRelease(u.withoutGateRejectedReleases(releases), variantID, channel)
+	return release, found, nil
+}
+
+// manifestReleases returns the newest release of a channel as a one-element
+// list, or nil when the manifest does not carry that channel. Every selection
+// rule then applies the same way it does to a channel's release list.
+func manifestReleases(manifest map[string]Release, channel string) []Release {
+	release, ok := manifest[channel]
+	if !ok {
+		return nil
+	}
+	return []Release{release}
+}
+
+// releaseMatchesChannel reports whether a release belongs to a channel. Stable
+// uses non-prerelease "v*" tags; nightly and testing use a channel- prefix on
+// prereleases.
+func releaseMatchesChannel(release Release, channel string) bool {
+	switch channel {
+	case "nightly":
+		return release.Prerelease && strings.HasPrefix(release.TagName, "nightly-")
+	case "testing":
+		return release.Prerelease && strings.HasPrefix(release.TagName, "testing-")
+	case "stable":
+		return !release.Prerelease && strings.HasPrefix(release.TagName, "v")
+	default:
+		return strings.HasPrefix(release.TagName, channel+"-")
+	}
+}
+
+// findLatestRelease returns the newest release in a list that carries an image
+// for the variant.
 func (u *Updater) findLatestRelease(releases []Release, variantID, channel string) (Release, bool) {
 	var latestRelease Release
 	found := false
 
 	for _, release := range releases {
-		// Channel-specific filtering logic
-		match := false
-		switch channel {
-		case "nightly":
-			// Nightly: look for prereleases with "nightly-" prefix
-			if release.Prerelease && strings.HasPrefix(release.TagName, "nightly-") {
-				match = true
-			}
-		case "testing":
-			// Testing: look for prereleases with "testing-" prefix
-			if release.Prerelease && strings.HasPrefix(release.TagName, "testing-") {
-				match = true
-			}
-		case "stable":
-			// Stable: look for non-prereleases with "v" prefix (e.g., v1.2.3)
-			if !release.Prerelease && strings.HasPrefix(release.TagName, "v") {
-				match = true
-			}
-		default:
-			// Fallback for unknown channels (legacy behavior: match channel prefix)
-			if strings.HasPrefix(release.TagName, channel+"-") {
-				match = true
-			}
-		}
-
-		if !match {
+		if !releaseMatchesChannel(release, channel) {
 			continue
 		}
 
@@ -4180,21 +4224,7 @@ func (u *Updater) buildDeltaChain(releases []Release, currentVersion, channel, v
 	// Filter and sort releases for our channel and variant
 	var candidateReleases []Release
 	for _, release := range releases {
-		// Check if the release is for the specified channel.
-		// Mirrors findLatestRelease: stable uses non-prerelease "v*" tags,
-		// nightly/testing use prerelease tags with the channel- prefix.
-		match := false
-		switch channel {
-		case "nightly":
-			match = release.Prerelease && strings.HasPrefix(release.TagName, "nightly-")
-		case "testing":
-			match = release.Prerelease && strings.HasPrefix(release.TagName, "testing-")
-		case "stable":
-			match = !release.Prerelease && strings.HasPrefix(release.TagName, "v")
-		default:
-			match = strings.HasPrefix(release.TagName, channel+"-")
-		}
-		if !match {
+		if !releaseMatchesChannel(release, channel) {
 			continue
 		}
 

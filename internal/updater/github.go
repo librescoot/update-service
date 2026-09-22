@@ -58,9 +58,10 @@ func NewGitHubAPI(ctx context.Context, baseURL string, logger Logger) *GitHubAPI
 	}
 }
 
-// GetReleases fetches releases for the given channel with exponential backoff retries.
-// The channel is passed per-call rather than cached so runtime channel switches via
-// Redis settings take effect on the next check without restarting the service.
+// GetReleases fetches the release list for one channel, which is what a delta
+// chain needs: it is built across several releases. Callers that only want the
+// newest release for a channel use the manifest instead, which carries every
+// channel in one document.
 func (g *GitHubAPI) GetReleases(channel string) ([]Release, error) {
 	return g.GetReleasesContext(g.ctx, channel)
 }
@@ -72,21 +73,45 @@ func (g *GitHubAPI) GetReleases(channel string) ([]Release, error) {
 // gets an error as soon as the deadline passes rather than when the ladder
 // runs out.
 func (g *GitHubAPI) GetReleasesContext(ctx context.Context, channel string) ([]Release, error) {
+	var releases []Release
+	if err := g.fetch(ctx, channel+".json", &releases); err != nil {
+		return nil, err
+	}
+	return releases, nil
+}
+
+// GetLatestByChannel fetches latest.json, the newest release of every channel in
+// one document keyed by channel name.
+func (g *GitHubAPI) GetLatestByChannel() (map[string]Release, error) {
+	return g.GetLatestByChannelContext(g.ctx)
+}
+
+// GetLatestByChannelContext is GetLatestByChannel bounded by a caller-supplied
+// context, for the same reason as GetReleasesContext.
+func (g *GitHubAPI) GetLatestByChannelContext(ctx context.Context) (map[string]Release, error) {
+	var manifest map[string]Release
+	if err := g.fetch(ctx, "latest.json", &manifest); err != nil {
+		return nil, err
+	}
+	return manifest, nil
+}
+
+// fetch GETs one release index document with the shared retry ladder.
+func (g *GitHubAPI) fetch(ctx context.Context, name string, out any) error {
 	var (
 		resp      *http.Response
 		err       error
 		backoff   = initialBackoff
 		retries   = 0
-		releases  []Release
 		lastError error
 	)
 
 	// Create the request outside the retry loop
-	url := g.baseURL + "/" + channel + ".json"
+	url := g.baseURL + "/" + name
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -96,7 +121,7 @@ func (g *GitHubAPI) GetReleasesContext(ctx context.Context, channel string) ([]R
 	for retries <= maxRetries {
 		// Check if context is canceled before making the request
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("context canceled: %w", ctx.Err())
+			return fmt.Errorf("context canceled: %w", ctx.Err())
 		}
 
 		// Make the request
@@ -107,8 +132,8 @@ func (g *GitHubAPI) GetReleasesContext(ctx context.Context, channel string) ([]R
 			defer resp.Body.Close()
 
 			// Decode the response
-			if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
-				return nil, fmt.Errorf("failed to decode response: %w", err)
+			if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+				return fmt.Errorf("failed to decode response: %w", err)
 			}
 
 			// If we retried, log success after retries
@@ -116,7 +141,7 @@ func (g *GitHubAPI) GetReleasesContext(ctx context.Context, channel string) ([]R
 				g.logger.Printf("Successfully fetched releases after %d retries", retries)
 			}
 
-			return releases, nil
+			return nil
 		}
 
 		// Handle response cleanup if we got a response but will retry
@@ -151,7 +176,7 @@ func (g *GitHubAPI) GetReleasesContext(ctx context.Context, channel string) ([]R
 		case <-time.After(actualBackoff):
 			// Continue with retry
 		case <-ctx.Done():
-			return nil, fmt.Errorf("context canceled during backoff: %w", ctx.Err())
+			return fmt.Errorf("context canceled during backoff: %w", ctx.Err())
 		}
 
 		// Increase backoff for next attempt (with cap)
@@ -161,5 +186,5 @@ func (g *GitHubAPI) GetReleasesContext(ctx context.Context, channel string) ([]R
 	}
 
 	// If we got here, we've exhausted all retries
-	return nil, fmt.Errorf("failed to fetch releases after %d retries: %w", maxRetries, lastError)
+	return fmt.Errorf("failed to fetch releases after %d retries: %w", maxRetries, lastError)
 }

@@ -3,6 +3,7 @@ package updater
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 )
@@ -46,6 +47,29 @@ func TestCheckCompletesWithNoRelease(t *testing.T) {
 	}
 	if got := setting(mr, "mdb", "last-check-time"); got == "" {
 		t.Error("last-check-time not recorded for a completed check")
+	}
+}
+
+// The check reads latest.json, one fetch carrying every channel; the per-channel
+// list is for delta chains and for the fallback when a variant has no image in
+// the newest release. An empty list with a usable manifest therefore still finds
+// the release.
+func TestCheckUsesTheManifestWithoutTheChannelList(t *testing.T) {
+	manifest := map[string]Release{"stable": {
+		TagName:     "v1.3.0",
+		PublishedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Assets:      []Asset{{Name: "librescoot-unu-mdb-v1.3.0.mender", Size: 401234432, URL: "http://example/mdb.mender"}},
+	}}
+	u, mr := newTestUpdaterForPreviewWithManifest(t, map[string][]Release{"stable": {}}, manifest)
+	mr.HSet("settings", "updates.mdb.channel", "stable")
+	mr.HSet("settings", "updates.mdb.method", "full")
+	mr.HSet("version:mdb", "version_id", "v1.3.0")
+	mr.HSet("version:mdb", "variant_id", "unu-mdb")
+
+	u.checkForUpdates(false)
+
+	if got := setting(mr, "mdb", "last-attempt-result"); got != checkResultUpToDate {
+		t.Errorf("last-attempt-result = %q, want %q", got, checkResultUpToDate)
 	}
 }
 
