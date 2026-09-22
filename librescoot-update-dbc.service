@@ -23,5 +23,16 @@ SyslogIdentifier=update-service-dbc
 ExecStartPre=/bin/mkdir -p /data/ota/dbc
 ExecStartPre=/bin/mkdir -p /data/ota/dbc-boot
 
+# The delta apply decompresses and patches a full ~230 MB image and writes it
+# to eMMC while the dashboard may be rendering mid-ride. This is pure
+# background work: yield the CPU completely and only take disk bandwidth when
+# the device would otherwise be idle, so scootui-qt never stalls behind an
+# update. Nice and ioprio are inherited by the mender-update/xdelta children
+# this process execs.
+Nice=19
+IOSchedulingClass=idle
+# Keep the updater and its children on CPU 0; CPU 1 is the dashboard's.
+CPUAffinity=0
+
 [Install]
 WantedBy=multi-user.target
