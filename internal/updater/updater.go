@@ -2958,14 +2958,12 @@ func (u *Updater) inferChannelFromVersion(version string) string {
 // latestReleaseFor returns the newest release a channel offers for a variant.
 // The manifest carries one release per channel, so when that entry holds no image
 // for this variant, or the gate rolled it back, the channel's release list is
-// fetched: an older release may still carry one. A channel the manifest does not
-// carry at all has nothing on its list either.
+// fetched: an older release may still carry one. A manifest that does not carry
+// the channel at all is treated the same way, so a manifest that has fallen
+// behind or lost a channel does not take the channel down with it.
 func (u *Updater) latestReleaseFor(manifest map[string]Release, channel, variantID string) (Release, bool, error) {
 	if release, found := u.findLatestRelease(u.withoutGateRejectedReleases(manifestReleases(manifest, channel)), variantID, channel); found {
 		return release, true, nil
-	}
-	if _, carried := manifest[channel]; !carried {
-		return Release{}, false, nil
 	}
 
 	releases, err := u.githubAPI.GetReleases(channel)

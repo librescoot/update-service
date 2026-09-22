@@ -50,13 +50,14 @@ func newTestUpdaterForPreviewWithManifest(t *testing.T, index map[string][]Relea
 		}
 
 		// The index is also served as /{channel}.json, matching downloads.librescoot.org.
+		// A channel the index does not carry is an empty list rather than a
+		// missing document, so the fallback is not an error.
 		channel := r.URL.Path
 		channel = channel[1:]                         // strip leading /
 		channel = channel[:len(channel)-len(".json")] // strip extension
 		releases, ok := index[channel]
 		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			return
+			releases = []Release{}
 		}
 		_ = json.NewEncoder(w).Encode(releases)
 	}))
@@ -206,8 +207,42 @@ func TestPreviewChannelFallsBackToTheChannelList(t *testing.T) {
 	}
 }
 
-// A channel the manifest does not carry has nothing to switch to, which is not
-// an error the UI should retry.
+// A manifest that has fallen behind and lost a channel does not take the channel
+// down with it: the channel's own list is still consulted.
+func TestPreviewChannelFallsBackWhenTheManifestOmitsAChannel(t *testing.T) {
+	index := map[string][]Release{
+		"stable": {
+			{
+				TagName:     "v1.3.0",
+				PublishedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+				Assets:      []Asset{{Name: "librescoot-unu-mdb-v1.3.0.mender", Size: 401234432, URL: "http://example/mdb.mender"}},
+			},
+		},
+		"testing": {
+			{
+				TagName:     "testing-20260920T211120",
+				PublishedAt: time.Date(2026, 9, 20, 21, 23, 44, 0, time.UTC),
+				Prerelease:  true,
+				Assets:      []Asset{{Name: "librescoot-unu-mdb-testing-20260920T211120.mender", Size: 228800000, URL: "http://example/mdb.mender"}},
+			},
+		},
+	}
+	manifest := map[string]Release{"stable": index["stable"][0]}
+	u, mr := newTestUpdaterForPreviewWithManifest(t, index, manifest)
+	mr.HSet("version:mdb", "variant_id", "unu-mdb")
+
+	u.previewChannel("testing")
+
+	if got := mr.HGet("ota", "preview-status:mdb"); got != status.PreviewReady {
+		t.Errorf("preview-status:mdb = %q, want %q", got, status.PreviewReady)
+	}
+	if got := mr.HGet("ota", "preview-version:mdb"); got != "testing-20260920T211120" {
+		t.Errorf("preview-version:mdb = %q, want the testing release from the channel list", got)
+	}
+}
+
+// A channel the manifest and the channel list both lack has nothing to switch
+// to, which is not an error the UI should retry.
 func TestPreviewChannel_UnavailableForChannelMissingFromManifest(t *testing.T) {
 	u, mr := newTestUpdaterForPreview(t, stableIndex())
 	mr.HSet("version:mdb", "variant_id", "unu-mdb")
