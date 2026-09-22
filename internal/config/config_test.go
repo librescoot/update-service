@@ -107,30 +107,40 @@ func TestConfig_ApplyRedisUpdate_Budget(t *testing.T) {
 }
 
 func TestConfig_CommitGateDefaults(t *testing.T) {
-	newConfig := func(channel string) *Config {
-		return New("localhost:6379", "https://example.invalid", time.Hour, "mdb", channel, "/data/ota/mdb", false, false, "/uboot", "", 2)
+	newConfig := func(component, channel string) *Config {
+		return New("localhost:6379", "https://example.invalid", time.Hour, component, channel, "/data/ota/"+component, false, false, "/uboot", "", 2)
 	}
 
-	// The gate is proved out on nightly before the other channels get it.
-	if newConfig("nightly").CommitGateSettings().Enabled != true {
-		t.Error("nightly must gate by default")
+	// Nightly MDB updates gate by default; nothing else does yet.
+	if !newConfig("mdb", "nightly").CommitGateSettings().Enabled {
+		t.Error("a nightly MDB must gate by default")
 	}
-	for _, channel := range []string{"stable", "testing"} {
-		if newConfig(channel).CommitGateSettings().Enabled {
-			t.Errorf("%s must not gate by default", channel)
+	for _, component := range []string{"mdb", "dbc"} {
+		for _, channel := range []string{"stable", "testing"} {
+			if newConfig(component, channel).CommitGateSettings().Enabled {
+				t.Errorf("%s on %s must not gate by default", component, channel)
+			}
 		}
 	}
+	if newConfig("dbc", "nightly").CommitGateSettings().Enabled {
+		t.Error("a nightly DBC must not gate by default until a gated DBC update has been observed")
+	}
 
-	// An explicit choice wins over the channel default in both directions.
-	offOnNightly := newConfig("nightly")
+	// An explicit choice wins over the default in both directions.
+	offOnNightly := newConfig("mdb", "nightly")
 	offOnNightly.SetCommitGate(false)
 	if offOnNightly.CommitGateSettings().Enabled {
 		t.Error("an explicit disable must beat the nightly default")
 	}
-	onStable := newConfig("stable")
+	onStable := newConfig("mdb", "stable")
 	onStable.SetCommitGate(true)
 	if !onStable.CommitGateSettings().Enabled {
 		t.Error("an explicit enable must beat the stable default")
+	}
+	onNightlyDBC := newConfig("dbc", "nightly")
+	onNightlyDBC.SetCommitGate(true)
+	if !onNightlyDBC.CommitGateSettings().Enabled {
+		t.Error("an explicit enable must beat the DBC's default")
 	}
 
 	// Clearing the explicit choice hands the decision back to the channel, so
@@ -146,7 +156,7 @@ func TestConfig_CommitGateDefaults(t *testing.T) {
 		t.Error("moving to nightly must enable the gate again")
 	}
 
-	mdb := newConfig("stable")
+	mdb := newConfig("mdb", "stable")
 	mdbGate := mdb.CommitGateSettings()
 	if mdbGate.Floor != DefaultCommitGateFloor {
 		t.Errorf("Floor = %v, want %v", mdbGate.Floor, DefaultCommitGateFloor)

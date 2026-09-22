@@ -134,10 +134,10 @@ type CommitGateSettings struct {
 }
 
 // CommitGateSettings returns the current gate configuration. Absent an explicit
-// choice the release channel decides: nightly gates, stable and testing do not.
+// choice the channel default applies; see defaultCommitGateEnabled.
 func (c *Config) CommitGateSettings() CommitGateSettings {
 	// channelMu before gateMu; nothing takes them the other way round.
-	enabled := c.GetChannel() == "nightly"
+	enabled := defaultCommitGateEnabled(c.Component, c.GetChannel())
 
 	c.gateMu.RLock()
 	defer c.gateMu.RUnlock()
@@ -150,6 +150,13 @@ func (c *Config) CommitGateSettings() CommitGateSettings {
 		Deadline:      c.CommitGateDeadline,
 		RequiredUnits: slices.Clone(c.CommitGateRequiredUnits),
 	}
+}
+
+// defaultCommitGateEnabled is the channel default: nightly MDB updates gate, and
+// nothing else does yet. The DBC stays off until a gated DBC update has been
+// through a real dashboard; no DBC window has run outside a bench.
+func defaultCommitGateEnabled(component, channel string) bool {
+	return component == "mdb" && channel == "nightly"
 }
 
 // SetCommitGate pins the gate to enabled or disabled. A CLI flag or setting
