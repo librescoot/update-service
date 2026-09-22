@@ -1,4 +1,4 @@
-// Package version compares and extracts LibreScoot firmware version strings.
+// Package version compares and extracts Librescoot firmware version strings.
 // Stable versions are bare semver ("v1.0.0"); nightly/testing versions carry a
 // "channel-" prefix with an ISO-timestamp token ("nightly-20251226T091616").
 package version
