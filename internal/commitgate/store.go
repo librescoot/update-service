@@ -5,10 +5,9 @@
 // systemd, and a rollback is only landed by the bootloader on the next boot.
 // Two documents are kept, with different lifetimes:
 //
-//   - the marker, one per attempt. It records which artifact is waiting, which
-//     boot began the wait, and whether a rollback has already been attempted
-//     for it. A restart resumes an existing marker, and a second boot that
-//     presents the same artifact is a failure rather than more time to wait.
+//   - the marker, one per attempt: which artifact is waiting, which boot the
+//     window is in, how long the gate has evaluated it, and whether a rollback
+//     was already attempted. A restart or a reboot resumes it.
 //   - the quarantine, one list per component. It records artifacts a rollback
 //     already rejected, so the next startup does not reinstall the image the
 //     gate just discarded.
@@ -39,15 +38,15 @@ const (
 type Marker struct {
 	Artifact       string `json:"artifact"`
 	PendingVersion string `json:"pending_version,omitempty"`
-	// BootID is the kernel boot ID the wait started in. The window is scoped to
-	// a single boot: an uncommitted slot is reverted by the bootloader on the
-	// next boot attempt, so a different boot ID means this is no longer the
-	// same activation.
+	// BootID is the kernel boot ID the window is running in. A window can span
+	// boots: the component comes back on the same artifact and adopts the new one.
 	BootID string `json:"boot_id"`
-	// FirstSeen is when this attempt began waiting, monotonic within the boot
-	// that wrote it. It is never rewritten by a service restart, so a crash
-	// loop cannot extend the window.
+	// FirstSeen is when the attempt began waiting. It is never rewritten.
 	FirstSeen time.Time `json:"first_seen"`
+	// Waiting is how long the gate has evaluated this attempt with the component
+	// up. The deadline is measured against it, not against the clock, so
+	// powered-off time does not count against an update.
+	Waiting time.Duration `json:"waiting,omitempty"`
 	// RollbackAttempted is set before asking Mender to roll back. On the next
 	// boot it distinguishes "the rollback did not land" from a fresh attempt,
 	// which is what stops the gate from rebooting forever.

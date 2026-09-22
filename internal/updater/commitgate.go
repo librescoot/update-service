@@ -155,15 +155,13 @@ func (u *Updater) reconcileCommitGate() (*GatedCommit, bool, error) {
 			return nil, true, u.finalizeStuckGate(marker,
 				"the image is still running after a requested rollback")
 		}
-		// The component rebooted while the window was open: a power cycle, a
-		// crash, or someone turning the vehicle off and straight back on. That is
-		// not a verdict about the image, and a quick off-and-on must not cost a
-		// good update, so adopt this boot and keep waiting. What bounds the
-		// attempt is the deadline, which still runs from when the window opened.
+		// A reboot while the window is open is a power cycle or a crash, not a
+		// verdict: adopt this boot and keep waiting. The deadline, which counts
+		// only time the gate runs, is what bounds the attempt.
 		u.logger.Printf("Commit gate window for %s continues across a reboot", marker.Artifact)
 		marker.BootID = bootID
 		marker.UpdatedAt = u.gateClock()
-		if err := u.saveGateMarker(marker); err != nil {
+		if err := u.recordGateWindow(marker); err != nil {
 			return nil, false, u.pendingCommitError(fmt.Errorf("record the rebooted commit gate window: %w", err))
 		}
 	}
@@ -264,12 +262,13 @@ func (u *Updater) runCommitGate(gated *GatedCommit) {
 		return
 	}
 
-	deadline := marker.FirstSeen.Add(u.config.CommitGateSettings().Deadline)
+	deadline := gateDeadline(marker, u.config.CommitGateSettings(), u.gateClock())
 	u.logger.Printf("Commit gate waiting on %s until %s", gated.Artifact, deadline.Format(time.RFC3339))
 	u.publishGateWaiting(marker, deadline, "")
 
 	ticker := time.NewTicker(commitGateTick)
 	defer ticker.Stop()
+	persisted := marker.Waiting.Truncate(time.Minute)
 	for {
 		if u.commitGateStep(&marker, gated) {
 			return
@@ -279,7 +278,32 @@ func (u *Updater) runCommitGate(gated *GatedCommit) {
 			return
 		case <-ticker.C:
 		}
+		persisted = u.accrueGateWait(&marker, persisted)
 	}
+}
+
+// accrueGateWait adds one tick to the window and writes the marker at most once
+// per minute. A restart loses at most the part of a minute not yet written.
+func (u *Updater) accrueGateWait(marker *commitgate.Marker, persisted time.Duration) time.Duration {
+	marker.Waiting += commitGateTick
+	if marker.Waiting.Truncate(time.Minute) == persisted {
+		return persisted
+	}
+	persisted = marker.Waiting.Truncate(time.Minute)
+	marker.UpdatedAt = u.gateClock()
+	if err := u.saveGateMarker(*marker); err != nil {
+		u.logger.Printf("Commit gate cannot record its waiting time: %v", err)
+	}
+	return persisted
+}
+
+// gateDeadline returns when the window runs out of evaluating time.
+func gateDeadline(marker commitgate.Marker, cfg config.CommitGateSettings, now time.Time) time.Time {
+	remaining := cfg.Deadline - marker.Waiting
+	if remaining < 0 {
+		remaining = 0
+	}
+	return now.Add(remaining)
 }
 
 // openGateMarker loads the marker this window is running under, creating it when
@@ -306,10 +330,34 @@ func (u *Updater) openGateMarker(gated *GatedCommit) (commitgate.Marker, error) 
 		FirstSeen:      u.gateClock(),
 		Verdict:        commitgate.VerdictWaiting,
 	}
-	if err := u.saveGateMarker(marker); err != nil {
+	if err := u.recordGateWindow(marker); err != nil {
 		return commitgate.Marker{}, err
 	}
 	return marker, nil
+}
+
+// recordGateWindow saves the marker for a boot joining the window, then holds the
+// trial boot. Save first: a window the gate cannot record must not hold it.
+func (u *Updater) recordGateWindow(marker commitgate.Marker) error {
+	if err := u.saveGateMarker(marker); err != nil {
+		return err
+	}
+	u.holdTrialBoot()
+	return nil
+}
+
+// holdTrialBoot resets U-Boot's boot counter so a reboot during the window does
+// not revert the pending artifact. U-Boot reverts an uncommitted slot once
+// bootcount passes bootlimit, and this window runs for minutes; a boot that
+// cannot run the gate never reaches here and is still reverted.
+func (u *Updater) holdTrialBoot() {
+	hold := u.gateTrialBoot
+	if hold == nil {
+		hold = func() error { return holdBootCountCommand().Run() }
+	}
+	if err := hold(); err != nil {
+		u.logger.Printf("Commit gate cannot hold the trial boot: %v", err)
+	}
 }
 
 // commitGateStep evaluates the probes once and acts on the outcome. done reports
@@ -345,9 +393,8 @@ func (u *Updater) commitGateStep(marker *commitgate.Marker, gated *GatedCommit) 
 
 	if name, detail := firstFailingProbe(probes); name != "" {
 		failing := fmt.Sprintf("%s: %s", name, detail)
-		deadline := marker.FirstSeen.Add(cfg.Deadline)
-		u.publishGateWaiting(*marker, deadline, failing)
-		if !u.gateClock().Before(deadline) {
+		u.publishGateWaiting(*marker, gateDeadline(*marker, cfg, u.gateClock()), failing)
+		if marker.Waiting >= cfg.Deadline {
 			u.rollbackGatedUpdate(*marker, fmt.Sprintf("no health verdict within %v: %s", cfg.Deadline, failing))
 			return true
 		}

@@ -53,10 +53,11 @@ type Updater struct {
 	// Commit gate. gateEvaluate is nil in production and falls back to
 	// evaluateCommitGateProbes; the gate tests substitute it, as they do
 	// observeUpdate and runningVersion above.
-	gateStore    *commitgate.Store
-	gateEvaluate func(config.CommitGateSettings) []gateProbeResult
-	gateNow      func() time.Time
-	gateReboot   func() error
+	gateStore     *commitgate.Store
+	gateEvaluate  func(config.CommitGateSettings) []gateProbeResult
+	gateNow       func() time.Time
+	gateReboot    func() error
+	gateTrialBoot func() error
 
 	// gateWindow guards gateWindowOpen, which is true while the gate is
 	// evaluating a pending artifact. Commands that would install on top of it
@@ -4030,6 +4031,11 @@ func (u *Updater) TriggerBootReboot(component string, manual bool) error {
 // transaction to finish. A blocking `systemctl reboot` is normally terminated
 // by systemd while the machine is shutting down, which exec.Cmd reports as a
 // command failure even though the reboot was accepted.
+// holdBootCountCommand resets U-Boot's boot counter; see holdTrialBoot.
+func holdBootCountCommand() *exec.Cmd {
+	return exec.Command("fw_setenv", "bootcount", "0")
+}
+
 func localRebootCommand() *exec.Cmd {
 	return exec.Command("systemctl", "--no-block", "reboot")
 }

@@ -45,6 +45,7 @@ type gateHarness struct {
 	commits    int
 	rollbacks  int
 	reboots    int
+	trialBoots int
 	bootID     string
 	running    string
 	committed  string
@@ -102,7 +103,11 @@ func newGateHarnessFor(t *testing.T, component string, opts ...func(*gateHarness
 			return h.probes
 		},
 		gateReboot: func() error { h.reboots++; return nil },
-		bootID:     func() (string, error) { return h.bootID, nil },
+		gateTrialBoot: func() error {
+			h.trialBoots++
+			return nil
+		},
+		bootID: func() (string, error) { return h.bootID, nil },
 		runningVersion: func() (string, error) {
 			return h.running, h.runningErr
 		},
@@ -259,14 +264,16 @@ func TestCommitGateDeadlineRollsBackAndReboots(t *testing.T) {
 		BootID: gateBootA, FirstSeen: h.now, Verdict: commitgate.VerdictWaiting,
 	}
 
-	// Just short of the deadline: still waiting.
-	h.now = h.now.Add(config.DefaultCommitGateDeadline - time.Second)
+	// Just short of the deadline: still waiting, however long the wall clock
+	// says the window has been open.
+	h.now = h.now.Add(12 * time.Hour)
+	marker.Waiting = config.DefaultCommitGateDeadline - time.Second
 	if done := h.updater.commitGateStep(&marker, h.gated()); done {
 		t.Fatal("the gate reached a verdict before its deadline")
 	}
 
 	// At the deadline: fail closed.
-	h.now = h.now.Add(time.Second)
+	marker.Waiting = config.DefaultCommitGateDeadline
 	if done := h.updater.commitGateStep(&marker, h.gated()); !done {
 		t.Fatal("the gate did not reach a verdict at its deadline")
 	}
@@ -337,7 +344,8 @@ func TestOpenGateMarkerResumesWithoutExtendingTheDeadline(t *testing.T) {
 	firstSeen := h.now.Add(-19 * time.Minute)
 	if err := h.store.Save(commitgate.Marker{
 		Artifact: gateArtifact, PendingVersion: gateVersion,
-		BootID: gateBootA, FirstSeen: firstSeen, Verdict: commitgate.VerdictWaiting,
+		BootID: gateBootA, FirstSeen: firstSeen, Waiting: 19 * time.Minute,
+		Verdict: commitgate.VerdictWaiting,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -349,10 +357,14 @@ func TestOpenGateMarkerResumesWithoutExtendingTheDeadline(t *testing.T) {
 	if !marker.FirstSeen.Equal(firstSeen) {
 		t.Fatalf("FirstSeen = %v, want the original %v", marker.FirstSeen, firstSeen)
 	}
+	if marker.Waiting != 19*time.Minute {
+		t.Fatalf("Waiting = %v, want the 19m already spent", marker.Waiting)
+	}
 
-	// One minute later the deadline has passed, so the resumed window fails
-	// closed rather than starting a fresh twenty minutes.
+	// The minute this boot has already waited reaches the deadline, so the
+	// resumed window fails closed rather than starting a fresh twenty minutes.
 	h.now = h.now.Add(time.Minute)
+	marker.Waiting += time.Minute
 	h.markStatusPendingReboot(t)
 	h.probes = failingProbe(allGateProbesPassing(), gateProbeUnits, "librescoot-pm.service is not active")
 	if done := h.updater.commitGateStep(&marker, h.gated()); !done {
@@ -485,18 +497,22 @@ func TestRebootDuringTheWindowResumesIt(t *testing.T) {
 	if h.commits != 1 {
 		t.Fatalf("commit calls = %d, want 1", h.commits)
 	}
+	// The boot that rejoins the window takes over holding the trial boot.
+	if h.trialBoots != 1 {
+		t.Errorf("trial boot holds = %d, want 1", h.trialBoots)
+	}
 }
 
-// A reboot does not extend the window either: the deadline runs from when it
-// opened, so an image that never earns its verdict across reboots still fails
-// closed.
+// A reboot does not extend the window: the deadline is evaluating time, so an
+// image that never earns its verdict still fails closed.
 func TestRebootPastTheDeadlineRollsBack(t *testing.T) {
 	h := newGateHarness(t)
 	h.markStatusPendingReboot(t)
 	h.bootID = gateBootB
 	if err := h.store.Save(commitgate.Marker{
 		Artifact: gateArtifact, PendingVersion: gateVersion,
-		BootID: gateBootA, FirstSeen: h.now.Add(-time.Hour), Verdict: commitgate.VerdictWaiting,
+		BootID: gateBootA, FirstSeen: h.now.Add(-time.Hour),
+		Waiting: config.DefaultCommitGateDeadline, Verdict: commitgate.VerdictWaiting,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -525,6 +541,63 @@ func TestRebootPastTheDeadlineRollsBack(t *testing.T) {
 	}
 	if quarantined, err := h.store.Quarantined(gateArtifact); err != nil || !quarantined {
 		t.Errorf("Quarantined(%s) = %v (err %v), want true", gateArtifact, quarantined, err)
+	}
+}
+
+// A day powered off must not fail a window the gate never got to evaluate.
+func TestWindowWaitsOnlyWhileTheComponentIsUp(t *testing.T) {
+	h := newGateHarness(t)
+	h.markStatusPendingReboot(t)
+	h.probes = failingProbe(allGateProbesPassing(), gateProbeUptime, "up to 10s, need 3m0s")
+	marker := commitgate.Marker{
+		Artifact: gateArtifact, PendingVersion: gateVersion,
+		BootID: gateBootA, FirstSeen: h.now, Waiting: time.Minute,
+		Verdict: commitgate.VerdictWaiting,
+	}
+
+	h.now = h.now.Add(24 * time.Hour)
+	if done := h.updater.commitGateStep(&marker, h.gated()); done {
+		t.Fatal("a powered-off gap counted against the window")
+	}
+	wantDeadline := h.now.Add(config.DefaultCommitGateDeadline - time.Minute).UTC().Format(time.RFC3339)
+	if got := h.gateField("commit-gate-deadline:mdb"); got != wantDeadline {
+		t.Errorf("commit-gate-deadline:mdb = %q, want the remaining budget %q", got, wantDeadline)
+	}
+
+	// The gate's own accumulation reaches the deadline, and is written down for
+	// the next restart.
+	persisted := time.Duration(0)
+	for i := 0; i < 4; i++ {
+		persisted = h.updater.accrueGateWait(&marker, persisted)
+	}
+	if marker.Waiting != time.Minute+4*commitGateTick {
+		t.Errorf("Waiting = %v, want one minute of ticks", marker.Waiting)
+	}
+	saved, err := h.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Waiting != 2*time.Minute {
+		t.Errorf("persisted Waiting = %v, want the whole minute reached", saved.Waiting)
+	}
+}
+
+// A boot joining the window holds the trial boot; a restart inside the same boot
+// resumes the recorded window and does not rewrite it.
+func TestOpeningAWindowHoldsTheTrialBoot(t *testing.T) {
+	h := newGateHarness(t)
+	if _, err := h.updater.openGateMarker(h.gated()); err != nil {
+		t.Fatal(err)
+	}
+	if h.trialBoots != 1 {
+		t.Fatalf("trial boot holds = %d, want 1 after recording a window", h.trialBoots)
+	}
+
+	if _, err := h.updater.openGateMarker(h.gated()); err != nil {
+		t.Fatal(err)
+	}
+	if h.trialBoots != 1 {
+		t.Errorf("trial boot holds = %d, want 1: a restart inside the same boot must not re-hold", h.trialBoots)
 	}
 }
 
@@ -703,6 +776,10 @@ func TestCommitGateHoldsWhenTheMarkerCannotBeWritten(t *testing.T) {
 	}
 	if got := h.gateField("commit-gate:mdb"); got != gateErrorHeld {
 		t.Errorf("commit-gate:mdb = %q, want %q", got, gateErrorHeld)
+	}
+	// The window was never recorded, so it must not hold the trial boot either.
+	if h.trialBoots != 0 {
+		t.Errorf("trial boot holds = %d, want 0", h.trialBoots)
 	}
 }
 
