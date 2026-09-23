@@ -67,7 +67,7 @@ type Updater struct {
 	gateWindowOpen   bool
 	backoff          *backoff.Store
 	status           *status.Reporter
-	bootUpdater      *boot.BootUpdater  // nil if --boot-update not set
+	bootUpdater      boot.Updater       // nil if --boot-update not set
 	bootStatus       *status.Reporter   // reporter for "{component}-boot" keys
 	dbcStatus        *status.Reporter   // reporter for "dbc" keys (MDB-only, for clearing stale DBC state)
 	flatMirror       *status.FlatMirror // mirrors mdb+dbc status into the flat pair (MDB-only)
@@ -151,7 +151,7 @@ func (u *Updater) installMender(path string) error {
 }
 
 // New creates a new component-aware updater
-func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inhibitorClient *inhibitor.Client, powerClient *power.Client, bootUpdater *boot.BootUpdater, logger *log.Logger) *Updater {
+func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inhibitorClient *inhibitor.Client, powerClient *power.Client, bootUpdater boot.Updater, logger *log.Logger) *Updater {
 	updaterCtx, cancel := context.WithCancel(ctx)
 
 	// Determine download directory

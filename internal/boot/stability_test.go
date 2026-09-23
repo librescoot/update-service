@@ -107,7 +107,8 @@ type ioState struct {
 	locks                                                []bool
 	compareErr, verifyErr, syncErr, unlockErr, relockErr bool
 	corrupt, shortWrite                                  bool
-	size                                                 uint64
+	partStartErr                                         error
+	size, partStart                                      uint64
 }
 type testRegion struct {
 	*os.File
@@ -171,6 +172,7 @@ func testUpdater(t *testing.T, data []byte) (*BootUpdater, string, *ioState) {
 			}
 			return nil
 		},
+		partitionStart: func(string) (uint64, error) { return state.partStart, state.partStartErr },
 	}
 	return b, dir, state
 }
@@ -304,7 +306,7 @@ func TestBootTargetRejections(t *testing.T) {
 			t.Fatal("opened target for invalid seek")
 		}
 	}
-	for _, path := range []string{"/dev/mmcblk3", "/dev/mmcblk3p1", "/dev/mmcblk3boot1", "/tmp/target", "/dev/../dev/mmcblk3boot0"} {
+	for _, path := range []string{"/dev/mmcblk3p1", "/dev/mmcblk3boot1", "/tmp/target", "/dev/../dev/mmcblk3boot0"} {
 		b, dir, s := testUpdater(t, representativeIMX(false))
 		b.bootDevice = path
 		if err := b.Apply(context.Background(), dir); err == nil {
@@ -313,7 +315,7 @@ func TestBootTargetRejections(t *testing.T) {
 		if s.opens != 0 {
 			t.Fatal("opened unsupported target")
 		}
-		if New("", path, 2, nil).forceROPath != "" {
+		if New("", path, 2, nil).forceROPath() != "" {
 			t.Fatal("invented force_ro path")
 		}
 	}

@@ -16,48 +16,72 @@ import (
 
 const LocalAssetsPath = "/usr/share/boot-assets"
 
-// BootUpdater verifies and updates U-Boot in the configured boot0 region.
+// BootUpdater verifies and updates U-Boot in the region the boot ROM reads.
+// The device path alone decides that region, so a target cannot drift from the
+// kind it was classified as.
 type BootUpdater struct {
-	mountPoint  string // e.g. /uboot — retained only to locate the eMMC device
-	bootDevice  string // e.g. /dev/mmcblk3boot0
-	forceROPath string // e.g. /sys/block/mmcblk3boot0/force_ro
-	ubootSeek   int64  // 512-byte blocks to skip before writing U-Boot (default 2)
-	logger      *log.Logger
-	io          bootIO
+	mountPoint string // e.g. /uboot — retained only to locate the eMMC device
+	bootDevice string // e.g. /dev/mmcblk3boot0, or /dev/mmcblk3 for the user area
+	ubootSeek  int64  // 512-byte blocks to skip before writing U-Boot (default 2)
+	logger     *log.Logger
+	io         bootIO
 }
 
 // New creates a BootUpdater from the given parameters.
 func New(mountPoint, bootDevice string, ubootSeek int64, logger *log.Logger) *BootUpdater {
-	forceROPath := ""
-	if supportedBootDevice(bootDevice) {
-		// /dev/mmcblk3boot0 → /sys/block/mmcblk3boot0/force_ro
-		dev := strings.TrimPrefix(bootDevice, "/dev/")
-		forceROPath = "/sys/block/" + dev + "/force_ro"
-	}
 	return &BootUpdater{
-		mountPoint:  mountPoint,
-		bootDevice:  bootDevice,
-		forceROPath: forceROPath,
-		ubootSeek:   ubootSeek,
-		logger:      logger,
-		io:          systemBootIO(),
+		mountPoint: mountPoint,
+		bootDevice: bootDevice,
+		ubootSeek:  ubootSeek,
+		logger:     logger,
+		io:         systemBootIO(),
 	}
+}
+
+// forceROPath is the sysfs write-protect switch of a boot partition target, and
+// empty for a target without one, such as the eMMC user area.
+func (b *BootUpdater) forceROPath() string {
+	if kind, ok := kindOfDevicePath(b.bootDevice); !ok || kind != regionBootPartition {
+		return ""
+	}
+	// /dev/mmcblk3boot0 → /sys/block/mmcblk3boot0/force_ro
+	return "/sys/block/" + strings.TrimPrefix(b.bootDevice, "/dev/") + "/force_ro"
 }
 
 // DetectBootDevice reads /proc/mounts, finds the device mounted at mountPoint,
 // strips the trailing partition number (p1), and appends "boot0".
-// E.g.: /dev/mmcblk3p1 → /dev/mmcblk3boot0
+// E.g.: /dev/mmcblk3p1 → /dev/mmcblk3boot0. Only boards whose ROM reads eMMC
+// boot partition 1 boot from that target; use ResolveBootDevice to pick one.
 func DetectBootDevice(mountPoint string) (string, error) {
+	base, err := StorageDevice(mountPoint)
+	if err != nil {
+		return "", err
+	}
+	return base + "boot0", nil
+}
+
+// StorageDevice reads /proc/mounts and returns the whole block device holding
+// the filesystem mounted at mountPoint: /dev/mmcblk3p1 → /dev/mmcblk3.
+func StorageDevice(mountPoint string) (string, error) {
 	f, err := os.Open("/proc/mounts")
 	if err != nil {
 		return "", fmt.Errorf("open /proc/mounts: %w", err)
 	}
 	defer f.Close()
-	return detectFromReader(f, mountPoint)
+	return storageDeviceFromReader(f, mountPoint)
 }
 
 // detectFromReader is the testable core of DetectBootDevice.
 func detectFromReader(r io.Reader, mountPoint string) (string, error) {
+	base, err := storageDeviceFromReader(r, mountPoint)
+	if err != nil {
+		return "", err
+	}
+	return base + "boot0", nil
+}
+
+// storageDeviceFromReader is the testable core of StorageDevice.
+func storageDeviceFromReader(r io.Reader, mountPoint string) (string, error) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
@@ -85,7 +109,7 @@ func detectFromReader(r io.Reader, mountPoint string) (string, error) {
 				base = candidate
 			}
 		}
-		return base + "boot0", nil
+		return base, nil
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -125,7 +149,7 @@ func (b *BootUpdater) Apply(ctx context.Context, extractDir string) error {
 		return err
 	}
 	imxPath := extractDir + "/" + UBootPath
-	b.logger.Printf("[boot] writing U-Boot: %s → %s", imxPath, b.bootDevice)
+	b.logger.Printf("[boot] writing U-Boot: %s → %s (%s)", imxPath, b.bootDevice, RegionKind(b.bootDevice))
 	if err := b.writeUBoot(ctx, imxPath); err != nil {
 		return fmt.Errorf("write U-Boot: %w", err)
 	}
@@ -174,8 +198,22 @@ func (b *BootUpdater) validateWrite(data []byte) (int64, uint64, error) {
 	if offset != 1024 {
 		return 0, 0, fmt.Errorf("unsupported U-Boot offset %d (expected 1024)", offset)
 	}
-	if !supportedBootDevice(b.bootDevice) {
-		return 0, 0, fmt.Errorf("unsupported boot region %q: only /dev/mmcblkNboot0 is supported", b.bootDevice)
+	switch kind, ok := kindOfDevicePath(b.bootDevice); {
+	case !ok:
+		return 0, 0, fmt.Errorf("unsupported boot region %q: expected /dev/mmcblkNboot0 or /dev/mmcblkN", b.bootDevice)
+	case kind == regionUserArea:
+		// A raw write into the eMMC user area shares the device with the
+		// partitions. It is only safe inside the gap ahead of the first one.
+		if b.io.partitionStart == nil {
+			return 0, 0, fmt.Errorf("no partition lookup available for %s", b.bootDevice)
+		}
+		start, err := b.io.partitionStart(b.bootDevice)
+		if err != nil {
+			return 0, 0, fmt.Errorf("locate the first partition of %s: %w", b.bootDevice, err)
+		}
+		if uint64(offset) > start || extent > start-uint64(offset) {
+			return 0, 0, fmt.Errorf("U-Boot would reach into the first partition at byte %d of %s", start, b.bootDevice)
+		}
 	}
 	return offset, extent, nil
 }
@@ -228,13 +266,16 @@ func (b *BootUpdater) writeUBoot(ctx context.Context, imxPath string) (result er
 	}
 
 	// Even a failed unlock may have changed sysfs; always attempt to re-lock.
-	defer func() {
-		if err := b.io.setReadOnly(b.forceROPath, true); err != nil {
-			result = errors.Join(result, fmt.Errorf("re-lock boot region: %w", err))
+	// The user area has no force_ro gate to open or close.
+	if path := b.forceROPath(); path != "" {
+		defer func() {
+			if err := b.io.setReadOnly(path, true); err != nil {
+				result = errors.Join(result, fmt.Errorf("re-lock boot region: %w", err))
+			}
+		}()
+		if err := b.io.setReadOnly(path, false); err != nil {
+			return fmt.Errorf("unlock boot region: %w", err)
 		}
-	}()
-	if err := b.io.setReadOnly(b.forceROPath, false); err != nil {
-		return fmt.Errorf("unlock boot region: %w", err)
 	}
 
 	f, err := b.openRegion(os.O_RDWR, offset, extent)

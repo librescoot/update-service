@@ -203,18 +203,21 @@ func main() {
 	inhibitorClient := inhibitor.New(redisClient.GetClient(), logger)
 	powerClient := power.New(redisClient.GetClient(), logger)
 
-	var bootUpdater *boot.BootUpdater
+	var bootUpdater boot.Updater
 	if cfg.BootEnabled {
+		devices := []string{cfg.BootDevice}
 		if cfg.BootDevice == "" {
-			detected, err := boot.DetectBootDevice(cfg.BootMountPoint)
+			detected, err := boot.BootTargets(*component, cfg.BootMountPoint)
 			if err != nil {
-				logger.Fatalf("Failed to detect boot device from %s: %v", cfg.BootMountPoint, err)
+				logger.Fatalf("Failed to resolve the boot regions from %s: %v", cfg.BootMountPoint, err)
 			}
-			cfg.BootDevice = detected
+			devices = detected
 		}
-		bootUpdater = boot.New(cfg.BootMountPoint, cfg.BootDevice, cfg.BootUBootSeek, logger)
-		logger.Printf("Boot updater: device=%s (U-Boot only; kernel and dtb ship in the rootfs)", cfg.BootDevice)
-
+		bootUpdater = boot.NewTargets(cfg.BootMountPoint, devices, cfg.BootUBootSeek, logger)
+		for _, device := range devices {
+			logger.Printf("Boot updater: device=%s, region=%s", device, boot.RegionKind(device))
+		}
+		logger.Printf("Boot updater: U-Boot only; kernel and dtb ship in the rootfs")
 	}
 
 	updater := updater.New(ctx, cfg, redisClient, inhibitorClient, powerClient, bootUpdater, logger)

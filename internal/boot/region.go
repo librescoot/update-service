@@ -24,21 +24,76 @@ type regionFile interface {
 }
 
 type bootIO struct {
-	open        func(string, int) (regionFile, error)
-	inspect     func(regionFile, string) (uint64, error)
-	setReadOnly func(string, bool) error
+	open           func(string, int) (regionFile, error)
+	inspect        func(regionFile, string) (uint64, error)
+	setReadOnly    func(string, bool) error
+	partitionStart func(string) (uint64, error)
 }
 
-var boot0Name = regexp.MustCompile(`^/dev/mmcblk[0-9]+boot0$`)
+// Only boot partition 1 is a target: it is the one the MDB's ROM reads. The
+// second boot partition exists on the hardware but nothing boots from it.
+var (
+	bootPartitionName = regexp.MustCompile(`^/dev/mmcblk[0-9]+boot0$`)
+	wholeDeviceName   = regexp.MustCompile(`^/dev/mmcblk[0-9]+$`)
+)
 
-func supportedBootDevice(path string) bool { return boot0Name.MatchString(path) }
+// kindOfDevicePath classifies a U-Boot write target by its device path.
+func kindOfDevicePath(path string) (TargetKind, bool) {
+	switch {
+	case bootPartitionName.MatchString(path):
+		return regionBootPartition, true
+	case wholeDeviceName.MatchString(path):
+		return regionUserArea, true
+	}
+	return regionUnknown, false
+}
+
+// firstPartitionStart returns the byte offset of the earliest partition on a
+// whole block device. A U-Boot image written into the user area has to fit in
+// the gap ahead of it.
+func firstPartitionStart(device string) (uint64, error) {
+	name := strings.TrimPrefix(device, "/dev/")
+	base := "/sys/class/block/" + name
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return 0, fmt.Errorf("read %s: %w", base, err)
+	}
+	prefix := name + "p"
+	start := uint64(0)
+	found := false
+	for _, entry := range entries {
+		part := entry.Name()
+		if !strings.HasPrefix(part, prefix) {
+			continue
+		}
+		if _, err := strconv.ParseUint(strings.TrimPrefix(part, prefix), 10, 32); err != nil {
+			continue
+		}
+		raw, err := os.ReadFile(base + "/" + part + "/start")
+		if err != nil {
+			return 0, fmt.Errorf("read %s start: %w", part, err)
+		}
+		value, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+		if err != nil || value > math.MaxInt64/512 {
+			return 0, fmt.Errorf("invalid start sector %q for %s", raw, part)
+		}
+		if bytes := value * 512; !found || bytes < start {
+			start, found = bytes, true
+		}
+	}
+	if !found {
+		return 0, fmt.Errorf("no partitions found on %s", device)
+	}
+	return start, nil
+}
 
 func systemBootIO() bootIO {
 	return bootIO{
 		open: func(path string, flags int) (regionFile, error) {
 			return os.OpenFile(path, flags|syscall.O_NOFOLLOW, 0)
 		},
-		inspect: inspectRegion,
+		inspect:        inspectRegion,
+		partitionStart: firstPartitionStart,
 		setReadOnly: func(path string, ro bool) error {
 			f, err := os.OpenFile(path, os.O_WRONLY, 0)
 			if err != nil {
@@ -58,9 +113,9 @@ func systemBootIO() bootIO {
 }
 
 // Check the opened descriptor, not just its pathname. sysfs identifies the
-// kernel's boot0 region and its capacity; ioctl independently checks capacity.
+// kernel's boot region and its capacity; ioctl independently checks capacity.
 func inspectRegion(f regionFile, path string) (uint64, error) {
-	if !supportedBootDevice(path) {
+	if _, ok := kindOfDevicePath(path); !ok {
 		return 0, fmt.Errorf("unsupported boot region %q", path)
 	}
 	info, err := f.Stat()
