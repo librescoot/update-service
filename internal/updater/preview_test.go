@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	ipc "github.com/librescoot/redis-ipc"
 
 	"github.com/librescoot/update-service/internal/config"
+	"github.com/librescoot/update-service/internal/mender"
 	"github.com/librescoot/update-service/internal/redis"
 	"github.com/librescoot/update-service/internal/status"
 	"github.com/librescoot/update-service/internal/version"
@@ -287,6 +289,60 @@ func TestPreviewChannel_RejectsInvalidChannel(t *testing.T) {
 
 // A preview must not disturb an update already in flight: it writes preview-*
 // fields and nothing else.
+func TestPreviewChannel_PlannedDownload(t *testing.T) {
+	index := map[string][]Release{"testing": {
+		{TagName: "testing-20260926T000000", Prerelease: true, PublishedAt: time.Date(2026, 9, 26, 0, 0, 0, 0, time.UTC), Assets: []Asset{
+			{Name: "librescoot-unu-mdb-testing-20260926T000000.mender", Size: 200000000},
+		}},
+		{TagName: "testing-20260927T000000", Prerelease: true, PublishedAt: time.Date(2026, 9, 27, 0, 0, 0, 0, time.UTC), Assets: []Asset{
+			{Name: "librescoot-unu-mdb-testing-20260927T000000.mender", Size: 220000000},
+			{Name: "librescoot-unu-mdb-testing-20260927T000000.delta", Size: 14000000},
+		}},
+	}}
+	for _, tt := range []struct {
+		name, installed, method string
+		base                    bool
+		wantMethod, wantSize    string
+	}{
+		{"delta base present", "testing-20260926t000000", "delta", true, "delta", "14000000"},
+		{"base missing", "testing-20260926t000000", "delta", false, "full", "220000000"},
+		{"full configured", "testing-20260926t000000", "full", true, "full", "220000000"},
+		{"already current", "testing-20260927t000000", "delta", false, "none", "0"},
+		{"switching channels", "nightly-20260926t000000", "delta", true, "full", "220000000"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			u, mr := newTestUpdaterForPreview(t, index)
+			dir := t.TempDir()
+			u.mender = mender.NewManager(dir, nil, log.New(os.Stdout, "test: ", 0))
+			if tt.base {
+				path := filepath.Join(dir, "librescoot-unu-mdb-testing-20260926T000000.mender")
+				if err := os.WriteFile(path, []byte("base"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mr.HSet("version:mdb", "variant_id", "unu-mdb")
+			mr.HSet("version:mdb", "version_id", tt.installed)
+			mr.HSet("settings", "updates.mdb.channel", "testing")
+			mr.HSet("settings", "updates.mdb.method", tt.method)
+
+			u.previewChannel("testing")
+
+			if got := mr.HGet("ota", "preview-status:mdb"); got != status.PreviewReady {
+				t.Errorf("preview status = %q", got)
+			}
+			if got := mr.HGet("ota", "preview-size:mdb"); got != "220000000" {
+				t.Errorf("full image size = %q", got)
+			}
+			if got := mr.HGet("ota", "preview-method:mdb"); got != tt.wantMethod {
+				t.Errorf("download method = %q, want %q", got, tt.wantMethod)
+			}
+			if got := mr.HGet("ota", "preview-download-size:mdb"); got != tt.wantSize {
+				t.Errorf("download size = %q, want %q", got, tt.wantSize)
+			}
+		})
+	}
+}
+
 func TestPreviewChannel_LeavesUpdateStatusAlone(t *testing.T) {
 	u, mr := newTestUpdaterForPreview(t, stableIndex())
 	mr.HSet("version:mdb", "variant_id", "unu-mdb")

@@ -424,19 +424,21 @@ func (r *Reporter) Initialize(ctx context.Context, updateMethod string) error {
 	// to this channel fetch right now", so one left over from before a restart
 	// is not an answer, it is a guess with a plausible shape.
 	m := map[string]any{
-		r.key("status"):            string(StatusIdle),
-		r.key("update-method"):     updateMethod,
-		r.key("download-progress"): "",
-		r.key("download-bytes"):    "",
-		r.key("download-total"):    "",
-		r.key("install-progress"):  "",
-		r.key("error"):             "",
-		r.key("error-message"):     "",
-		r.key("error-event"):       "",
-		r.key("preview-channel"):   "",
-		r.key("preview-status"):    "",
-		r.key("preview-version"):   "",
-		r.key("preview-size"):      "",
+		r.key("status"):                string(StatusIdle),
+		r.key("update-method"):         updateMethod,
+		r.key("download-progress"):     "",
+		r.key("download-bytes"):        "",
+		r.key("download-total"):        "",
+		r.key("install-progress"):      "",
+		r.key("error"):                 "",
+		r.key("error-message"):         "",
+		r.key("error-event"):           "",
+		r.key("preview-channel"):       "",
+		r.key("preview-status"):        "",
+		r.key("preview-version"):       "",
+		r.key("preview-size"):          "",
+		r.key("preview-download-size"): "",
+		r.key("preview-method"):        "",
 		// Gate fields describe one attempt at one artifact. With no status to
 		// hold them, they are leftovers from a previous boot.
 		r.key("commit-gate"):          "",
@@ -471,10 +473,12 @@ const (
 // result fields of whatever the previous preview left behind.
 func (r *Reporter) SetPreviewChecking(ctx context.Context, channel string) error {
 	m := map[string]any{
-		r.key("preview-channel"): channel,
-		r.key("preview-status"):  PreviewChecking,
-		r.key("preview-version"): "",
-		r.key("preview-size"):    "",
+		r.key("preview-channel"):       channel,
+		r.key("preview-status"):        PreviewChecking,
+		r.key("preview-version"):       "",
+		r.key("preview-size"):          "",
+		r.key("preview-download-size"): "",
+		r.key("preview-method"):        "",
 	}
 	if err := r.pub.SetMany(m, ipc.Sync()); err != nil {
 		return fmt.Errorf("set preview checking for %s: %w", r.component, err)
@@ -486,20 +490,32 @@ func (r *Reporter) SetPreviewChecking(ctx context.Context, channel string) error
 // SetPreviewResult publishes a finished preview. version and size are only
 // meaningful for PreviewReady; the other statuses pass them empty and zero.
 func (r *Reporter) SetPreviewResult(ctx context.Context, channel, previewStatus, version string, size int64) error {
-	sizeStr := ""
+	return r.SetPreviewResultWithPlan(ctx, channel, previewStatus, version, size, "", 0)
+}
+
+// SetPreviewResultWithPlan includes the download selected by the update check.
+// Method "none" means the installed version is current; an empty method means
+// the plan cannot be determined from the available release metadata.
+func (r *Reporter) SetPreviewResultWithPlan(ctx context.Context, channel, previewStatus, version string, size int64, method string, downloadSize int64) error {
+	sizeStr, downloadStr := "", ""
 	if size > 0 {
 		sizeStr = strconv.FormatInt(size, 10)
 	}
+	if method != "" {
+		downloadStr = strconv.FormatInt(downloadSize, 10)
+	}
 	m := map[string]any{
-		r.key("preview-channel"): channel,
-		r.key("preview-status"):  previewStatus,
-		r.key("preview-version"): version,
-		r.key("preview-size"):    sizeStr,
+		r.key("preview-channel"):       channel,
+		r.key("preview-status"):        previewStatus,
+		r.key("preview-version"):       version,
+		r.key("preview-size"):          sizeStr,
+		r.key("preview-download-size"): downloadStr,
+		r.key("preview-method"):        method,
 	}
 	if err := r.pub.SetMany(m, ipc.Sync()); err != nil {
 		return fmt.Errorf("set preview result for %s: %w", r.component, err)
 	}
-	r.logger.Printf("Preview for %s: channel=%s status=%s version=%s size=%s",
-		r.component, channel, previewStatus, version, sizeStr)
+	r.logger.Printf("Preview for %s: channel=%s status=%s version=%s size=%s method=%s download=%s",
+		r.component, channel, previewStatus, version, sizeStr, method, downloadStr)
 	return nil
 }

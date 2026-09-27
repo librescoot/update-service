@@ -316,7 +316,7 @@ func TestSetPreviewChecking_ClearsPreviousResult(t *testing.T) {
 	r, mr := newTestReporter(t)
 	ctx := context.Background()
 
-	if err := r.SetPreviewResult(ctx, "stable", PreviewReady, "v1.3.0", 401234432); err != nil {
+	if err := r.SetPreviewResultWithPlan(ctx, "stable", PreviewReady, "v1.3.0", 401234432, "delta", 12345678); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.SetPreviewChecking(ctx, "nightly"); err != nil {
@@ -333,8 +333,10 @@ func TestSetPreviewChecking_ClearsPreviousResult(t *testing.T) {
 	if got := mr.HGet("ota", "preview-version:mdb"); got != "" {
 		t.Errorf("preview-version:mdb = %q, want cleared", got)
 	}
-	if got := mr.HGet("ota", "preview-size:mdb"); got != "" {
-		t.Errorf("preview-size:mdb = %q, want cleared", got)
+	for _, field := range []string{"preview-size:mdb", "preview-download-size:mdb", "preview-method:mdb"} {
+		if got := mr.HGet("ota", field); got != "" {
+			t.Errorf("%s = %q, want cleared", field, got)
+		}
 	}
 }
 
@@ -360,14 +362,14 @@ func TestInitialize_ClearsPreviewFields(t *testing.T) {
 	r, mr := newTestReporter(t)
 	ctx := context.Background()
 
-	if err := r.SetPreviewResult(ctx, "stable", PreviewReady, "v1.3.0", 401234432); err != nil {
+	if err := r.SetPreviewResultWithPlan(ctx, "stable", PreviewReady, "v1.3.0", 401234432, "delta", 12345678); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Initialize(ctx, "delta"); err != nil {
 		t.Fatal(err)
 	}
 
-	for _, field := range []string{"preview-channel:mdb", "preview-status:mdb", "preview-version:mdb", "preview-size:mdb"} {
+	for _, field := range []string{"preview-channel:mdb", "preview-status:mdb", "preview-version:mdb", "preview-size:mdb", "preview-download-size:mdb", "preview-method:mdb"} {
 		if got := mr.HGet("ota", field); got != "" {
 			t.Errorf("%s = %q, want cleared after Initialize", field, got)
 		}

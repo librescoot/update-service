@@ -2934,7 +2934,71 @@ func (u *Updater) previewChannel(channel string) {
 		return
 	}
 
-	publish(status.PreviewReady, release.TagName, asset.Size)
+	method, downloadSize := u.previewDownloadPlan(ctx, channel, variantID, release, asset.Size)
+	if err := u.status.SetPreviewResultWithPlan(u.ctx, channel, status.PreviewReady, release.TagName, asset.Size, method, downloadSize); err != nil {
+		u.logger.Printf("Failed to publish preview result: %v", err)
+	}
+}
+
+// previewDownloadPlan follows the same full/delta decision as checkForUpdates
+// without starting an update. An empty method leaves the estimate unavailable.
+func (u *Updater) previewDownloadPlan(ctx context.Context, channel, variantID string, release Release, fullSize int64) (string, int64) {
+	if fullSize <= 0 {
+		return "", 0
+	}
+	configuredChannel, updateMethod, err := u.resolveCheckSettings()
+	if err != nil {
+		return "", 0
+	}
+	currentVersion, err := u.getCurrentVersion()
+	if err != nil || currentVersion == "" || configuredChannel != channel {
+		return "full", fullSize
+	}
+	if !u.isUpdateNeeded(release) {
+		return "none", 0
+	}
+	if currentChannel := u.inferChannelFromVersion(currentVersion); currentChannel != "" && currentChannel != channel {
+		return "full", fullSize
+	}
+	if updateMethod != "delta" || u.mender == nil {
+		return "full", fullSize
+	}
+
+	baseVersion := currentVersion
+	if _, exists := u.mender.FindMenderFileForVersion(currentVersion); !exists {
+		_, availableVersion, found := u.mender.FindLatestMenderFile(channel)
+		if !found || availableVersion == "" {
+			return "full", fullSize
+		}
+		baseVersion = availableVersion
+	}
+	releases, err := u.githubAPI.GetReleasesContext(ctx, channel)
+	if err != nil {
+		u.logger.Printf("Cannot estimate %s download: %v", channel, err)
+		return "", 0
+	}
+	chain, err := u.buildDeltaChain(releases, baseVersion, channel, variantID)
+	if err != nil {
+		return "full", fullSize
+	}
+	if len(chain) == 0 {
+		return "none", 0
+	}
+	if !strings.EqualFold(chain[len(chain)-1].TagName, release.TagName) {
+		return "", 0
+	}
+	var total int64
+	for _, step := range chain {
+		asset, ok := releaseAsset(step, variantID, ".delta")
+		if !ok {
+			return "full", fullSize
+		}
+		total += asset.Size
+	}
+	if total <= 0 || total >= fullSize {
+		return "full", fullSize
+	}
+	return "delta", total
 }
 
 // inferChannelFromVersion attempts to infer the channel from the version string
