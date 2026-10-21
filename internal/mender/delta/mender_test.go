@@ -140,6 +140,99 @@ func TestRepackMenderPublishesCompleteArchive(t *testing.T) {
 	}
 }
 
+func TestRepackMenderPreservesSignature(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source")
+	if err := os.MkdirAll(filepath.Join(source, "data"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"version": "version", "manifest": "manifest", "manifest.sig": "disposable-signature\n",
+		"header.tar.gz": "header", "data/0000.tar.gz": "payload",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(source, name), []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	output := filepath.Join(dir, "signed.mender")
+	if err := RepackMender(source, output); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	tr := tar.NewReader(f)
+	var names []string
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, hdr.Name)
+		body, err := io.ReadAll(tr)
+		if err != nil || string(body) != files[hdr.Name] {
+			t.Fatalf("member %s changed: %q, %v", hdr.Name, body, err)
+		}
+	}
+	want := "version,manifest,manifest.sig,header.tar.gz,data/0000.tar.gz"
+	if strings.Join(names, ",") != want {
+		t.Fatalf("archive entries = %v, want %s", names, want)
+	}
+}
+
+func TestRepackMenderRejectsInvalidSignatureEntry(t *testing.T) {
+	for _, kind := range []string{"directory", "empty", "symlink", "dangling symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			source := filepath.Join(dir, "source")
+			if err := os.Mkdir(source, 0755); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"version", "manifest", "header.tar.gz"} {
+				if err := os.WriteFile(filepath.Join(source, name), []byte(name), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			signature := filepath.Join(source, "manifest.sig")
+			var err error
+			switch kind {
+			case "directory":
+				err = os.Mkdir(signature, 0755)
+			case "empty":
+				err = os.WriteFile(signature, nil, 0644)
+			case "symlink":
+				err = os.Symlink("manifest", signature)
+			case "dangling symlink":
+				err = os.Symlink("missing", signature)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			output := filepath.Join(dir, "output.mender")
+			if err := os.WriteFile(output, []byte("previous"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := RepackMender(source, output); err == nil {
+				t.Fatal("repacked an invalid signature entry")
+			}
+			got, err := os.ReadFile(output)
+			if err != nil || string(got) != "previous" {
+				t.Fatalf("previous output changed: %q, %v", got, err)
+			}
+			matches, err := filepath.Glob(filepath.Join(dir, ".output.mender.tmp-*"))
+			if err != nil || len(matches) != 0 {
+				t.Fatalf("temporary output remains: %v, %v", matches, err)
+			}
+		})
+	}
+}
+
 func TestRepackMenderFailurePreservesExistingOutput(t *testing.T) {
 	dir := t.TempDir()
 	output := filepath.Join(dir, "output.mender")

@@ -17,7 +17,7 @@ func UnpackMender(menderPath, extractDir string) error {
 }
 
 // RepackMender creates a .mender tar from files in sourceDir.
-// Enforces mender ordering: version, manifest, header.tar.gz, then data/*.
+// Enforces Mender ordering: version, manifest, optional manifest.sig, header, data.
 func RepackMender(sourceDir, menderPath string) error {
 	dir := filepath.Dir(menderPath)
 	f, err := os.CreateTemp(dir, "."+filepath.Base(menderPath)+".tmp-")
@@ -38,8 +38,18 @@ func RepackMender(sourceDir, menderPath string) error {
 
 	tw := tar.NewWriter(f)
 
-	// Fixed ordering
-	items := []string{"version", "manifest", "header.tar.gz"}
+	items := []string{"version", "manifest"}
+	// The signature covers the target manifest and must survive recompression
+	// verbatim. An invalid entry must not silently turn into unsigned output.
+	if info, err := os.Lstat(filepath.Join(sourceDir, "manifest.sig")); err == nil {
+		if !info.Mode().IsRegular() || info.Size() == 0 {
+			return fmt.Errorf("manifest.sig must be a non-empty regular file")
+		}
+		items = append(items, "manifest.sig")
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat manifest.sig: %w", err)
+	}
+	items = append(items, "header.tar.gz")
 
 	dataDir := filepath.Join(sourceDir, "data")
 	if entries, err := os.ReadDir(dataDir); err == nil {

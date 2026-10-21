@@ -146,6 +146,50 @@ make test
 
 For local dry-run instances, use `make run-mdb` or `make run-dbc`. The Makefile also provides `make fmt`, `make deps`, `make lint`, and `make clean`.
 
+### Signed artifact and delta compatibility
+
+Delta reconstruction preserves the target `version`, `manifest`, optional
+`manifest.sig`, and `header.tar.gz` without rewriting them. Signed artifacts
+retain the signature immediately after the manifest. Empty or non-file
+signature entries fail repacking without replacing an existing output.
+Unsigned target artifacts remain supported; signature enforcement is controlled
+by Mender's verification-key configuration, not by the delta repacker.
+
+The delta generator must ship metadata and signatures as complete new files,
+not xdelta patches. Use the compatible `mender-delta-create.py` from
+[the firmware build repository](https://github.com/librescoot/librescoot).
+
+Run the disposable-key integration test with a sibling firmware checkout:
+
+```sh
+MENDER_ARTIFACT=/path/to/mender-artifact \
+MENDER_DELTA_CREATOR=/path/to/librescoot/mender-delta-create.py \
+go test -race -v -count=1 -run '^TestSignedDeltaIntegration$' ./internal/mender/delta
+```
+
+It requires Python 3, xdelta3, tar and gzip. The test generates temporary P-256
+keys and rootfs fixtures, signs with the real artifact tool, reconstructs single
+and multi-hop deltas, and validates the results. It also checks replacement-key
+metadata-only deltas, a recompressed base, unsigned compatibility, and rejection
+of missing/wrong signatures, wrong keys and altered manifest/header/payload.
+No private keys are committed or production configuration changed. The test
+skips if its tool variables are unset and fails if explicitly configured tools
+are missing. It has been exercised with `mender-artifact` 4.4.2.
+
+Optionally set `MENDER_UPDATE=/path/to/mender-update` to exercise the actual
+client too. This may be an executable wrapper invoking an ARM client under
+QEMU with its matching libraries. The test supplies isolated configuration,
+datastore and a temporary test update module; the module consumes the payload
+into a temporary file instead of writing a partition. Valid artifacts must
+reach `ArtifactInstall`; invalid ones must not. This checks client verification,
+not hardware installation or reboot behavior. Do not point the wrapper at a
+remote device or override the supplied test paths. The published ARM client
+5.1.0 has been exercised this way.
+
+This compatibility support does not enable release signing, provision trust
+keys, authenticate delta archives before extraction, or change the current
+release-index trust policy.
+
 ## Deployment and runtime dependencies
 
 The image recipe installs `/usr/bin/update-service`, `mender-apply-delta.py`, and one board-specific unit as `librescoot-update.service`. Both units run as `root`, restart automatically, create their required `/data/ota` directories before start, and set `GOMEMLIMIT=100MiB`.
