@@ -262,6 +262,18 @@ func (u *Updater) applyLocalBootUpdate(ctx context.Context, component string, d 
 	return runLocalBootUpdate(ctx, component, d)
 }
 
+func (u *Updater) maintainLocalBoot(holdsPendingArtifact bool) {
+	if holdsPendingArtifact {
+		if u.bootUpdater != nil {
+			u.logger.Printf("[boot-local] deferring boot maintenance until the rootfs update is committed")
+		}
+		return
+	}
+	if u.localBootUpdate != nil {
+		u.localBootUpdate()
+	}
+}
+
 func (u *Updater) performLocalBootUpdate() {
 	if u.bootUpdater == nil || !boot.HasLocalAssets() {
 		return

@@ -439,6 +439,7 @@ func (u *Updater) commitGatedUpdate(marker *commitgate.Marker, gated *GatedCommi
 	}
 	u.publishGateState(verdict, "", "")
 	u.logger.Printf("Commit gate committed %s", gated.Artifact)
+	u.maintainLocalBoot(false)
 }
 
 // rollbackGatedUpdate fails the attempt closed: record the decision so the next

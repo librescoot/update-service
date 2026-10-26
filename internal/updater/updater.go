@@ -47,6 +47,7 @@ type Updater struct {
 	applyDeltaChain   func(context.Context, []string, []string, string, mender.DeltaProgressCallback) (string, error)
 	dbcInstallGuard   dbcInstallGuard
 	localReboot       func() error
+	localBootUpdate   func()
 	dbcStateCache     string
 	activationAttempt string
 	bootID            func() (string, error)
@@ -227,6 +228,8 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		cancel:               cancel,
 		checkIntervalChanged: make(chan struct{}, 1),
 	}
+
+	u.localBootUpdate = u.performLocalBootUpdate
 
 	// Initialize update method from Redis
 	updateMethod, err := redisClient.GetUpdateMethod(cfg.Component)
@@ -729,9 +732,9 @@ func (u *Updater) Start(rec Reconciliation) error {
 	u.checkInitialStandbyState()
 	go u.monitorVehicleState()
 
-	// Apply local boot assets if they differ (boot write is synchronous; the
-	// reboot wait it schedules runs in the background so it can't wedge Start()).
-	u.performLocalBootUpdate()
+	// A pending rootfs must earn its commit before it can supply boot assets.
+	// The gate resumes maintenance after a verified commit.
+	u.maintainLocalBoot(holdsPendingArtifact)
 
 	// Initialize Redis keys if they don't exist
 	if err := u.initializeRedisKeys(); err != nil {
