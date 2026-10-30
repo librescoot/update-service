@@ -26,11 +26,18 @@ func TestMDBRebootRequiresFinishedDBCAndPowerOff(t *testing.T) {
 				if mdbRebootWaitReason(state) == "" {
 					t.Fatal("unfinished DBC update admitted MDB reboot")
 				}
+				state.DBCUpdating = ""
+				if mdbRebootWaitReason(state) == "" {
+					t.Fatal("missing lifecycle flag bypassed unfinished DBC update")
+				}
 			})
 		}
 	}
 	for _, field := range []string{"vehicle", "power", "lifecycle"} {
 		for _, value := range []string{"", "unknown", "on", "true", "parked", "shutting-down"} {
+			if field == "lifecycle" && value == "" {
+				continue
+			}
 			state := ready
 			switch field {
 			case "vehicle":
@@ -124,6 +131,23 @@ func TestMDBRebootFinalGateFailsClosed(t *testing.T) {
 				t.Fatal("unsafe reboot request queued")
 			}
 		})
+	}
+}
+
+func TestMDBRebootWithoutPreviousDBCUpdate(t *testing.T) {
+	u, mr := newPendingCommitUpdater(t)
+	// These are the vehicle's cold-start fields; no DBC update has run.
+	mr.HSet("vehicle", "state", "stand-by", "dashboard:power", "off")
+	u.setStandbyStartTime(time.Now().Add(-time.Minute))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	u.ctx = ctx
+	if err := u.TriggerReboot("mdb", true); err != nil {
+		t.Fatalf("MDB-only update blocked with no DBC lifecycle: %v", err)
+	}
+	commands, err := mr.List("scooter:power")
+	if err != nil || len(commands) != 1 || commands[0] != "reboot" {
+		t.Fatalf("power requests = %v, %v", commands, err)
 	}
 }
 

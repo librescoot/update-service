@@ -12,7 +12,8 @@ func mdbRebootWaitReason(state redis.MDBRebootState) string {
 	if state.VehicleState != "stand-by" {
 		return "vehicle is not in stand-by"
 	}
-	if state.DBCUpdating != "false" {
+	// Vehicle leaves this field absent until the first DBC update lifecycle.
+	if state.DBCUpdating != "" && state.DBCUpdating != "false" {
 		return "DBC update lifecycle has not finished"
 	}
 	for _, status := range []string{state.DBCStatus, state.DBCBootStatus} {
