@@ -3983,24 +3983,6 @@ func (u *Updater) fallbackToFullUpdate(releases []Release, variantID, channel, r
 
 const umsMDBRebootOwnerPath = "/run/librescoot/ums-mdb-reboot-owner"
 
-func (u *Updater) triggerMDBRebootIfUnowned() error {
-	if _, err := os.Stat(umsMDBRebootOwnerPath); err == nil {
-		u.logger.Printf("MDB reboot is owned by UMS (local claim); leaving update pending")
-		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("read local MDB reboot owner: %w", err)
-	}
-	owner, err := u.redis.GetRebootOwner("mdb")
-	if err != nil {
-		return fmt.Errorf("read MDB reboot owner: %w", err)
-	}
-	if owner == "ums" {
-		u.logger.Printf("MDB reboot is owned by UMS; leaving update pending")
-		return nil
-	}
-	return u.redis.TriggerReboot()
-}
-
 // setRebootTriggerError records a reboot-trigger failure for the component.
 // It never records a terminal error while the updater is shutting down: a
 // canceled context means the reboot is already in progress or the service is
@@ -4080,9 +4062,8 @@ func (u *Updater) TriggerReboot(component string, manual bool) error {
 					u.setStandbyStartTime(time.Time{})
 					return u.waitForStandbyWithSubscription(requiredStandbyDuration)
 				}
-				u.logger.Printf("Vehicle in 'stand-by' for %v (since %s). Proceeding with MDB reboot immediately.", durationInStandby, standbyStart.Format(time.RFC3339))
-				u.logger.Printf("Triggering MDB reboot via Redis command")
-				return u.triggerMDBRebootIfUnowned()
+				u.logger.Printf("Vehicle in 'stand-by' for %v (since %s). Checking DBC before MDB reboot.", durationInStandby, standbyStart.Format(time.RFC3339))
+				return u.triggerMDBRebootIfUnowned(requiredStandbyDuration)
 			}
 
 			// Calculate exact remaining time plus safety buffer
@@ -4097,16 +4078,15 @@ func (u *Updater) TriggerReboot(component string, manual bool) error {
 				// Verify still in standby before rebooting
 				currentState, err := u.redis.GetVehicleState(config.VehicleHashKey)
 				if err != nil {
-					u.logger.Printf("Failed to verify vehicle state before reboot: %v. Proceeding anyway.", err)
+					u.logger.Printf("Failed to verify vehicle state before reboot: %v. Rechecking reboot prerequisites.", err)
 				} else if currentState != "stand-by" {
 					u.logger.Printf("Vehicle left 'stand-by' state (current: %s) during wait. Restarting wait process.", currentState)
 					return u.waitForStandbyWithSubscription(requiredStandbyDuration)
 				}
 
 				totalDuration := time.Since(standbyStart)
-				u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Proceeding with MDB reboot.", totalDuration, standbyStart.Format(time.RFC3339))
-				u.logger.Printf("Triggering MDB reboot via Redis command")
-				return u.triggerMDBRebootIfUnowned()
+				u.logger.Printf("Vehicle has been in 'stand-by' for %v (since %s). Checking DBC before MDB reboot.", totalDuration, standbyStart.Format(time.RFC3339))
+				return u.triggerMDBRebootIfUnowned(requiredStandbyDuration)
 			}
 		}
 
@@ -4249,9 +4229,9 @@ func (u *Updater) waitForStandbyWithSubscription(requiredDuration time.Duration)
 				continue
 			}
 
-			u.logger.Printf("Vehicle in 'stand-by' for %v (since %s). Triggering MDB reboot.",
+			u.logger.Printf("Vehicle in 'stand-by' for %v (since %s). Checking DBC before MDB reboot.",
 				durationInStandby, standbyStart.Format(time.RFC3339))
-			return u.triggerMDBRebootIfUnowned()
+			return u.triggerMDBRebootIfUnowned(requiredDuration)
 		}
 	}
 }
