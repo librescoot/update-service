@@ -56,6 +56,8 @@ The service stores component-scoped data in the `ota` hash, including `status:<c
 
 Running versions are read from `version:<component>` field `version_id`; the release variant is read from `variant_id`. During startup recovery, Mender's committed artifact and `standalone-state.ArtifactName` are the durable sources for committed and installed-but-uncommitted identity. The active rootfs `/etc/os-release` `VERSION_ID` must match the pending artifact before commit.
 
+Boot status recovery runs independently of rootfs status at startup, including when the rootfs is already `idle` or has no status. Recovering a DBC boot update from `pending-reboot` emits `complete-dbc` and clears its boot status. MDB reboot still requires terminal DBC rootfs and boot statuses, a finished DBC lifecycle, and dashboard power off.
+
 ### Commit gate
 
 The commit gate defers that commit until the platform has proved itself on the new image, so an update's success is "booted and the vehicle came up on it" rather than only "the running version matches the pending artifact".

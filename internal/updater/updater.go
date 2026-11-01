@@ -902,8 +902,11 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot, gateOpen bool) error 
 		return fmt.Errorf("failed to get current status: %w", err)
 	}
 
-	// Nothing to recover if already idle or empty.
+	// Rootfs and boot updates have independent recovery states.
 	if currentStatus == status.StatusIdle || currentStatus == "" {
+		if u.bootStatus != nil {
+			return u.recoverBootStatus()
+		}
 		return nil
 	}
 
