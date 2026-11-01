@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/update-service/internal/backoff"
 	"github.com/librescoot/update-service/internal/boot"
 	"github.com/librescoot/update-service/internal/commitgate"
@@ -904,7 +905,7 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot, gateOpen bool) error 
 
 	// Rootfs and boot updates have independent recovery states.
 	if currentStatus == status.StatusIdle || currentStatus == "" {
-		if u.bootStatus != nil {
+		if u.bootStatus != nil && !menderNeedsReboot && !gateOpen {
 			return u.recoverBootStatus()
 		}
 		return nil
@@ -960,9 +961,19 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot, gateOpen bool) error 
 			// For DBC component, notify vehicle-service that update is complete
 			// (the defer that normally sends this didn't execute due to reboot)
 			if u.config.Component == "dbc" {
-				u.logger.Printf("Sending complete-dbc command after reboot")
-				if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-					u.logger.Printf("Failed to send complete-dbc command: %v", err)
+				bootBusy := false
+				if u.bootStatus != nil {
+					bootState, err := u.redis.GetClient().Raw().HGet(u.ctx, "ota", "status:dbc-boot").Result()
+					if err != nil && !errors.Is(err, ipc.ErrNil) {
+						return fmt.Errorf("read DBC boot status: %w", err)
+					}
+					bootBusy = bootState != "" && bootState != "idle" && bootState != "error" && bootState != "staged-noop"
+				}
+				if !bootBusy {
+					u.logger.Printf("Sending complete-dbc command after reboot")
+					if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
+						u.logger.Printf("Failed to send complete-dbc command: %v", err)
+					}
 				}
 			}
 		}
@@ -974,6 +985,10 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot, gateOpen bool) error 
 		}
 	}
 
+	// A rootfs reboot or health verdict still owns the DBC lifecycle.
+	if menderNeedsReboot || gateOpen || (currentStatus != status.StatusDownloading && currentStatus != status.StatusPreparing && currentStatus != status.StatusInstalling && currentStatus != status.StatusPendingReboot && currentStatus != status.StatusError) {
+		return nil
+	}
 	// Recover boot status independently
 	if u.bootStatus != nil {
 		if err := u.recoverBootStatus(); err != nil {
@@ -984,16 +999,19 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot, gateOpen bool) error 
 	return nil
 }
 
-// recoverBootStatus resets a stuck boot update status on startup.
-// If boot status is "pending-reboot" on startup, the reboot already happened, clear to idle.
+// recoverBootStatus reconciles boot update state after process startup.
 func (u *Updater) recoverBootStatus() error {
 	bootComp := bootComponent(u.config.Component)
-	currentStatus, err := u.bootStatus.GetStatus(u.ctx)
-	if err != nil {
+	value, err := u.redis.GetClient().Raw().HGet(u.ctx, "ota", "status:"+bootComp).Result()
+	if err != nil && !errors.Is(err, ipc.ErrNil) {
 		return fmt.Errorf("failed to get boot status: %w", err)
 	}
+	currentStatus := status.Status(value)
 
 	if currentStatus == status.StatusIdle || currentStatus == "" {
+		if u.config.Component == "dbc" {
+			return u.finishDBCBootCompletion()
+		}
 		return nil
 	}
 
@@ -1001,17 +1019,38 @@ func (u *Updater) recoverBootStatus() error {
 
 	switch currentStatus {
 	case status.StatusPendingReboot:
-		u.logger.Printf("Clearing %s-boot pending-reboot status (reboot completed)", u.config.Component)
 		if u.config.Component == "dbc" {
-			u.logger.Printf("Sending complete-dbc command after boot reboot")
-			if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
-				u.logger.Printf("Failed to send complete-dbc command: %v", err)
+			id, err := u.currentBootIdentity()
+			if err != nil {
+				return err
+			}
+			raw := u.redis.GetClient().Raw()
+			previous, err := raw.HGet(u.ctx, "ota", dbcBootRebootID).Result()
+			if err != nil && !errors.Is(err, ipc.ErrNil) {
+				return fmt.Errorf("read boot reboot identity: %w", err)
+			}
+			if previous == "" {
+				// Legacy pending statuses have no evidence of a completed reboot.
+				return raw.HSet(u.ctx, "ota", dbcBootRebootID, id).Err()
+			}
+			if previous == id {
+				return nil
 			}
 		}
 		if err := u.bootStatus.SetIdle(u.ctx); err != nil {
 			return fmt.Errorf("failed to clear pending-reboot status: %w", err)
 		}
-	case status.StatusDownloading, status.StatusPreparing, status.StatusInstalling, status.StatusError:
+		if u.config.Component == "dbc" {
+			return u.finishDBCBootCompletion()
+		}
+	case status.StatusInstalling:
+		if u.config.Component == "dbc" {
+			// A crash during the flash leaves its outcome unknown. It is not
+			// evidence that the boot update completed or can be skipped.
+			return nil
+		}
+		fallthrough
+	case status.StatusDownloading, status.StatusPreparing, status.StatusError:
 		u.logger.Printf("Clearing %s-boot %s status", bootComp, currentStatus)
 		if err := u.bootStatus.SetIdle(u.ctx); err != nil {
 			return fmt.Errorf("failed to clear %s status: %w", currentStatus, err)
@@ -4132,7 +4171,14 @@ func localRebootCommand() *exec.Cmd {
 }
 
 func (u *Updater) triggerDBCLocalReboot(requireMender bool) error {
+	return u.triggerDBCLocalRebootContext(u.ctx, requireMender)
+}
+
+func (u *Updater) triggerDBCLocalRebootContext(ctx context.Context, requireMender bool) error {
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		state, err := u.redis.GetVehicleState(config.VehicleHashKey)
 		if err == nil && dbcRebootAllowedState(state) {
 			break
@@ -4143,8 +4189,8 @@ func (u *Updater) triggerDBCLocalReboot(requireMender bool) error {
 			u.logger.Printf("Deferring DBC reboot while vehicle state is %q", state)
 		}
 		select {
-		case <-u.ctx.Done():
-			return u.ctx.Err()
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-time.After(5 * time.Second):
 		}
 	}
@@ -4167,6 +4213,9 @@ func (u *Updater) triggerDBCLocalReboot(requireMender bool) error {
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	u.logger.Printf("Rebooting DBC locally to activate installed changes")
 	if err := u.localReboot(); err != nil {
 		// Keep the activation marker on failure. `systemctl --no-block reboot`

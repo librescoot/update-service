@@ -55,11 +55,16 @@ type bootUpdateDeps struct {
 	ackTimeout        time.Duration
 	pollInterval      time.Duration
 	heartbeatInterval time.Duration
+	prepareReboot     func(context.Context) error
+	handoff           func(context.Context, context.CancelFunc, func() error)
 }
 
 const bootGuardTimeout = 10 * time.Second
 
-var errBootUpdateDeferred = errors.New("DBC lifecycle already active")
+var (
+	errBootUpdateDeferred    = errors.New("DBC lifecycle already active")
+	errDBCBootOutcomeUnknown = errors.New("DBC boot flash outcome requires recovery")
+)
 
 func waitBootDBC(ctx context.Context, timeout, interval time.Duration, read func(context.Context) (bool, error)) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -164,10 +169,20 @@ func runLocalBootUpdate(ctx context.Context, component string, d bootUpdateDeps)
 		d.heartbeatInterval = heartbeatInterval
 	}
 	ctx, cancelWrite := context.WithCancel(ctx)
-	defer cancelWrite()
+	handedOff := false
+	flashStarted := false
+	defer func() {
+		if !handedOff {
+			cancelWrite()
+		}
+	}()
 	cleanupCtx := context.WithoutCancel(ctx)
 	defer func() {
-		if result != nil && !errors.Is(result, context.Canceled) && result != errBootUpdateDeferred {
+		if result != nil && component == "dbc" && flashStarted && !handedOff {
+			result = errors.Join(errDBCBootOutcomeUnknown, result)
+			return
+		}
+		if result != nil && !handedOff && !errors.Is(result, context.Canceled) && result != errBootUpdateDeferred {
 			c, cancel := context.WithTimeout(cleanupCtx, bootGuardTimeout)
 			defer cancel()
 			result = errors.Join(result, d.status.SetError(c, "install-failed", result.Error()))
@@ -210,7 +225,9 @@ func runLocalBootUpdate(ctx context.Context, component string, d bootUpdateDeps)
 		defer func() {
 			c, cancel := context.WithTimeout(cleanupCtx, bootGuardTimeout)
 			defer cancel()
-			result = errors.Join(result, d.command(c, "complete-dbc"))
+			if !handedOff && (!flashStarted || result == nil) {
+				result = errors.Join(result, d.command(c, "complete-dbc"))
+			}
 		}()
 		c, cancel := context.WithTimeout(ctx, d.ackTimeout)
 		err := d.command(c, "start-dbc")
@@ -225,7 +242,18 @@ func runLocalBootUpdate(ctx context.Context, component string, d bootUpdateDeps)
 		if err != nil {
 			return false, fmt.Errorf("start DBC heartbeat: %w", err)
 		}
-		defer func() { result = errors.Join(result, stopHeartbeat()) }()
+		defer func() {
+			if !handedOff {
+				result = errors.Join(result, stopHeartbeat())
+			}
+		}()
+		if d.handoff != nil {
+			defer func() {
+				if handedOff {
+					d.handoff(ctx, cancelWrite, stopHeartbeat)
+				}
+			}()
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -242,14 +270,23 @@ func runLocalBootUpdate(ctx context.Context, component string, d bootUpdateDeps)
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	flashStarted = true
 	if err := d.writer.Apply(ctx, boot.LocalAssetsPath); err != nil {
 		return false, err
 	}
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	if component == "dbc" && d.prepareReboot != nil {
+		if err := d.prepareReboot(ctx); err != nil {
+			return false, fmt.Errorf("record boot reboot identity: %w", err)
+		}
+	}
 	if err := d.status.SetPendingReboot(ctx); err != nil {
 		return false, err
+	}
+	if component == "dbc" && d.handoff != nil {
+		handedOff = true
 	}
 	return true, nil
 }
@@ -268,6 +305,31 @@ func (u *Updater) maintainLocalBoot(holdsPendingArtifact bool) {
 			u.logger.Printf("[boot-local] deferring boot maintenance until the rootfs update is committed")
 		}
 		return
+	}
+	if u.config != nil && u.config.Component == "dbc" && u.bootStatus != nil {
+		raw := u.redis.GetClient().Raw()
+		st, err := raw.HGet(u.ctx, "ota", "status:dbc-boot").Result()
+		if err != nil && !errors.Is(err, ipc.ErrNil) {
+			u.logger.Printf("[boot-local] cannot read boot status: %v", err)
+			return
+		}
+		if st == "pending-reboot" || st == "idle" || st == "" {
+			if err := u.recoverBootStatus(); err != nil {
+				u.logger.Printf("[boot-local] cannot reconcile pending boot reboot: %v", err)
+				return
+			}
+			st, err = raw.HGet(u.ctx, "ota", "status:dbc-boot").Result()
+			if err != nil && !errors.Is(err, ipc.ErrNil) {
+				return
+			}
+			if st == "pending-reboot" {
+				u.resumeDBCBootReboot()
+				return
+			}
+		}
+		if st != "" && st != "idle" {
+			return
+		}
 	}
 	if u.localBootUpdate != nil {
 		u.localBootUpdate()
@@ -289,8 +351,15 @@ func (u *Updater) performLocalBootUpdate() {
 		}
 	}()
 	raw := u.redis.GetClient().Raw()
+	var handoffCtx context.Context
+	var handoffCancel context.CancelFunc
+	var stopHeartbeat func() error
 	applied, err := runLocalBootUpdate(u.ctx, u.config.Component, bootUpdateDeps{
 		writer: u.bootUpdater, guard: u.inhibitor, status: u.bootStatus, heartbeat: u.status,
+		prepareReboot: u.recordDBCBootIdentity,
+		handoff: func(ctx context.Context, cancel context.CancelFunc, stop func() error) {
+			handoffCtx, handoffCancel, stopHeartbeat = ctx, cancel, stop
+		},
 		rootfsState: func() (mender.UpdateState, error) { return u.mender.CheckUpdateState("") },
 		powerObserved: func(ctx context.Context, requestID string) (bool, error) {
 			return u.inhibitor.BootInstallObserved(ctx, u.config.Component, requestID)
@@ -303,10 +372,26 @@ func (u *Updater) performLocalBootUpdate() {
 			if errors.Is(err, ipc.ErrNil) {
 				return false, nil
 			}
-			return value == "true", err
+			if err != nil {
+				return false, err
+			}
+			if value != "true" && value != "false" && value != "" {
+				return false, fmt.Errorf("unknown DBC lifecycle state %q", value)
+			}
+			return value == "true", nil
 		},
 	})
+	if err != nil && applied && handoffCancel != nil {
+		// The write succeeded and reboot remains owed even if releasing the
+		// flash-only block failed. Do not publish a terminal status.
+		u.logger.Printf("[boot-local] flash guard cleanup failed: %v", err)
+		err = nil
+	}
 	if err != nil {
+		if errors.Is(err, errDBCBootOutcomeUnknown) {
+			u.logger.Printf("[boot-local] flash outcome unresolved: %v", err)
+			return
+		}
 		if err == errBootUpdateDeferred {
 			u.logger.Printf("[boot-local] boot maintenance deferred because a DBC lifecycle is active; retry on next service/DBC start")
 			return
@@ -322,6 +407,10 @@ func (u *Updater) performLocalBootUpdate() {
 	// Transfer the operation lock to the reboot waiter without a gap: a
 	// rootfs install must not start and then be interrupted by this reboot.
 	unlockOnReturn = false
+	if u.config.Component == "dbc" {
+		u.startDBCBootRebootWait(handoffCtx, handoffCancel, stopHeartbeat)
+		return
+	}
 	u.wg.Add(1)
 	go func() {
 		defer u.wg.Done()

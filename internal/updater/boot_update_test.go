@@ -254,7 +254,11 @@ func TestBootOperationFailsClosed(t *testing.T) {
 				started = started || event == "start-dbc"
 				completed = completed || event == "complete-dbc"
 			}
-			if started != completed {
+			if tt.writes > 0 {
+				if !started || completed || !errors.Is(err, errDBCBootOutcomeUnknown) {
+					t.Fatalf("uncertain flash was treated as complete: %v, %v", f.events, err)
+				}
+			} else if started != completed {
 				t.Fatalf("unpaired lifecycle: %v", f.events)
 			}
 		})
@@ -293,9 +297,9 @@ func TestBootOperationCancellationDuringWrite(t *testing.T) {
 	if applied || !errors.Is(err, context.Canceled) || f.held {
 		t.Fatalf("applied=%v err=%v held=%v", applied, err, f.held)
 	}
-	want := []string{"acquire", "installing", "start-dbc", "ack", "heartbeat", "write", "clear-heartbeat", "complete-dbc", "release"}
-	if !reflect.DeepEqual(f.events, want) {
-		t.Fatalf("events=%v", f.events)
+	want := []string{"acquire", "installing", "start-dbc", "ack", "heartbeat", "write", "clear-heartbeat", "release"}
+	if !errors.Is(err, errDBCBootOutcomeUnknown) || !reflect.DeepEqual(f.events, want) {
+		t.Fatalf("err=%v events=%v", err, f.events)
 	}
 }
 

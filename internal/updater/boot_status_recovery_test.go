@@ -28,6 +28,7 @@ func bootRecoveryFixture(t *testing.T, component string) (*Updater, *miniredis.M
 		bootStatus: status.NewReporter(rc.GetClient(), component+"-boot", logger),
 		logger:     logger,
 		ctx:        context.Background(),
+		bootID:     func() (string, error) { return "current-boot", nil },
 	}, mr
 }
 
@@ -44,13 +45,20 @@ func TestBootRecoveryWithSettledRootfs(t *testing.T) {
 					if bootStatus != "" {
 						mr.HSet("ota", bootKey, bootStatus)
 					}
+					if component == "dbc" && bootStatus == "pending-reboot" {
+						mr.HSet("ota", dbcBootRebootID, "previous-boot")
+					}
 					if err := u.recoverFromStuckState(false, false); err != nil {
 						t.Fatal(err)
 					}
 					want := bootStatus
 					switch bootStatus {
-					case "pending-reboot", "downloading", "preparing", "installing", "error":
+					case "pending-reboot", "downloading", "preparing", "error":
 						want = "idle"
+					case "installing":
+						if component != "dbc" {
+							want = "idle"
+						}
 					}
 					if got := mr.HGet("ota", bootKey); got != want {
 						t.Fatalf("boot status = %q, want %q", got, want)
@@ -95,6 +103,9 @@ func TestBootRecoveryPreservesPendingRootfs(t *testing.T) {
 		if got := mr.HGet("ota", "status:dbc"); got != "pending-reboot" {
 			t.Fatalf("rootfs awaiting reboot/commit was cleared: %q", got)
 		}
+		if got := mr.HGet("ota", "status:dbc-boot"); got != "pending-reboot" || mr.Exists("scooter:update") {
+			t.Fatalf("rootfs gate released boot lifecycle: boot=%q", got)
+		}
 		state, err := u.redis.GetMDBRebootState(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -107,7 +118,7 @@ func TestBootRecoveryPreservesPendingRootfs(t *testing.T) {
 
 func TestBootRecoveryPreservesMDBRebootGuards(t *testing.T) {
 	u, mr := bootRecoveryFixture(t, "dbc")
-	mr.HSet("ota", "status:dbc", "idle", "status:dbc-boot", "pending-reboot")
+	mr.HSet("ota", "status:dbc", "idle", "status:dbc-boot", "pending-reboot", dbcBootRebootID, "previous-boot")
 	mr.HSet("vehicle", "state", "stand-by", "dashboard:power", "on", "dbc-updating", "true")
 	if err := u.recoverFromStuckState(false, false); err != nil {
 		t.Fatal(err)
