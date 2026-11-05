@@ -59,7 +59,7 @@ func ValidDigest(s string) bool {
 }
 func (o Object) Validate(ext string) error {
 	u, err := url.Parse(o.URL)
-	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.RawQuery != "" || u.Fragment != "" || u.User != nil || !strings.HasSuffix(u.Path, ext) || path.Base(u.Path) == "." || o.Size <= 0 || o.Size > 8<<30 || !ValidDigest(o.SHA256) {
+	if err != nil || u.Host == "" || u.Scheme != "https" || u.RawQuery != "" || u.Fragment != "" || u.User != nil || !strings.HasSuffix(u.Path, ext) || path.Base(u.Path) == "." || o.Size <= 0 || o.Size > 8<<30 || !ValidDigest(o.SHA256) {
 		return errors.New("invalid OTA transfer object")
 	}
 	return nil
@@ -109,6 +109,7 @@ func (c *Catalog) Validate() error {
 		}
 	}
 	edges := map[string]bool{}
+	outgoing := map[string]int{}
 	for _, e := range c.Deltas {
 		a, ok := c.Find(e.Source)
 		b, bok := c.Find(e.Target)
@@ -116,6 +117,10 @@ func (c *Catalog) Validate() error {
 			return errors.New("invalid or duplicate delta endpoints")
 		}
 		edges[e.Source+e.Target] = true
+		outgoing[e.Source]++
+		if outgoing[e.Source] > 16 {
+			return errors.New("too many delta edges from one artifact")
+		}
 		if err := (Object{e.URL, e.Size, e.SHA256}).Validate(".delta"); err != nil {
 			return err
 		}
@@ -147,7 +152,8 @@ type Plan struct {
 	Target   Artifact `json:"target"`
 	Steps    []Edge   `json:"steps"`
 	// Nodes retain the exact metadata for intermediate identity checks after restart.
-	Nodes []Artifact `json:"nodes"`
+	Nodes          []Artifact `json:"nodes"`
+	InstallStarted bool       `json:"install_started,omitempty"`
 }
 
 func (p Plan) Method() string {

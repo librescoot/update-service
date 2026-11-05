@@ -42,6 +42,20 @@ func zipData(t *testing.T, data []byte, stamp int64) []byte {
 	}
 	return out.Bytes()
 }
+func TestRealMenderArtifactIdentity(t *testing.T) {
+	file := os.Getenv("OTA_TEST_MENDER_ARTIFACT")
+	if file == "" {
+		t.Skip("OTA_TEST_MENDER_ARTIFACT not set")
+	}
+	got, err := Inspect(context.Background(), file, "unu-mdb", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expected := os.Getenv("OTA_TEST_MENDER_ID"); expected == "" || got.ID != expected {
+		t.Fatalf("identity = %s, want %s", got.ID, expected)
+	}
+}
+
 func TestInspectAndVerify(t *testing.T) {
 	data := []byte("rootfs content")
 	raw := tarData(t, map[string][]byte{"rootfs.ext4": data})
