@@ -124,6 +124,19 @@ func (u *Updater) requestSwitch(channel, id string) {
 	u.switchMu.Lock()
 	defer u.switchMu.Unlock()
 	s := switchIntent{ID: id, Channel: channel}
+	if u.config.FeedURL != "" {
+		if channel != "stable" && channel != "testing" {
+			_ = u.publishSwitch(s, "error")
+			return
+		}
+		for _, board := range []string{"mdb", "dbc"} {
+			bound, err := u.redis.GetOTAField("ota", "feed-url:"+board)
+			if err != nil || bound != u.config.FeedURL {
+				_ = u.publishSwitch(s, "error")
+				return
+			}
+		}
+	}
 	if !u.updateOpMu.TryLock() {
 		_ = u.publishSwitch(s, "busy")
 		return
@@ -176,6 +189,7 @@ func (u *Updater) requestSwitch(channel, id string) {
 	}
 	u.switchQueuedMDB = false
 	u.switchQueuedDBC = false
+	u.switchPolicyLastQueued = time.Time{}
 	if err := u.publishSwitch(s, "accepted"); err != nil {
 		u.logger.Printf("Publish switch acceptance: %v", err)
 	}
@@ -210,6 +224,33 @@ func (u *Updater) advanceSwitch() {
 		}
 		if *done {
 			continue
+		}
+		if u.config.FeedURL != "" {
+			result, _ := u.redis.GetOTAField("ota", "feed-channel-result:"+board)
+			if result == s.ID+":error" {
+				s.Failed = true
+				break
+			}
+			if result != s.ID+":accepted" {
+				if board == "mdb" {
+					if err := u.config.SetFeedChannel(s.Channel); err != nil {
+						s.Failed = true
+						break
+					}
+					_ = client.NewHashPublisher("ota").SetMany(map[string]any{"feed-channel-result:mdb": s.ID + ":accepted"}, ipc.Sync())
+				} else {
+					// Keep only one queued request while off. Retry a live DBC
+					// after a bounded interval if startup recovery was still busy.
+					power, _ := client.HGet("vehicle", "dashboard:power")
+					if !*queued || (power == "on" && time.Since(u.switchPolicyLastQueued) >= 2*time.Minute) {
+						if err := u.redis.PushUpdateCommandToComponent(board, "set-feed-channel:"+s.Channel+":"+s.ID); err == nil {
+							*queued = true
+							u.switchPolicyLastQueued = time.Now()
+						}
+					}
+					continue
+				}
+			}
 		}
 		state, _ := u.redis.GetOTAField("ota", "status:"+board)
 		v, _ := u.redis.GetComponentVersion(board)

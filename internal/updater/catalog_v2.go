@@ -21,7 +21,11 @@ import (
 // getCatalogV2 is deliberately bounded: absence of the optional catalog must
 // not delay or disable legacy clients and releases.
 func (g *GitHubAPI) getCatalogV2(ctx context.Context) (*catalog.Catalog, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.baseURL+"/ota-v2.json", nil)
+	return g.getCatalogV2URL(ctx, g.baseURL+"/ota-v2.json")
+}
+
+func (g *GitHubAPI) getCatalogV2URL(ctx context.Context, url string) (*catalog.Catalog, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}

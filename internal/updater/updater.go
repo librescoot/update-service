@@ -16,6 +16,7 @@ import (
 	ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/update-service/internal/backoff"
 	"github.com/librescoot/update-service/internal/boot"
+	"github.com/librescoot/update-service/internal/catalog"
 	"github.com/librescoot/update-service/internal/commitgate"
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/dbcstate"
@@ -100,12 +101,13 @@ type Updater struct {
 	updateOpMu sync.Mutex
 
 	// DBC orchestration (MDB-only)
-	orchestrateDBCMu      sync.RWMutex
-	orchestrateDBCEnabled bool
-	dbcOrchestrating      sync.Mutex // prevents overlapping orchestration
-	switchMu              sync.Mutex
-	switchQueuedMDB       bool
-	switchQueuedDBC       bool
+	orchestrateDBCMu       sync.RWMutex
+	orchestrateDBCEnabled  bool
+	dbcOrchestrating       sync.Mutex // prevents overlapping orchestration
+	switchMu               sync.Mutex
+	switchQueuedMDB        bool
+	switchQueuedDBC        bool
+	switchPolicyLastQueued time.Time
 
 	// Wakes updateCheckLoop to reload config.CheckInterval and reset its timer
 	// when the setting changes at runtime (e.g., set to 0 to disable checks).
@@ -134,6 +136,15 @@ func (u *Updater) menderInstallProgressCb() mender.InstallProgressCallback {
 
 // installMender blocks power transitions during every DBC rootfs write.
 func (u *Updater) installMender(path string) error {
+	if u.config.FeedURL != "" {
+		if _, err := u.config.FeedChannel(); err != nil {
+			return fmt.Errorf("persistent feed policy: %w", err)
+		}
+		info, err := catalog.Inspect(u.ctx, path, "unu-"+u.config.Component, false)
+		if err != nil || info.UpdaterProtocol != config.OTAProtocol {
+			return fmt.Errorf("target does not preserve persistent OTA feed support: %v", err)
+		}
+	}
 	// A prior attestation must not survive into the next rootfs activation.
 	// Otherwise an old value for the same version could be mistaken for a
 	// fresh commit while the board is still booting its pending slot.
@@ -757,6 +768,9 @@ func (u *Updater) Start(rec Reconciliation) error {
 		u.logger.Printf("Warning: Failed to initialize Redis keys: %v", err)
 	}
 
+	if err := u.publishFeedBinding(); err != nil {
+		return err
+	}
 	u.publishCommittedVersion()
 	if u.config.Component == "mdb" {
 		go u.monitorSwitch()
@@ -1342,6 +1356,12 @@ func (u *Updater) handleCommand(command string) {
 			defer u.wg.Done()
 			u.checkForUpdates(true)
 		}()
+
+	case strings.HasPrefix(command, "set-feed-channel:"):
+		parts := strings.Split(strings.TrimPrefix(command, "set-feed-channel:"), ":")
+		if len(parts) == 2 {
+			u.setPersistentFeedChannel(parts[0], parts[1])
+		}
 
 	case command == "cancel-v2-plan":
 		u.cancelV2Plan()
@@ -2685,6 +2705,9 @@ func (u *Updater) NotifyCheckIntervalChanged() {
 // The settings watcher is asynchronous to the command queue; its cached values
 // cannot order a preceding HSET relative to check-now.
 func (u *Updater) resolveChannel() (string, error) {
+	if u.config.FeedURL != "" {
+		return u.config.FeedChannel()
+	}
 	if u.config.ChannelFromCLI {
 		return u.config.GetChannel(), nil
 	}
@@ -2843,6 +2866,11 @@ func (u *Updater) checkForUpdates(manual bool) {
 		u.logger.Printf("Failed to get current %s version: %v", u.config.Component, err)
 		// Continue anyway - we might not have a version installed yet
 		currentVersion = ""
+	}
+
+	if u.config.FeedURL != "" {
+		u.checkExclusiveV2(currentVersion, channel, updateMethod, manual)
+		return
 	}
 
 	// The manifest carries the newest release of every channel in one document,
@@ -3019,6 +3047,11 @@ func (u *Updater) previewChannel(channel string) {
 	// check is happy to sit through.
 	ctx, cancel := context.WithTimeout(u.ctx, previewTimeout)
 	defer cancel()
+
+	if u.config.FeedURL != "" {
+		u.previewExclusiveV2(ctx, channel)
+		return
+	}
 
 	releases, err := u.githubAPI.GetLatestByChannelContext(ctx)
 	if err != nil {

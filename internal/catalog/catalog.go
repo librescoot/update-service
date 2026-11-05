@@ -20,17 +20,18 @@ type Object struct {
 }
 
 type Artifact struct {
-	ID             string   `json:"id"`
-	Variant        string   `json:"variant_id"`
-	Version        string   `json:"version"`
-	Name           string   `json:"artifact_name"`
-	Devices        []string `json:"device_types"`
-	ManifestSHA256 string   `json:"manifest_sha256"`
-	HeaderSHA256   string   `json:"header_sha256"`
-	RootfsSHA256   string   `json:"rootfs_sha256"`
-	PayloadSHA256  string   `json:"payload_tar_sha256"`
-	PayloadSize    int64    `json:"payload_tar_size"`
-	Full           Object   `json:"full"`
+	ID              string   `json:"id"`
+	Variant         string   `json:"variant_id"`
+	Version         string   `json:"version"`
+	Name            string   `json:"artifact_name"`
+	Devices         []string `json:"device_types"`
+	ManifestSHA256  string   `json:"manifest_sha256"`
+	HeaderSHA256    string   `json:"header_sha256"`
+	RootfsSHA256    string   `json:"rootfs_sha256"`
+	PayloadSHA256   string   `json:"payload_tar_sha256"`
+	PayloadSize     int64    `json:"payload_tar_size"`
+	UpdaterProtocol int      `json:"updater_protocol,omitempty"`
+	Full            Object   `json:"full"`
 }
 
 type Edge struct {
@@ -154,6 +155,7 @@ type Plan struct {
 	// Nodes retain the exact metadata for intermediate identity checks after restart.
 	Nodes          []Artifact `json:"nodes"`
 	InstallStarted bool       `json:"install_started,omitempty"`
+	FeedURL        string     `json:"feed_url,omitempty"`
 }
 
 func (p Plan) Method() string {

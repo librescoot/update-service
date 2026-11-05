@@ -60,7 +60,7 @@ func TestInspectAndVerify(t *testing.T) {
 	data := []byte("rootfs content")
 	raw := tarData(t, map[string][]byte{"rootfs.ext4": data})
 	info, _ := json.Marshal(map[string]any{"artifact_provides": map[string]any{"artifact_name": "release-v1.4.1"}, "artifact_depends": map[string]any{"device_type": []string{"unu-mdb"}}})
-	header := zipData(t, tarData(t, map[string][]byte{"header-info": info}), 0)
+	header := zipData(t, tarData(t, map[string][]byte{"header-info": info, "headers/0000/type-info": []byte(`{"artifact_provides":{"rootfs-image.librescoot-updater-protocol":"2"}}`)}), 0)
 	manifest := []byte(Hash(data) + "  data/0000/rootfs.ext4\n")
 	makeFile := func(stamp int64) string {
 		p := filepath.Join(t.TempDir(), "image.mender")
@@ -76,7 +76,7 @@ func TestInspectAndVerify(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.PayloadSHA256 != Hash(raw) || a.PayloadSize != int64(len(raw)) {
+	if a.PayloadSHA256 != Hash(raw) || a.PayloadSize != int64(len(raw)) || a.UpdaterProtocol != 2 {
 		t.Fatalf("wrong source payload: %+v", a)
 	}
 	if err := Verify(context.Background(), second, a); err != nil {

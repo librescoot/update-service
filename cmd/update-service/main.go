@@ -29,6 +29,8 @@ var (
 	downloadDir    = flag.String("download-dir", "", "Download directory for OTA files (default: /data/ota/{component})")
 	dryRun         = flag.Bool("dry-run", false, "If true, don't actually reboot, just notify")
 	showVersion    = flag.Bool("version", false, "Print version and exit")
+	enrollFeed     = flag.String("enroll-feed", "", "Persist exclusive v2 feed (canary, releases, or HTTPS catalog URL), then exit; requires --channel")
+	feedConfig     = flag.String("feed-config", "", "Persistent feed policy path (default: /data/ota/{component}/feed.json)")
 	bootUpdate     = flag.Bool("boot-update", false, "Enable boot partition updates")
 	bootMountPoint = flag.String("boot-mount", "/uboot", "Boot partition mount point")
 	bootDevice     = flag.String("boot-device", "", "U-Boot device path (auto-detected from mount if empty)")
@@ -57,6 +59,30 @@ func main() {
 	}
 	if *component != "mdb" && *component != "dbc" {
 		log.Fatalf("Invalid component '%s'. Must be 'mdb' or 'dbc'", *component)
+	}
+
+	policyPath := *feedConfig
+	if policyPath == "" {
+		policyPath = config.FeedPolicyPath(*component)
+	}
+	if *enrollFeed != "" {
+		url := *enrollFeed
+		switch url {
+		case "canary":
+			url = config.CanaryV2Feed
+		case "releases":
+			url = config.DefaultV2Feed
+		}
+		policy := config.FeedPolicy{Schema: 2, URL: url, Channel: *channel}
+		if err := config.SaveFeedPolicy(policyPath, policy); err != nil {
+			log.Fatalf("Cannot enroll v2 feed: %v", err)
+		}
+		fmt.Printf("Exclusive OTA feed saved to %s; restart update-service to apply\n", policyPath)
+		return
+	}
+	policy, policyErr := config.LoadFeedPolicy(policyPath)
+	if policyErr != nil && !os.IsNotExist(policyErr) {
+		log.Fatalf("Cannot read persistent OTA feed policy: %v", policyErr)
 	}
 
 	dlDir := *downloadDir
@@ -191,6 +217,13 @@ func main() {
 		if units := config.ParseUnitList(*commitGateRequiredUnits); len(units) > 0 {
 			cfg.CommitGateRequiredUnits = units
 		}
+	}
+
+	if policyErr == nil {
+		if err := cfg.BindFeed(policyPath, policy); err != nil {
+			logger.Fatalf("Cannot bind OTA feed: %v", err)
+		}
+		logger.Printf("Exclusive OTA v2 feed: %s, channel %s (persisted in %s)", cfg.FeedURL, policy.Channel, policyPath)
 	}
 
 	if !config.IsValidChannel(cfg.Channel) {

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -104,6 +105,23 @@ func Inspect(ctx context.Context, filename, variant string, full bool) (Artifact
 					a.Name = info.Provides.Name
 					a.Devices = info.Depends.Devices
 				}
+				if hh.Name == "headers/0000/type-info" {
+					var info struct {
+						Provides map[string]string `json:"artifact_provides"`
+					}
+					if err := json.NewDecoder(ht).Decode(&info); err != nil {
+						gz.Close()
+						return a, err
+					}
+					if value := info.Provides["rootfs-image.librescoot-updater-protocol"]; value != "" {
+						protocol, err := strconv.Atoi(value)
+						if err != nil {
+							gz.Close()
+							return a, err
+						}
+						a.UpdaterProtocol = protocol
+					}
+				}
 			}
 			gz.Close()
 		default:
@@ -188,7 +206,7 @@ func Verify(ctx context.Context, filename string, want Artifact) error {
 	if err != nil {
 		return err
 	}
-	if got.ID != want.ID || got.RootfsSHA256 != want.RootfsSHA256 || got.PayloadSHA256 != want.PayloadSHA256 || got.PayloadSize != want.PayloadSize {
+	if got.ID != want.ID || got.RootfsSHA256 != want.RootfsSHA256 || got.PayloadSHA256 != want.PayloadSHA256 || got.PayloadSize != want.PayloadSize || got.UpdaterProtocol != want.UpdaterProtocol {
 		return fmt.Errorf("artifact bytes do not match %s", want.ID)
 	}
 	return nil

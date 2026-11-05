@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/librescoot/update-service/internal/catalog"
+	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/mender"
 )
 
@@ -26,6 +27,13 @@ func (u *Updater) executeV2(p catalog.Plan, manual bool) {
 	if err != nil || obs.PendingArtifact != "" || (obs.State != mender.StateNoUpdate && obs.State != mender.StateCommitted) {
 		u.logger.Printf("Mender pending or unavailable: %v", err)
 		return
+	}
+	if u.config.FeedURL != "" {
+		channel, err := u.config.FeedChannel()
+		if err != nil || p.FeedURL != u.config.FeedURL || p.Channel != channel || p.Target.UpdaterProtocol != config.OTAProtocol {
+			u.logger.Printf("Refusing plan outside persistent v2 policy: %v", err)
+			return
+		}
 	}
 	dir := u.mender.GetDownloadDir()
 	if existing, readErr := loadV2Plan(dir); readErr == nil {
@@ -207,6 +215,10 @@ func (u *Updater) v2Install(p catalog.Plan, file string, manual bool) {
 }
 
 func (u *Updater) v2FullFallback(p catalog.Plan, manual bool) {
+	if u.config.FeedURL != "" {
+		u.executeExclusiveFull(p, manual)
+		return
+	}
 	// Pin the exact target and digest, not a freshly selected latest release.
 	release := Release{TagName: p.Target.Version, Assets: []Asset{{Name: filepath.Base(p.Target.Full.URL), URL: p.Target.Full.URL, Size: p.Target.Full.Size, Sha256: p.Target.Full.SHA256}}}
 	u.logger.Printf("Using full target %s", p.Target.Version)

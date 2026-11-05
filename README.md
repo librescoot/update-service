@@ -154,6 +154,40 @@ make test
 
 For local dry-run instances, use `make run-mdb` or `make run-dbc`. The Makefile also provides `make fmt`, `make deps`, `make lint`, and `make clean`.
 
+### Persistent exclusive v2 feeds
+
+The versioned catalogs are `https://downloads.librescoot.org/updates/v2/releases.json`
+and `https://downloads.librescoot.org/updates/v2/canary.json`. Existing clients
+continue using their legacy release-index URL. A board with a persistent feed
+policy uses only its selected catalog, including for full updates and previews.
+A missing or invalid catalog pauses discovery; it never selects a public legacy
+feed. Stable/testing switches change the durable channel but not the feed URL.
+
+With a compatible updater installed on each board, stop that board's updater,
+then enroll it locally and restart it using its existing systemd unit:
+
+```sh
+update-service --component=mdb --enroll-feed=canary --channel=testing
+# On the DBC:
+update-service --component=dbc --enroll-feed=canary --channel=testing
+```
+
+Enrollment exits without Redis or vehicle access. It writes a mode-0600 policy
+at `/data/ota/<component>/feed.json`, separate from transient Redis settings and
+preserved by rootfs OTA. `--feed-config` selects an explicit policy file for host
+tests. `--enroll-feed=releases` deliberately moves a board to the regular v2
+catalog. A custom HTTPS JSON URL is also accepted. Enrollment must specify
+`--channel=stable` or `testing`. Restart after changing the feed URL.
+
+Every installed target, including manually supplied files, must advertise
+`rootfs-image.librescoot-updater-protocol:2` in its Mender payload metadata.
+The build layer derives that signed capability from the installed service's
+`OTA_PROTOCOL` marker. Unsupported images are refused before installation so an
+OTA cannot silently remove policy loading. Bootloader updates do not change this
+policy. Both boards must report the same enrollment before the MDB accepts a
+joint `switch-channel` request. Enrollment is not a substitute for installing
+the compatible updater on both boards first.
+
 ### Signed artifact and delta compatibility
 
 Delta reconstruction preserves the target `version`, `manifest`, optional

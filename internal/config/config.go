@@ -21,8 +21,10 @@ const (
 type Config struct {
 	RedisAddr string // CLI-only; never accepted from Redis.
 
-	ReleasesURL   string
-	CheckInterval time.Duration
+	ReleasesURL    string
+	FeedURL        string
+	FeedPolicyFile string
+	CheckInterval  time.Duration
 
 	Component       string // CLI-only target: mdb or dbc.
 	Channel         string // stable, testing, or nightly; CLI overrides Redis.
@@ -362,6 +364,10 @@ func (c *Config) ApplyRedisUpdate(key, value string) bool {
 	}
 
 	settingName := key[len(prefix):]
+
+	if c.FeedURL != "" && (settingName == "channel" || settingName == "releases-url") {
+		return false
+	}
 
 	switch settingName {
 	case "channel":
