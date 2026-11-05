@@ -103,6 +103,9 @@ type Updater struct {
 	orchestrateDBCMu      sync.RWMutex
 	orchestrateDBCEnabled bool
 	dbcOrchestrating      sync.Mutex // prevents overlapping orchestration
+	switchMu              sync.Mutex
+	switchQueuedMDB       bool
+	switchQueuedDBC       bool
 
 	// Wakes updateCheckLoop to reload config.CheckInterval and reset its timer
 	// when the setting changes at runtime (e.g., set to 0 to disable checks).
@@ -131,6 +134,16 @@ func (u *Updater) menderInstallProgressCb() mender.InstallProgressCallback {
 
 // installMender blocks power transitions during every DBC rootfs write.
 func (u *Updater) installMender(path string) error {
+	// A prior attestation must not survive into the next rootfs activation.
+	// Otherwise an old value for the same version could be mistaken for a
+	// fresh commit while the board is still booting its pending slot.
+	if u.redis != nil {
+		if err := u.redis.GetClient().NewHashPublisher("ota").SetMany(map[string]any{
+			"committed-version:" + u.config.Component: "",
+		}, ipc.Sync()); err != nil {
+			return fmt.Errorf("clear committed version attestation: %w", err)
+		}
+	}
 	if u.config.Component == "dbc" {
 		if err := u.dbcInstallGuard.AddDBCInstallInhibit(); err != nil {
 			return fmt.Errorf("add DBC install inhibit: %w", err)
@@ -479,6 +492,8 @@ func (u *Updater) finishVerifiedUpdate(committedArtifact string) error {
 	if err := u.status.SetIdle(u.ctx); err != nil {
 		return fmt.Errorf("publish committed update: %w", err)
 	}
+	u.publishCommittedArtifact(committedArtifact)
+	u.finishV2Plan(committedArtifact)
 	if u.config.Component != "dbc" {
 		return nil
 	}
@@ -685,12 +700,12 @@ func (u *Updater) Start(rec Reconciliation) error {
 	// Remove leftover OTA artifacts at /data/ota/ (legacy location, before per-component subdirs)
 	u.cleanupLegacyOtaFiles()
 
-	// Remove old .mender files, keeping only the newest one
-	u.mender.CleanupStaleMenderFiles()
-
-	// Reap stale delta artifacts against the newest local .mender. Runs before
-	// any download goroutine launches, so there is no concurrent writer.
-	u.mender.CleanupStaleDeltaFiles(deltaMaxAge)
+	// A durable v2 plan may need a cross-channel target and its running base.
+	// Preserve both until recovery has reconciled the plan with Mender.
+	if _, err := os.Stat(planFile(u.mender.GetDownloadDir())); os.IsNotExist(err) {
+		u.mender.CleanupStaleMenderFiles()
+		u.mender.CleanupStaleDeltaFiles(deltaMaxAge)
+	}
 
 	// Release our own suspend inhibit unconditionally, before anything else
 	// in this process can take it. A prior run that crashed, was killed, or
@@ -742,9 +757,16 @@ func (u *Updater) Start(rec Reconciliation) error {
 		u.logger.Printf("Warning: Failed to initialize Redis keys: %v", err)
 	}
 
+	u.publishCommittedVersion()
+	if u.config.Component == "mdb" {
+		go u.monitorSwitch()
+	}
+
 	// Check if we have a mender file newer than the running version (e.g., from
 	// an interrupted update). If so, install it directly without re-downloading.
-	u.installPendingMenderFile(holdsPendingArtifact)
+	if !u.recoverV2Plan(holdsPendingArtifact) {
+		u.installPendingMenderFile(holdsPendingArtifact)
+	}
 
 	// Run the commit gate window in the background when a commit is owed and the
 	// gate owns the decision. Started after recoverFromStuckState so the status
@@ -1320,6 +1342,18 @@ func (u *Updater) handleCommand(command string) {
 			defer u.wg.Done()
 			u.checkForUpdates(true)
 		}()
+
+	case command == "cancel-v2-plan":
+		u.cancelV2Plan()
+
+	case strings.HasPrefix(command, "switch-channel:"):
+		parts := strings.Split(strings.TrimPrefix(command, "switch-channel:"), ":")
+		if len(parts) == 2 {
+			u.requestSwitch(parts[0], parts[1])
+			if u.config.Component == "mdb" {
+				u.advanceSwitch()
+			}
+		}
 
 	case strings.HasPrefix(command, "preview-channel:"):
 		channel := strings.TrimSpace(strings.TrimPrefix(command, "preview-channel:"))
@@ -2757,6 +2791,27 @@ func (u *Updater) checkForUpdates(manual bool) {
 		return
 	}
 
+	// A persisted v2 operation fixes the selected target until recovery or
+	// explicit intervention. Never let a periodic check install on top of it.
+	if u.mender != nil {
+		if _, err := os.Stat(planFile(u.mender.GetDownloadDir())); err == nil {
+			plan, readErr := loadV2Plan(u.mender.GetDownloadDir())
+			if readErr != nil || plan.InstallStarted {
+				u.logger.Printf("Deferring update check for unconfirmed v2 plan: %v", readErr)
+				return
+			}
+			if skip, _ := u.backoff.ShouldSkip(plan.Target.Version, u.config.CheckInterval); skip {
+				return
+			}
+			u.wg.Add(1)
+			go func() { defer u.wg.Done(); u.executeV2(plan, manual) }()
+			return
+		} else if !os.IsNotExist(err) {
+			u.logger.Printf("Cannot inspect v2 plan: %v", err)
+			return
+		}
+	}
+
 	// From here on an attempt is in flight: record it before anything that can
 	// fail, so a failed attempt is visible without moving last-check-time.
 	u.startCheckAttempt()
@@ -2816,6 +2871,27 @@ func (u *Updater) checkForUpdates(manual bool) {
 	}
 
 	u.logger.Printf("Update method for %s: %s", u.config.Component, updateMethod)
+
+	// A v2 plan binds the selected release to explicit, verified delta edges.
+	// Legacy releases retain their existing channel and full-fallback behavior.
+	if currentVersion != "" && (channel == "stable" || channel == "testing") {
+		release, found, selectErr := u.latestReleaseFor(manifest, channel, variantID)
+		if selectErr == nil && found && u.isUpdateNeeded(release) {
+			ctx, cancel := v2PlanTimeout(u.ctx)
+			plan, ok := u.candidateV2(ctx, channel, variantID, currentVersion, release, updateMethod)
+			cancel()
+			if ok && plan.Method() == "delta" {
+				if skip, remaining := u.backoff.ShouldSkip(release.TagName, u.config.CheckInterval); skip {
+					_ = u.status.SetSkipChecksRemaining(u.ctx, remaining)
+					u.finishCheck(checkResultBackedOff)
+					return
+				}
+				u.wg.Add(1)
+				go func() { defer u.wg.Done(); u.executeV2(plan, manual) }()
+				return
+			}
+		}
+	}
 
 	// Check for channel switch
 	if currentVersion != "" {
@@ -2996,11 +3072,20 @@ func (u *Updater) previewDownloadPlan(ctx context.Context, channel, variantID st
 		return "", 0
 	}
 	currentVersion, err := u.getCurrentVersion()
-	if err != nil || currentVersion == "" || configuredChannel != channel {
+	if err != nil || currentVersion == "" {
 		return "full", fullSize
 	}
 	if !u.isUpdateNeeded(release) {
 		return "none", 0
+	}
+	if plan, ok := u.candidateV2(ctx, channel, variantID, currentVersion, release, updateMethod); ok && plan.Method() == "delta" {
+		if enoughDeltaSpace(plan, u.mender.GetDownloadDir()) {
+			return plan.Method(), plan.Bytes()
+		}
+		return "full", fullSize
+	}
+	if configuredChannel != channel {
+		return "full", fullSize
 	}
 	if currentChannel := u.inferChannelFromVersion(currentVersion); currentChannel != "" && currentChannel != channel {
 		return "full", fullSize

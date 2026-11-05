@@ -254,7 +254,7 @@ func (c *Client) HGet(key, field string) (string, error) {
 // check actually ran to a decision.
 func (c *Client) SetLastUpdateCheckTime(component string, timestamp time.Time) error {
 	key := fmt.Sprintf("updates.%s.last-check-time", component)
-	return c.client.HSet("settings", key, timestamp.Format(time.RFC3339))
+	return c.client.HSet("settings", key, timestamp.Format(time.RFC3339Nano))
 }
 
 // SetLastAttemptTime stores when the most recent check attempt started,

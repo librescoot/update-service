@@ -31,6 +31,8 @@ Each instance accepts commands on `scooter:update:<component>`:
 | --- | --- |
 | `check-now` | Start an immediate release check. |
 | `preview-channel:<channel>` | Resolve the latest matching artifact for a valid channel without starting an update. |
+| `switch-channel:<channel>:<id>` | MDB only: durably request a channel switch for both boards. The request ID is 32 lowercase hexadecimal characters. |
+| `cancel-v2-plan` | Cancel a stopped v2 transport plan when Mender has no pending update. This does not roll back Mender. |
 | `update-from-file:<path>` | Install a local `.mender` or `.delta` artifact. |
 | `apply-staged-updates` | Discover the artifacts UMS staged in this component's download dir, resolve them, and install once. |
 | `update-from-url:<url>` | Download and install an artifact from `http`, `https`, or `file` URL. |
@@ -38,6 +40,8 @@ Each instance accepts commands on `scooter:update:<component>`:
 For `update-from-file` and `update-from-url`, append `#sha256=<hex>` to request checksum verification. The legacy `:sha256:<hex>` suffix is also accepted. An unverified source is allowed when no checksum is supplied.
 
 Release discovery reads `latest.json`, the release index's one release per channel, which is also what lets the MDB judge the DBC against the DBC's own channel rather than its own. It is also the smaller document: one manifest for every channel replaces the newest channel's full release list on every check. A channel's `<channel>.json` list is fetched only where it adds something: a delta chain is built across several releases, and when the manifest carries no usable release for the channel and variant — a board that failed to build that night, a version the gate rolled back, or a manifest that has fallen behind — the list is consulted for an older release.
+
+When `ota-v2.json` names the same board and target as the legacy release index, the service can select up to three explicit delta edges from its locally verified base. It verifies transfer digests, endpoint metadata, payload bytes and the reconstructed target before Mender installation. If the catalog is unavailable, stale, invalid, uneconomical, or lacks a route, the existing legacy/full path remains available. Local file and UMS deltas retain their same-channel rules. A v2 plan persists across a restart and pins its target; after an unconfirmed installation it reports an error instead of automatically retrying. The MDB persists confirmed two-board channel switches and restores the DBC request after an MDB restart. `ota[switch-result]` combines the request ID and result as `<id>:<status>`.
 
 `update-from-file` behaves as before apart from the power holds: one `.mender` is a full image and one `.delta` is applied against the base image of the running version. A single delta is the one-file case of the chain path below, so it is prechecked the same way and takes the suspend hold the chain path takes for the duration of the apply. Both branches install through the same inhibit/tail as the staged path. For a full image the install inhibit is now taken before the checksum verification, so `installing` is published after the verification instead of before it; the delta success log line still names the base -> target it assembled.
 
@@ -108,7 +112,7 @@ The gate needs the bootloader to revert an uncommitted slot, which is what lands
 
 The MDB instance atomically maintains `/data/ota/dbc-state.json` after stable live DBC observations. If Redis data is lost while the DBC is powered off, it restores `version:dbc[version_id]` and the DBC OTA status/target with `ota[state-origin:dbc]=cached`. A running DBC instance sets that marker to `live`.
 
-Each release check reads the current component channel and update method from settings before selecting a release; an explicit `--channel` still takes precedence. The selected channel stays fixed for that operation, including delta rechecks. Switching between recognized channels requests a full image, including nightly/testing to stable; same-channel stable checks still reject version downgrades. A settings read failure aborts the check instead of silently using a stale channel.
+Each release check reads the current component channel and update method from settings before selecting a release; an explicit `--channel` still takes precedence. The selected channel stays fixed for that operation, including delta rechecks. Between stable and testing, a valid v2 catalog may provide a delta route; otherwise a channel switch uses a full image. Nightly channel switches use full images. Same-channel stable checks still reject version downgrades. A settings read failure aborts the check instead of silently using a stale channel.
 
 ## Configuration
 

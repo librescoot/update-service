@@ -709,6 +709,19 @@ func (m *Manager) ApplyDownloadedDeltaChain(ctx context.Context, deltaPaths []st
 	return newMenderPath, nil
 }
 
+// ApplyExplicitDeltaChain preserves the verified base and publishes the target
+// under the normal artifact filename. Callers validate the target before install.
+func (m *Manager) ApplyExplicitDeltaChain(ctx context.Context, basePath string, deltaPaths []string, targetName string, progress DeltaProgressCallback) (string, error) {
+	if filepath.Base(targetName) != targetName || !strings.HasSuffix(targetName, ".mender") {
+		return "", fmt.Errorf("invalid target artifact filename")
+	}
+	target := filepath.Join(m.downloader.downloadDir, targetName)
+	if err := m.deltaApplier.ApplyDeltaChain(ctx, basePath, deltaPaths, target, progress); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
 // ErrStagedChainAmbiguous reports a set of staged deltas that cannot be
 // resolved into one contiguous chain from the running version's base image:
 // two deltas built for the same base (a fork), or a delta that cannot be

@@ -162,6 +162,13 @@ func (u *Updater) preflightDBCUpdate(manifest map[string]Release) dbcPreflight {
 
 	if !u.isVersionNewer(release.TagName, dbcVersion, dbcChannel) {
 		u.logger.Printf("[dbc-orchestrate] DBC at %s, latest on %s is %s — up to date", dbcVersion, dbcChannel, release.TagName)
+		// A confirmed switch may need the DBC to attest its committed image
+		// even when its cached version already names the selected channel.
+		if u.mender != nil {
+			if intent, err := readSwitch(u.mender.GetDownloadDir()); err == nil && !intent.Failed && !intent.DBCDone {
+				return dbcPreflight{result: status.DBCPreflightUnknown, version: release.TagName, wake: true}
+			}
+		}
 		return dbcPreflight{result: status.DBCPreflightUpToDate, version: release.TagName}
 	}
 	return dbcPreflight{result: status.DBCPreflightAvailable, version: release.TagName, wake: true}

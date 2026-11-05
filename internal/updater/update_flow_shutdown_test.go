@@ -49,6 +49,8 @@ func newUpdateFlowUpdater(t *testing.T) (*Updater, *miniredis.Miniredis) {
 		mender:     mender.NewManager(t.TempDir(), func() mender.Budget { return mender.Budget{} }, logger),
 		ctx:        context.Background(),
 	}
+	// Heartbeat cleanup writes through rc; wait before the client is closed.
+	t.Cleanup(func() { u.wg.Wait() })
 	return u, mr
 }
 

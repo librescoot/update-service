@@ -204,8 +204,8 @@ func TestAllMenderInstallsUseSafetyGate(t *testing.T) {
 	// the local-file paths that reach it through installAssembledAndReboot
 	// (the shared install tail). A new path of either shape moves one of
 	// these two counts, so a bypass cannot be added silently.
-	if got := strings.Count(text, "u.installMender("); got != 4 {
-		t.Fatalf("found %d guarded rootfs install sites, want 4", got)
+	if got := strings.Count(text, "u.installMender("); got != 5 {
+		t.Fatalf("found %d guarded rootfs install sites, want 5", got)
 	}
 	if got := strings.Count(text, "u.installAssembledAndReboot("); got != 2 {
 		t.Fatalf("found %d shared local-file install call sites, want 2", got)
