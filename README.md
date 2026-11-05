@@ -181,7 +181,7 @@ catalog. A custom HTTPS JSON URL is also accepted. Enrollment must specify
 
 Every installed target, including manually supplied files, must advertise
 `rootfs-image.librescoot-updater-protocol:2` in its Mender payload metadata.
-The build layer derives that signed capability from the installed service's
+The build layer derives that capability from the installed service's
 `OTA_PROTOCOL` marker. Unsupported images are refused before installation so an
 OTA cannot silently remove policy loading. Bootloader updates do not change this
 policy. Both boards must report the same enrollment before the MDB accepts a
