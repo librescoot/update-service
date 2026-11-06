@@ -13,14 +13,14 @@ import (
 // Stable filenames are "librescoot-unu-mdb-v1.0.0.mender" -> "v1.0.0".
 // Nightly/testing filenames are
 // "librescoot-unu-mdb-nightly-20251226T091616.mender" -> "nightly-20251226T091616".
-// It also accepts ".delta", ".delta.tmp", and ".mender.tmp" filenames and yields
+// It also accepts ".delta", ".hdelta" and their ".tmp" forms, plus ".mender.tmp", and yields
 // the same token as the corresponding ".mender" (a delta's filename embeds its
 // target version). Returns "" if no version token can be found.
 func FromFilename(filename string) string {
 	basename := filepath.Base(filename)
 	// Strip exactly one known suffix, longest/compound forms first so
-	// ".delta.tmp" matches before ".delta" and we never half-strip.
-	for _, suffix := range []string{".mender.tmp", ".delta.tmp", ".mender", ".delta"} {
+	// a partial download matches before its non-temporary suffix.
+	for _, suffix := range []string{".mender.tmp", ".hdelta.tmp", ".delta.tmp", ".mender", ".hdelta", ".delta"} {
 		if strings.HasSuffix(basename, suffix) {
 			basename = strings.TrimSuffix(basename, suffix)
 			break

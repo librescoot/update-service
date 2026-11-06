@@ -1079,6 +1079,8 @@ func removeLegacyOtaFiles(baseDir, downloadDir string, logger *log.Logger) {
 		filepath.Join(baseDir, "*.mender.tmp"),
 		filepath.Join(baseDir, "*.delta"),
 		filepath.Join(baseDir, "*.delta.tmp"),
+		filepath.Join(baseDir, "*.hdelta"),
+		filepath.Join(baseDir, "*.hdelta.tmp"),
 	}
 	for _, pattern := range patterns {
 		matches, err := filepath.Glob(pattern)
@@ -1470,15 +1472,15 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 	switch {
 	case strings.HasSuffix(source, ".mender"):
 		// full image: continues with the flow below
-	case strings.HasSuffix(source, ".delta"):
+	case isDeltaPath(source):
 		// locally delivered delta (BLE OTA path): apply against the base
 		// image of the running version, then install the assembled .mender.
 		// A single delta is the one-file case of the chain path.
 		u.applyLocalDeltaChainLocked([]string{source}, checksum)
 		return
 	default:
-		u.logger.Printf("Error: file is not a .mender or .delta file: %s", source)
-		if err := u.status.SetError(u.ctx, "invalid-file", fmt.Sprintf("File is not a .mender or .delta file: %s", source)); err != nil {
+		u.logger.Printf("Error: file is not a .mender, .delta or .hdelta file: %s", source)
+		if err := u.status.SetError(u.ctx, "invalid-file", fmt.Sprintf("File is not a .mender, .delta or .hdelta file: %s", source)); err != nil {
 			u.logger.Printf("Failed to set error status: %v", err)
 		}
 		return
@@ -1721,7 +1723,7 @@ func listStagedArtifacts(dir string) (menders, deltas []string, err error) {
 		switch {
 		case strings.HasSuffix(entry.Name(), ".mender"):
 			menders = append(menders, filepath.Join(dir, entry.Name()))
-		case strings.HasSuffix(entry.Name(), ".delta"):
+		case isDeltaPath(entry.Name()):
 			deltas = append(deltas, filepath.Join(dir, entry.Name()))
 		}
 	}
@@ -1924,12 +1926,12 @@ func (u *Updater) applyLocalDeltaChainLocked(deltaPaths []string, checksum strin
 	}
 
 	for _, p := range deltaPaths {
-		if !strings.HasSuffix(p, ".delta") {
-			u.logger.Printf("Error: file is not a .delta file: %s", p)
+		if !isDeltaPath(p) {
+			u.logger.Printf("Error: file is not a .delta or .hdelta file: %s", p)
 			if u.skipTerminalErrorOnShutdown("invalid delta file") {
 				return
 			}
-			if err := u.status.SetError(u.ctx, "invalid-file", fmt.Sprintf("File is not a .delta file: %s", p)); err != nil {
+			if err := u.status.SetError(u.ctx, "invalid-file", fmt.Sprintf("File is not a .delta or .hdelta file: %s", p)); err != nil {
 				u.logger.Printf("Failed to set error status: %v", err)
 			}
 			return
@@ -4301,6 +4303,10 @@ func (u *Updater) findMenderAsset(release Release, variantID string) string {
 // librescoot-{variantID}-{tag}{ext}, the naming scheme CI uses for every
 // channel. Substring matching is unsafe here: "unu-mdb" is contained in
 // "unu-mdb-minimal", so a loose match could pick a bootstrap image.
+func isDeltaPath(path string) bool {
+	return strings.HasSuffix(path, ".delta") || strings.HasSuffix(path, ".hdelta")
+}
+
 func releaseAsset(release Release, variantID, ext string) (Asset, bool) {
 	prefix := "librescoot-" + variantID + "-" + release.TagName
 	var normal, hdiff Asset
@@ -4309,7 +4315,7 @@ func releaseAsset(release Release, variantID, ext string) (Asset, bool) {
 		if asset.Name == prefix+ext {
 			normal, hasNormal = asset, true
 		}
-		if ext == ".delta" && asset.Name == prefix+".hdiff.delta" {
+		if ext == ".delta" && strings.HasPrefix(release.TagName, "nightly-") && asset.Name == prefix+".hdelta" {
 			hdiff, hasHDiff = asset, true
 		}
 	}

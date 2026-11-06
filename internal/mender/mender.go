@@ -379,7 +379,7 @@ func (m *Manager) CleanupStaleDeltaFiles(maxAge time.Duration) {
 	// Include the resumable .delta.tmp partials: both call sites run with no
 	// concurrent download writer, so reaping a dead partial promptly is safe.
 	var candidates []string
-	for _, pattern := range []string{filepath.Join(dir, "*.delta"), filepath.Join(dir, "*.delta.tmp")} {
+	for _, pattern := range []string{filepath.Join(dir, "*.delta"), filepath.Join(dir, "*.delta.tmp"), filepath.Join(dir, "*.hdelta"), filepath.Join(dir, "*.hdelta.tmp")} {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
 			continue
@@ -653,7 +653,7 @@ func (m *Manager) ApplyDownloadedDelta(ctx context.Context, deltaPath, currentVe
 }
 
 func menderNameFromDelta(deltaName string) string {
-	return strings.TrimSuffix(strings.TrimSuffix(deltaName, ".delta"), ".hdiff") + ".mender"
+	return strings.TrimSuffix(strings.TrimSuffix(deltaName, ".delta"), ".hdelta") + ".mender"
 }
 
 // ApplyDownloadedDeltaChain applies multiple pre-downloaded deltas in a single
