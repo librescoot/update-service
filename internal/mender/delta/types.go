@@ -13,10 +13,11 @@ type DeltaMetadata struct {
 }
 
 type ChangeInfo struct {
-	Type    string   `json:"type"` // "new", "modified", "deleted"
-	Patch   string   `json:"patch"`
-	OldMeta FileMeta `json:"old_meta"`
-	NewMeta FileMeta `json:"new_meta"`
+	Type      string   `json:"type"` // "new", "modified", "deleted"
+	Patch     string   `json:"patch"`
+	Algorithm string   `json:"algorithm,omitempty"`
+	OldMeta   FileMeta `json:"old_meta"`
+	NewMeta   FileMeta `json:"new_meta"`
 }
 
 type FileMeta struct {

@@ -37,6 +37,13 @@ Each instance accepts commands on `scooter:update:<component>`:
 
 For `update-from-file` and `update-from-url`, append `#sha256=<hex>` to request checksum verification. The legacy `:sha256:<hex>` suffix is also accepted. An unverified source is allowed when no checksum is supplied.
 
+Experimental HDiffPatch support accepts deltas whose modified payload declares
+`"algorithm": "hdiffpatch"`. It invokes `hpatchz` with an 8 MiB old-file cache,
+then verifies the reconstructed payload and rootfs checksums. A release may carry
+both the standard `.delta` and an additional `.hdiff.delta`; when `hpatchz` is
+available the updater selects the smaller file. Older clients continue to select
+only the standard `.delta`. Unknown algorithms fail closed.
+
 Release discovery reads `latest.json`, the release index's one release per channel, which is also what lets the MDB judge the DBC against the DBC's own channel rather than its own. It is also the smaller document: one manifest for every channel replaces the newest channel's full release list on every check. A channel's `<channel>.json` list is fetched only where it adds something: a delta chain is built across several releases, and when the manifest carries no usable release for the channel and variant — a board that failed to build that night, a version the gate rolled back, or a manifest that has fallen behind — the list is consulted for an older release.
 
 `update-from-file` behaves as before apart from the power holds: one `.mender` is a full image and one `.delta` is applied against the base image of the running version. A single delta is the one-file case of the chain path below, so it is prechecked the same way and takes the suspend hold the chain path takes for the duration of the apply. Both branches install through the same inhibit/tail as the staged path. For a full image the install inhibit is now taken before the checksum verification, so `installing` is published after the verification instead of before it; the delta success log line still names the base -> target it assembled.

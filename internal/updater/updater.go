@@ -4302,13 +4302,23 @@ func (u *Updater) findMenderAsset(release Release, variantID string) string {
 // channel. Substring matching is unsafe here: "unu-mdb" is contained in
 // "unu-mdb-minimal", so a loose match could pick a bootstrap image.
 func releaseAsset(release Release, variantID, ext string) (Asset, bool) {
-	want := "librescoot-" + variantID + "-" + release.TagName + ext
+	prefix := "librescoot-" + variantID + "-" + release.TagName
+	var normal, hdiff Asset
+	var hasNormal, hasHDiff bool
 	for _, asset := range release.Assets {
-		if asset.Name == want {
-			return asset, true
+		if asset.Name == prefix+ext {
+			normal, hasNormal = asset, true
+		}
+		if ext == ".delta" && asset.Name == prefix+".hdiff.delta" {
+			hdiff, hasHDiff = asset, true
 		}
 	}
-	return Asset{}, false
+	if hasHDiff && hdiff.Size > 0 && (!hasNormal || normal.Size <= 0 || hdiff.Size < normal.Size) {
+		if _, err := exec.LookPath("hpatchz"); err == nil {
+			return hdiff, true
+		}
+	}
+	return normal, hasNormal
 }
 
 // buildDeltaChain builds a complete chain of deltas from currentVersion to the

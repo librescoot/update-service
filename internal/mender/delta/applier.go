@@ -128,7 +128,16 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 				patchPath := filepath.Join(deltaDir, "patches", change.Patch)
 				nextPayload := filepath.Join(work, "payload.next")
 
-				sha256hex, err := ApplyXdelta(ctx, payloadPath, patchPath, nextPayload, tracker)
+				var sha256hex string
+				var err error
+				switch change.Algorithm {
+				case "", "xdelta3":
+					sha256hex, err = ApplyXdelta(ctx, payloadPath, patchPath, nextPayload, tracker)
+				case "hdiffpatch":
+					sha256hex, err = ApplyHDiff(ctx, payloadPath, patchPath, nextPayload, tracker)
+				default:
+					return fmt.Errorf("unsupported delta algorithm %q", change.Algorithm)
+				}
 				if err != nil {
 					return fmt.Errorf("xdelta delta %d %s: %w", deltaNum, relPath, err)
 				}
