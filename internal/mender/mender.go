@@ -575,7 +575,7 @@ func (m *Manager) ApplyDeltaUpdate(ctx context.Context, deltaURL, currentVersion
 
 	// Generate the new mender filename based on the delta filename
 	deltaBaseName := filepath.Base(deltaPath)
-	newMenderName := deltaBaseName[:len(deltaBaseName)-6] + ".mender" // Replace .delta with .mender
+	newMenderName := menderNameFromDelta(deltaBaseName)
 	newMenderPath := filepath.Join(m.downloader.downloadDir, newMenderName)
 
 	// Apply the delta
@@ -625,7 +625,7 @@ func (m *Manager) ApplyDownloadedDelta(ctx context.Context, deltaPath, currentVe
 
 	// Generate the new mender filename based on the delta filename
 	deltaBaseName := filepath.Base(deltaPath)
-	newMenderName := deltaBaseName[:len(deltaBaseName)-6] + ".mender" // Replace .delta with .mender
+	newMenderName := menderNameFromDelta(deltaBaseName)
 	newMenderPath := filepath.Join(m.downloader.downloadDir, newMenderName)
 
 	err := m.deltaApplier.ApplyDelta(ctx, oldMenderPath, deltaPath, newMenderPath, deltaProgressCallback)
@@ -652,6 +652,10 @@ func (m *Manager) ApplyDownloadedDelta(ctx context.Context, deltaPath, currentVe
 	return newMenderPath, nil
 }
 
+func menderNameFromDelta(deltaName string) string {
+	return strings.TrimSuffix(strings.TrimSuffix(deltaName, ".delta"), ".hdiff") + ".mender"
+}
+
 // ApplyDownloadedDeltaChain applies multiple pre-downloaded deltas in a single
 // unpack/repack cycle, avoiding intermediate compress+repack overhead.
 // Returns the path to the final mender file.
@@ -676,7 +680,7 @@ func (m *Manager) ApplyDownloadedDeltaChain(ctx context.Context, deltaPaths []st
 
 	// Output is named after the final delta
 	finalDeltaBase := filepath.Base(deltaPaths[len(deltaPaths)-1])
-	newMenderName := finalDeltaBase[:len(finalDeltaBase)-6] + ".mender"
+	newMenderName := menderNameFromDelta(finalDeltaBase)
 	newMenderPath := filepath.Join(m.downloader.downloadDir, newMenderName)
 
 	err := m.deltaApplier.ApplyDeltaChain(ctx, oldMenderPath, deltaPaths, newMenderPath, deltaProgressCallback)
