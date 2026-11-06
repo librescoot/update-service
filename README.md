@@ -40,8 +40,8 @@ For `update-from-file` and `update-from-url`, append `#sha256=<hex>` to request 
 Experimental HDiffPatch support accepts deltas whose modified payload declares
 `"algorithm": "hdiffpatch"`. It invokes `hpatchz` with an 8 MiB old-file cache,
 then verifies the reconstructed payload and rootfs checksums. A release may carry
-both the standard `.delta` and an additional `.hdelta`; for normal Nightly
-releases, when `hpatchz` is available the updater selects the smaller file. Older clients continue to select
+both the standard `.delta` and an additional `.hdelta`; for normal Nightly and
+Testing releases, when `hpatchz` is available the updater selects the smaller file. Older clients continue to select
 only the standard `.delta`. Unknown algorithms fail closed.
 
 Release discovery reads `latest.json`, the release index's one release per channel, which is also what lets the MDB judge the DBC against the DBC's own channel rather than its own. It is also the smaller document: one manifest for every channel replaces the newest channel's full release list on every check. A channel's `<channel>.json` list is fetched only where it adds something: a delta chain is built across several releases, and when the manifest carries no usable release for the channel and variant — a board that failed to build that night, a version the gate rolled back, or a manifest that has fallen behind — the list is consulted for an older release.

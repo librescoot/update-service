@@ -51,7 +51,12 @@ func TestReleaseAssetHDiffCompatibility(t *testing.T) {
 	}
 	r.TagName = "testing-20261105T000000"
 	r.Assets = []Asset{{Name: "librescoot-unu-mdb-" + r.TagName + ".delta", Size: 100}, {Name: "librescoot-unu-mdb-" + r.TagName + ".hdelta", Size: 1}}
+	if a, ok := releaseAsset(r, "unu-mdb", ".delta"); !ok || a.Name != r.Assets[1].Name {
+		t.Fatal("testing must choose the smaller hdelta", a)
+	}
+	r.TagName = "v1.4.2"
+	r.Assets = []Asset{{Name: "librescoot-unu-mdb-" + r.TagName + ".delta", Size: 100}, {Name: "librescoot-unu-mdb-" + r.TagName + ".hdelta", Size: 1}}
 	if a, ok := releaseAsset(r, "unu-mdb", ".delta"); !ok || a.Name != r.Assets[0].Name {
-		t.Fatal("testing must use the standard delta", a)
+		t.Fatal("stable must use the standard delta", a)
 	}
 }

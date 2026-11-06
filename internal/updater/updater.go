@@ -4315,7 +4315,7 @@ func releaseAsset(release Release, variantID, ext string) (Asset, bool) {
 		if asset.Name == prefix+ext {
 			normal, hasNormal = asset, true
 		}
-		if ext == ".delta" && strings.HasPrefix(release.TagName, "nightly-") && asset.Name == prefix+".hdelta" {
+		if ext == ".delta" && (strings.HasPrefix(release.TagName, "nightly-") || strings.HasPrefix(release.TagName, "testing-")) && asset.Name == prefix+".hdelta" {
 			hdiff, hasHDiff = asset, true
 		}
 	}
