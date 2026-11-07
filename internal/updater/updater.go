@@ -1315,6 +1315,19 @@ func (u *Updater) listenForCommands() {
 // handleCommand handles incoming Redis commands
 func (u *Updater) handleCommand(command string) {
 	switch {
+	case strings.HasPrefix(command, "probe-hdelta:"):
+		nonce := strings.TrimPrefix(command, "probe-hdelta:")
+		if len(nonce) != 32 || strings.Trim(nonce, "0123456789abcdef") != "" {
+			return
+		}
+		supported := "0"
+		if _, err := exec.LookPath("hpatchz"); err == nil {
+			supported = "1"
+		}
+		if err := u.redis.GetClient().Set("ota:hdelta-probe:"+u.config.Component+":"+nonce, supported, time.Minute); err != nil {
+			u.logger.Printf("Failed to answer hdelta capability probe: %v", err)
+		}
+
 	case command == "check-now":
 		u.logger.Printf("Manual update check triggered")
 		u.wg.Add(1)

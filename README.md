@@ -31,7 +31,8 @@ Each instance accepts commands on `scooter:update:<component>`:
 | --- | --- |
 | `check-now` | Start an immediate release check. |
 | `preview-channel:<channel>` | Resolve the latest matching artifact for a valid channel without starting an update. |
-| `update-from-file:<path>` | Install a local `.mender` or `.delta` artifact. |
+| `probe-hdelta:<nonce>` | Check this running updater and its decoder. The 32-digit lowercase hexadecimal nonce identifies the response in `ota:hdelta-probe:<component>:<nonce>`, which contains `1` or `0` and expires after one minute. |
+| `update-from-file:<path>` | Install a local `.mender`, `.delta`, or `.hdelta` artifact. |
 | `apply-staged-updates` | Discover the artifacts UMS staged in this component's download dir, resolve them, and install once. |
 | `update-from-url:<url>` | Download and install an artifact from `http`, `https`, or `file` URL. |
 
