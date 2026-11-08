@@ -628,6 +628,9 @@ func TestHandleApplyStagedUpdatesRefusalSuppressedOnShutdown(t *testing.T) {
 // end to end through the handler: plan -> resolver order -> apply -> install
 // tail. The applier is stubbed (a real one needs xdelta3 and a real base), so
 // the seam records the ordered chain the handler hands it.
+// Only the deltas have to be uploaded: the base image of the running version
+// already sits in the download dir because update-service keeps it as the delta
+// base, so it is never a candidate and never needs to be transferred again.
 func TestHandleApplyStagedUpdatesAppliesMultiDeltaChain(t *testing.T) {
 	u, mr, installs := newStagedTestUpdater(t, "mdb")
 	dir := u.mender.GetDownloadDir()
