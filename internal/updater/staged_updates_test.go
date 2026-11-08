@@ -662,6 +662,79 @@ func TestHandleApplyStagedUpdatesAppliesMultiDeltaChain(t *testing.T) {
 	}
 }
 
+// A chain built on a stable release: the running version reads "1.3.0" while
+// the artifact names carry "v1.3.0", so the base lookup depends on the same
+// prefix normalization the delta target check uses. This is the shape a BLE
+// upload produces, because the base image of the running version had to be
+// uploaded beside the deltas for the chain to apply at all.
+func TestHandleApplyStagedUpdatesAppliesStableChainOnRunningVersion(t *testing.T) {
+	u, mr, installs := newStagedTestUpdater(t, "mdb")
+	dir := u.mender.GetDownloadDir()
+	mr.HSet("version:mdb", "version_id", "1.3.0")
+
+	baseSum := strings.Repeat("a", 64)
+	base := writeBaseMender(t, dir, "librescoot-unu-mdb-v1.3.0.mender", baseSum)
+	d1 := writeDeltaFile(t, dir, "librescoot-unu-mdb-v1.3.1.delta", baseSum, strings.Repeat("b", 64))
+	d2 := writeDeltaFile(t, dir, "librescoot-unu-mdb-v1.3.2.delta", strings.Repeat("b", 64), strings.Repeat("c", 64))
+
+	var applied []string
+	var gotBase, gotBaseFile string
+	assembled := filepath.Join(dir, "assembled-from-deltas.mender")
+	u.applyDeltaChain = func(_ context.Context, deltaPaths, _ []string, baseVersion string, _ mender.DeltaProgressCallback) (string, error) {
+		applied = append([]string{}, deltaPaths...)
+		gotBase = baseVersion
+		gotBaseFile, _ = u.mender.FindMenderFileForVersion(baseVersion)
+		return assembled, nil
+	}
+	u.config.DryRun = false
+	mr.HSet("ota", "reboot-owner:mdb", "ums")
+
+	u.handleApplyStagedUpdates()
+
+	if strings.Join(applied, ",") != d1+","+d2 {
+		t.Fatalf("applied chain = %v, want [%s %s]", applied, d1, d2)
+	}
+	if gotBase != "v1.3.0" {
+		t.Errorf("baseVersion = %q, want v1.3.0", gotBase)
+	}
+	if gotBaseFile != base {
+		t.Errorf("base image = %q, want %s", gotBaseFile, base)
+	}
+	if len(*installs) != 1 || (*installs)[0] != assembled {
+		t.Fatalf("installArtifact calls = %v, want exactly [%s]", *installs, assembled)
+	}
+	if got := mr.HGet("ota", "status:mdb"); got == "error" {
+		t.Fatalf("chain refused: %s", mr.HGet("ota", "error-message:mdb"))
+	}
+}
+
+// The same chain without the running version's base image cannot be applied:
+// this is what a user sees after uploading only the deltas over Bluetooth, and
+// it has to say so instead of installing something.
+func TestHandleApplyStagedUpdatesDeltasWithoutBaseAreRefused(t *testing.T) {
+	u, mr, installs := newStagedTestUpdater(t, "mdb")
+	dir := u.mender.GetDownloadDir()
+	mr.HSet("version:mdb", "version_id", "1.3.0")
+
+	writeDeltaFile(t, dir, "librescoot-unu-mdb-v1.3.1.delta", strings.Repeat("a", 64), strings.Repeat("b", 64))
+	writeDeltaFile(t, dir, "librescoot-unu-mdb-v1.3.2.delta", strings.Repeat("b", 64), strings.Repeat("c", 64))
+
+	var applied []string
+	u.applyDeltaChain = func(_ context.Context, deltaPaths, _ []string, _ string, _ mender.DeltaProgressCallback) (string, error) {
+		applied = append([]string{}, deltaPaths...)
+		return "", nil
+	}
+
+	u.handleApplyStagedUpdates()
+
+	if len(applied) != 0 || len(*installs) != 0 {
+		t.Fatalf("applied=%v installs=%v, want nothing", applied, *installs)
+	}
+	if got := mr.HGet("ota", "error:mdb"); got != "no-base-image" {
+		t.Fatalf("error:mdb = %q, want no-base-image", got)
+	}
+}
+
 // TestHandleApplyStagedUpdatesHoldsInstallNotPreparing observes the power-hold
 // handover at the instant the install runs: the install hold is present while
 // the preparing hold is already gone, so there is no window with neither.
