@@ -1455,6 +1455,9 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 
 	if !u.updateOpMu.TryLock() {
 		u.logger.Printf("Update already in progress, ignoring file request: %s", source)
+		if err := u.status.SetInstallRefused(u.ctx, "the scooter is already running an update"); err != nil {
+			u.logger.Printf("Failed to record install refusal: %v", err)
+		}
 		return
 	}
 	defer u.updateOpMu.Unlock()
@@ -1464,6 +1467,9 @@ func (u *Updater) handleUpdateFromFile(filePath string) {
 	// evidence about that image.
 	if u.gateWindowIsOpen() {
 		u.logger.Printf("Ignoring file update %s: the commit gate is evaluating a pending update", source)
+		if err := u.status.SetInstallRefused(u.ctx, "the scooter is still completing the previous update"); err != nil {
+			u.logger.Printf("Failed to record install refusal: %v", err)
+		}
 		return
 	}
 

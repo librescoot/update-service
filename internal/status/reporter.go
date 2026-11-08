@@ -355,6 +355,24 @@ func (r *Reporter) SetInstallProgress(ctx context.Context, percent int) error {
 	return r.pub.Set(r.key("install-progress"), percent)
 }
 
+// SetInstallRefused records that a local-artifact install request was dropped
+// before it ever started: the updater was already running another operation, or
+// the commit gate was evaluating a pending update. It deliberately writes
+// neither status nor the error fields — the gate reads those as evidence about
+// the image under test, and a refused request says nothing about any image. The
+// BLE receiver watches this field to tell the phone immediately that the
+// install it queued never started, instead of leaving it in "installing" until
+// its watchdog expires. The timestamp lets the receiver ignore a refusal that
+// was written before the install it is watching was queued.
+func (r *Reporter) SetInstallRefused(ctx context.Context, reason string) error {
+	value := strconv.FormatInt(time.Now().Unix(), 10) + ":" + reason
+	err := r.pub.Set(r.key("install-refused"), value, ipc.Sync())
+	if err == nil {
+		r.logger.Printf("Install refused for %s: %s", r.component, reason)
+	}
+	return err
+}
+
 // SetSkipChecksRemaining updates just the download-skip-checks field to the
 // count actually remaining after a skip was just served. SetAborted writes
 // the initial count when the backoff is first recorded, but nothing updated
