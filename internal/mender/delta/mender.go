@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -150,10 +151,29 @@ func VerifyPayloadAgainstManifest(outputDir, rootfsChecksum string) error {
 // the fixed header allows. Parsing those by hand hashes the wrong bytes and
 // fails later as a rootfs checksum mismatch, blaming the payload.
 //
-// Every byte the parse consumes is teed into gzip, so gzip still receives the
+// Every byte the parse consumes is teed into the compressor, so it still receives the
 // payload verbatim and the output is byte for byte what streaming it straight
 // through would produce.
 func CompressPayloadAndHash(payloadTarPath, compressedPath string, tracker *progressTracker) (rootfsChecksum string, err error) {
+	return compressPayloadAndHash(PayloadGzip, payloadTarPath, compressedPath, tracker)
+}
+
+// compressPayloadAndHash is CompressPayloadAndHash for either payload
+// compression. zstd runs single-threaded at its default level: the target has
+// one core, and a higher level costs minutes there for a few percent.
+func compressPayloadAndHash(format PayloadFormat, payloadTarPath, compressedPath string, tracker *progressTracker) (rootfsChecksum string, err error) {
+	var compCmd *exec.Cmd
+	switch format {
+	case PayloadGzip:
+		compCmd = lowPriorityCommand("gzip", "-3", "-c")
+	case PayloadZstd:
+		if !ZstdAvailable() {
+			return "", ErrZstdUnavailable
+		}
+		compCmd = lowPriorityCommand("zstd", "-3", "-T1", "-q", "-c")
+	default:
+		return "", fmt.Errorf("unknown payload format %q", format)
+	}
 	inFile, err := os.Open(payloadTarPath)
 	if err != nil {
 		return "", fmt.Errorf("open payload: %w", err)
@@ -166,26 +186,25 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, tracker *prog
 	}
 	defer outFile.Close()
 
-	gzipCmd := lowPriorityCommand("gzip", "-3", "-c")
-	gzipCmd.Stdout = outFile
-	gzipIn, err := gzipCmd.StdinPipe()
+	compCmd.Stdout = outFile
+	compIn, err := compCmd.StdinPipe()
 	if err != nil {
-		return "", fmt.Errorf("gzip stdin pipe: %w", err)
+		return "", fmt.Errorf("%s stdin pipe: %w", format, err)
 	}
 
-	if err := gzipCmd.Start(); err != nil {
-		return "", fmt.Errorf("start gzip: %w", err)
+	if err := compCmd.Start(); err != nil {
+		return "", fmt.Errorf("start %s: %w", format, err)
 	}
 
-	// Closing the pipe releases gzip, which is otherwise left blocked on a
+	// Closing the pipe releases the compressor, which is otherwise left blocked on a
 	// stdin that never ends.
 	abort := func(cause error) (string, error) {
-		_ = gzipIn.Close()
-		_ = gzipCmd.Wait()
+		_ = compIn.Close()
+		_ = compCmd.Wait()
 		return "", cause
 	}
 
-	tee := io.TeeReader(tracker.reader(inFile, "compressing"), gzipIn)
+	tee := io.TeeReader(tracker.reader(inFile, "compressing"), compIn)
 	tr := tar.NewReader(tee)
 
 	if _, err := tr.Next(); err != nil {
@@ -199,17 +218,17 @@ func CompressPayloadAndHash(payloadTarPath, compressedPath string, tracker *prog
 
 	// The tar reader stops at the end of the first member's content. Drain
 	// what follows (its padding, any later members, the end-of-archive
-	// blocks) straight through the tee, since only gzip needs those.
+	// blocks) straight through the tee, since only the compressor needs those.
 	if _, err := io.Copy(io.Discard, tee); err != nil {
 		return abort(fmt.Errorf("copy payload: %w", err))
 	}
 
-	if err := gzipIn.Close(); err != nil {
-		_ = gzipCmd.Wait()
-		return "", fmt.Errorf("close gzip stdin: %w", err)
+	if err := compIn.Close(); err != nil {
+		_ = compCmd.Wait()
+		return "", fmt.Errorf("close %s stdin: %w", format, err)
 	}
-	if err := gzipCmd.Wait(); err != nil {
-		return "", fmt.Errorf("gzip failed: %w", err)
+	if err := compCmd.Wait(); err != nil {
+		return "", fmt.Errorf("%s failed: %w", format, err)
 	}
 
 	return hex.EncodeToString(innerHasher.Sum(nil)), nil

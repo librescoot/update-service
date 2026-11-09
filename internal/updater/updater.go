@@ -4322,20 +4322,39 @@ func (u *Updater) findMenderAsset(release Release, variantID string) string {
 // librescoot-{variantID}-{tag}{ext}, the naming scheme CI uses for every
 // channel. Substring matching is unsafe here: "unu-mdb" is contained in
 // "unu-mdb-minimal", so a loose match could pick a bootstrap image.
+// zstdImageExt names a release's zstd-payload copy of a full image.
+const zstdImageExt = ".zmender"
+
 func isDeltaPath(path string) bool {
 	return strings.HasSuffix(path, ".delta") || strings.HasSuffix(path, ".hdelta")
 }
 
 func releaseAsset(release Release, variantID, ext string) (Asset, bool) {
 	prefix := "librescoot-" + variantID + "-" + release.TagName
-	var normal, hdiff Asset
-	var hasNormal, hasHDiff bool
+	var normal, hdiff, zstdImage Asset
+	var hasNormal, hasHDiff, hasZstdImage bool
 	for _, asset := range release.Assets {
 		if asset.Name == prefix+ext {
 			normal, hasNormal = asset, true
 		}
+		if ext == ".mender" && asset.Name == prefix+zstdImageExt {
+			zstdImage, hasZstdImage = asset, true
+		}
 		if ext == ".delta" && (strings.HasPrefix(release.TagName, "nightly-") || strings.HasPrefix(release.TagName, "testing-")) && asset.Name == prefix+".hdelta" {
 			hdiff, hasHDiff = asset, true
+		}
+	}
+	// The zstd copy of a full image is the same artifact with the rootfs payload
+	// recompressed, so it is only offered where the zstd tool is installed: an
+	// image that ships the tool also ships a Mender client that reads zstd.
+	// Anything else keeps taking the gzip artifact every release carries.
+	//
+	// The extension deliberately does not end in ".mender": clients and tools
+	// that pick artifacts by that suffix, including update-service releases
+	// that match by substring, must not mistake it for the standard artifact.
+	if hasZstdImage && zstdImage.Size > 0 && (!hasNormal || normal.Size <= 0 || zstdImage.Size < normal.Size) {
+		if _, err := exec.LookPath("zstd"); err == nil {
+			return zstdImage, true
 		}
 	}
 	if hasHDiff && hdiff.Size > 0 && (!hasNormal || normal.Size <= 0 || hdiff.Size < normal.Size) {

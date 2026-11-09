@@ -39,13 +39,30 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 		}
 	}
 
+	// The result keeps the base's payload compression. A zstd base needs the
+	// zstd tool for both ends, so a system without it refuses now rather than
+	// after the base has been unpacked.
+	format, err := BasePayloadFormat(oldMenderPath)
+	if err != nil {
+		return fmt.Errorf("read base payload format: %w", err)
+	}
+	if format == PayloadZstd && !ZstdAvailable() {
+		return ErrZstdUnavailable
+	}
+
 	// Extract old.mender (fast, no tracking)
 	a.logger.Printf("Extracting old mender (chain of %d deltas)", n)
 	if err := UnpackMender(oldMenderPath, outputDir); err != nil {
 		return fmt.Errorf("unpack old mender: %w", err)
 	}
 
-	compressedPayload := filepath.Join(dataDir, "0000.tar.gz")
+	compressedPayload, foundFormat, err := findPayload(dataDir)
+	if err != nil {
+		return fmt.Errorf("unpacked base: %w", err)
+	}
+	if foundFormat != format {
+		return fmt.Errorf("base payload is %s but its member list said %s", foundFormat, format)
+	}
 	payloadPath := filepath.Join(work, "payload")
 
 	compressedInfo, _ := os.Stat(compressedPayload)
@@ -60,13 +77,13 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 	if estimatedPayload == 0 {
 		estimatedPayload = compressedSize * 7 / 2
 	}
-	// Total work: 1 decompress + n xdelta steps + 1 compress
+	// Total work: 1 decompress + n delta steps + 1 compress
 	totalWork := estimatedPayload * (int64(n) + 2)
 
 	tracker := newProgressTracker(totalWork, progress)
 
 	// Decompress payload (slow — tracked)
-	if err := ShellGunzipTracked(compressedPayload, payloadPath, tracker); err != nil {
+	if err := decompressPayload(format, compressedPayload, payloadPath, tracker); err != nil {
 		return fmt.Errorf("decompress payload: %w", err)
 	}
 	// Best-effort: compressedPayload lives under workDir, which is removed
@@ -174,7 +191,7 @@ func (a *Applier) ApplyChain(ctx context.Context, oldMenderPath string, deltaPat
 	}
 
 	// Compress + rootfs checksum (slow — tracked)
-	rootfsChecksum, err := CompressPayloadAndHash(payloadPath, compressedPayload, tracker)
+	rootfsChecksum, err := compressPayloadAndHash(format, payloadPath, compressedPayload, tracker)
 	if err != nil {
 		return fmt.Errorf("compress payload: %w", err)
 	}

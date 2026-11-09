@@ -156,10 +156,7 @@ func (m *Manager) CleanupStaleTmpFiles(currentFilename string) error {
 
 // cleanupOldFiles removes old downloaded .mender files except the one we're about to download
 func (m *Manager) cleanupOldFiles(currentURL string) error {
-	currentFilename := filepath.Base(currentURL)
-	if currentFilename == "" || currentFilename == "." {
-		currentFilename = "update.mender"
-	}
+	currentFilename := LocalArtifactName(currentURL)
 
 	pattern := filepath.Join(m.downloader.downloadDir, "*.mender")
 	files, err := filepath.Glob(pattern)

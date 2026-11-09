@@ -654,3 +654,16 @@ func TestDownloader_ReadsBudgetFreshPerAttempt(t *testing.T) {
 		t.Fatalf("second attempt should honour the now-tightened budget, got %v", err)
 	}
 }
+
+func TestLocalArtifactName(t *testing.T) {
+	for _, tc := range []struct{ url, want string }{
+		{"https://example.org/dl/librescoot-unu-mdb-v1.4.2.mender", "librescoot-unu-mdb-v1.4.2.mender"},
+		{"https://example.org/dl/librescoot-unu-mdb-v1.4.2.zmender", "librescoot-unu-mdb-v1.4.2.mender"},
+		{"https://example.org/dl/librescoot-unu-mdb-nightly-20261109T030336.hdelta", "librescoot-unu-mdb-nightly-20261109T030336.hdelta"},
+		{"", "update.mender"},
+	} {
+		if got := LocalArtifactName(tc.url); got != tc.want {
+			t.Errorf("LocalArtifactName(%q) = %q, want %q", tc.url, got, tc.want)
+		}
+	}
+}

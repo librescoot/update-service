@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // ErrArtifactTooLarge reports an artifact whose rootfs payload is larger than
@@ -40,7 +42,7 @@ type headerInfo struct {
 // of its rootfs payload.
 //
 // A version 3 artifact is a tar holding "version", "manifest", "header.tar.gz"
-// and one "data/NNNN.tar.gz" per payload, in that order. The payload's
+// and one "data/NNNN.tar.gz" (or .tar.zst) per payload, in that order. The payload's
 // uncompressed size is in the tar header of the file inside data/0000, so only
 // the first few kilobytes of a several-hundred-megabyte member get read.
 func ReadArtifactInfo(path string) (*ArtifactInfo, error) {
@@ -125,8 +127,10 @@ func readDeviceTypes(r io.Reader) ([]string, error) {
 }
 
 // readPayloadEntry returns the name and uncompressed size of the first file in
-// a data/NNNN member. The member is a tar, optionally gzipped; other
-// compressions are reported as unsupported rather than guessed at.
+// a data/NNNN member. The member is a tar, gzipped or zstd-compressed; other
+// compressions are reported as unsupported rather than guessed at. Both are
+// decoded in-process so that this check does not depend on any tool being
+// installed.
 func readPayloadEntry(memberName string, r io.Reader) (string, int64, error) {
 	switch {
 	case strings.HasSuffix(memberName, ".tar.gz"):
@@ -136,6 +140,13 @@ func readPayloadEntry(memberName string, r io.Reader) (string, int64, error) {
 		}
 		defer gz.Close()
 		r = gz
+	case strings.HasSuffix(memberName, ".tar.zst"):
+		zr, err := zstd.NewReader(r, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(64<<20))
+		if err != nil {
+			return "", 0, fmt.Errorf("open %s: %w", memberName, err)
+		}
+		defer zr.Close()
+		r = zr
 	case strings.HasSuffix(memberName, ".tar"):
 		// already plain
 	default:

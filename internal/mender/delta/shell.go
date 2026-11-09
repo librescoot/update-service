@@ -60,34 +60,40 @@ func ShellGunzip(inputFile, outputFile string) error {
 
 // ShellGunzipTracked decompresses with byte tracking through the shared tracker.
 func ShellGunzipTracked(inputFile, outputFile string, tracker *progressTracker) error {
+	return shellDecompressTracked("gunzip", []string{"-c", inputFile}, outputFile, tracker)
+}
+
+// shellDecompressTracked runs a decompressor that writes to stdout and stores
+// the result in outputFile, counting bytes through the tracker when there is one.
+func shellDecompressTracked(name string, args []string, outputFile string, tracker *progressTracker) error {
 	outFile, err := os.Create(outputFile)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
 	defer outFile.Close()
 
-	cmd := lowPriorityCommand("gunzip", "-c", inputFile)
+	cmd := lowPriorityCommand(name, args...)
 	cmd.Stderr = os.Stderr
 
 	if tracker != nil {
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			return fmt.Errorf("gunzip stdout pipe: %w", err)
+			return fmt.Errorf("%s stdout pipe: %w", name, err)
 		}
 		if err := cmd.Start(); err != nil {
-			return fmt.Errorf("gunzip start: %w", err)
+			return fmt.Errorf("%s start: %w", name, err)
 		}
 		if _, err := io.Copy(outFile, tracker.reader(stdout, "decompressing")); err != nil {
 			_ = cmd.Wait()
-			return fmt.Errorf("gunzip copy: %w", err)
+			return fmt.Errorf("%s copy: %w", name, err)
 		}
 		if err := cmd.Wait(); err != nil {
-			return fmt.Errorf("gunzip failed: %w", err)
+			return fmt.Errorf("%s failed: %w", name, err)
 		}
 	} else {
 		cmd.Stdout = outFile
 		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("gunzip failed: %w", err)
+			return fmt.Errorf("%s failed: %w", name, err)
 		}
 	}
 

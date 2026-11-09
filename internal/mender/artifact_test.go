@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // writeTar writes a tar of the given name/content pairs.
@@ -356,5 +358,73 @@ func TestCheckArtifactFitsWithOneDeviceUnreadable(t *testing.T) {
 	}
 	if err := inst.checkArtifactFits(buildArtifact(t, nil, "rootfs.ext4", 4000)); err != nil {
 		t.Fatalf("got %v, want nil", err)
+	}
+}
+
+func zstdBytesForTest(t *testing.T, raw string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw, err := zstd.NewWriter(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(zw, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestReadArtifactInfoZstdPayload(t *testing.T) {
+	hi := headerInfo{}
+	hi.ArtifactDepends.DeviceType = []string{"unu-mdb"}
+	hiJSON, err := json.Marshal(hi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := gzTar(t, [][2]string{{"header-info", string(hiJSON)}, {"headers/0000/type-info", "{}"}})
+
+	var tarBuf bytes.Buffer
+	writeTar(t, &tarBuf, [][2]string{{"rootfs.ext4", strings.Repeat("\x00", 1<<20)}})
+	payload := zstdBytesForTest(t, tarBuf.String())
+
+	path := filepath.Join(t.TempDir(), "zst.mender")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	tw := tar.NewWriter(f)
+	for _, e := range []struct {
+		name string
+		body []byte
+	}{
+		{"version", []byte(`{"format":"mender","version":3}`)},
+		{"manifest", []byte("deadbeef  data/0000/rootfs.ext4\n")},
+		{"header.tar.gz", []byte(header)},
+		{"data/0000.tar.zst", payload},
+	} {
+		if err := tw.WriteHeader(&tar.Header{Name: e.name, Mode: 0o600, Size: int64(len(e.body))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(e.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := ReadArtifactInfo(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.PayloadName != "rootfs.ext4" || info.PayloadSize != 1<<20 {
+		t.Errorf("payload = %q, %d bytes", info.PayloadName, info.PayloadSize)
+	}
+	if len(info.DeviceTypes) != 1 || info.DeviceTypes[0] != "unu-mdb" {
+		t.Errorf("device types = %v", info.DeviceTypes)
 	}
 }

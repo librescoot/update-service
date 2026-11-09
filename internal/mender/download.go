@@ -177,12 +177,26 @@ func (d *Downloader) CleanupStaleTmpFiles(currentFilename string) error {
 	return nil
 }
 
-// Download downloads a file from the given URL with resumable downloads and retry logic
-func (d *Downloader) Download(ctx context.Context, url string, progressCallback ProgressCallback) (string, error) {
+// LocalArtifactName is the file name a download is stored under. A release's
+// zstd copy of a full image (".zmender") is stored as the ".mender" it stands
+// in for, since everything that finds, ranks and cleans up artifacts looks for
+// that name. A copy fetched under one name can therefore be completed or
+// replaced by the other; the checksum check after the download catches a
+// resume that mixed the two.
+func LocalArtifactName(url string) string {
 	filename := filepath.Base(url)
 	if filename == "" || filename == "." {
-		filename = "update.mender"
+		return "update.mender"
 	}
+	if strings.HasSuffix(filename, ".zmender") {
+		return strings.TrimSuffix(filename, ".zmender") + ".mender"
+	}
+	return filename
+}
+
+// Download downloads a file from the given URL with resumable downloads and retry logic
+func (d *Downloader) Download(ctx context.Context, url string, progressCallback ProgressCallback) (string, error) {
+	filename := LocalArtifactName(url)
 
 	// Read once, at the top of this attempt: the spec promise is that the
 	// budget in effect for an attempt is whatever was configured when the

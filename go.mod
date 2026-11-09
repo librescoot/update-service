@@ -4,6 +4,7 @@ go 1.22.1
 
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
+	github.com/klauspost/compress v1.18.0
 	github.com/librescoot/librescoot-mender-status v0.1.0
 	github.com/librescoot/redis-ipc v0.15.4
 	golang.org/x/sys v0.30.0
