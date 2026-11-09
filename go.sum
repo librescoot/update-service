@@ -16,6 +16,8 @@ github.com/librescoot/librescoot-mender-status v0.1.0 h1:nQNlwwka1gDYGCCVAvLxCj2
 github.com/librescoot/librescoot-mender-status v0.1.0/go.mod h1:BadhSjAJaipOAOST6Q1O5ViJbZlcaWxOZi8deTVxHjQ=
 github.com/librescoot/redis-ipc v0.15.3 h1:TziMMjcb9Erm3zfBODWit9RU2BXFrUtz8mTCzoyMD8U=
 github.com/librescoot/redis-ipc v0.15.3/go.mod h1:uvlJaUd1WzRMjZy7dYCHJ6qphCDeYD5orGK9CLudv1Q=
+github.com/librescoot/redis-ipc v0.15.4 h1:Ls1s+QnqWKDOPVP0RR3h/fQDfLa30hT5ChwBQst9E44=
+github.com/librescoot/redis-ipc v0.15.4/go.mod h1:uvlJaUd1WzRMjZy7dYCHJ6qphCDeYD5orGK9CLudv1Q=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/redis/go-redis/v9 v9.18.0 h1:pMkxYPkEbMPwRdenAzUNyFNrDgHx9U+DrBabWNfSRQs=
