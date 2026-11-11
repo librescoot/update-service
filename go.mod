@@ -6,7 +6,7 @@ require (
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/klauspost/compress v1.18.0
 	github.com/librescoot/librescoot-mender-status v0.1.0
-	github.com/librescoot/redis-ipc v0.15.4
+	github.com/librescoot/redis-ipc v0.15.5-0.20261111175103-0bca8184dc69
 	golang.org/x/sys v0.30.0
 )
 
