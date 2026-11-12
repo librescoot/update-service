@@ -35,6 +35,17 @@ func rolledBackUpdater(t *testing.T, markerBootID string) (*Updater, *miniredis.
 		}, nil
 	}
 	u.runningVersion = func() (string, error) { return committedVersion, nil }
+	u.rootfsOrigin = func() (mender.RootfsOrigin, error) {
+		return mender.RootfsOrigin{OriginalSlot: "slot-a", Artifact: pendingArtifact, CommittedArtifact: committedArtifact}, nil
+	}
+	u.bootState = func() (mender.BootState, error) {
+		b := mender.BootState{RunningSlot: "slot-a", OtherSlot: "slot-b", SelectedSlot: "slot-a"}
+		if markerBootID == "boot-current" || markerBootID == "" {
+			b.SelectedSlot = "slot-b"
+			b.UpgradeAvailable = true
+		}
+		return b, nil
+	}
 	if markerBootID != "" {
 		if err := dbcstate.SaveActivationAttempt(u.activationAttempt, dbcstate.ActivationAttempt{
 			Artifact: pendingArtifact,
@@ -54,7 +65,13 @@ func TestRolledBackActivationFinalizesWithoutReboot(t *testing.T) {
 		t.Fatal(err)
 	}
 	rolledBack := false
-	u.rollbackUpdate = func() error { rolledBack = true; return nil }
+	u.rollbackUpdate = func() error {
+		rolledBack = true
+		u.observeUpdate = func() (mender.UpdateObservation, error) {
+			return mender.UpdateObservation{State: mender.StateNoUpdate, CommittedArtifact: committedArtifact, CommittedVersion: committedVersion}, nil
+		}
+		return nil
+	}
 
 	reconciliation, err := u.ReconcilePendingUpdate()
 	if err != nil {
@@ -73,13 +90,13 @@ func TestRolledBackActivationFinalizesWithoutReboot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != status.StatusIdle {
-		t.Fatalf("status after rollback = %q, want idle", got)
+	if got != status.StatusError {
+		t.Fatalf("status after rollback = %q, want error", got)
 	}
 }
 
-// Same boot ID means the reboot never actually happened: keep the retry path
-// (return needsReboot) and clear the marker so the next boot re-saves it.
+// Same boot ID with a staged target means activation is still owed. Retain
+// the original evidence while retrying the reboot.
 func TestSameBootActivationRetriesReboot(t *testing.T) {
 	u, _, marker := rolledBackUpdater(t, "boot-current")
 	u.rollbackUpdate = func() error {
@@ -94,8 +111,8 @@ func TestSameBootActivationRetriesReboot(t *testing.T) {
 	if !reconciliation.NeedsReboot {
 		t.Fatal("same-boot activation should still request the reboot")
 	}
-	if _, err := dbcstate.LoadActivationAttempt(marker); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("same-boot marker should be cleared before retrying, got err=%v", err)
+	if _, err := dbcstate.LoadActivationAttempt(marker); err != nil {
+		t.Errorf("same-boot marker should survive retrying: %v", err)
 	}
 }
 
@@ -115,12 +132,10 @@ func TestTriggerRebootKeepsActivationMarkerOnLocalRebootError(t *testing.T) {
 	}
 }
 
-// A fresh install must not inherit an activation marker from an earlier
-// attempt for the same artifact, or the next startup would finalise a rollback
-// before the new activation is attempted.
-func TestFreshInstallClearsStaleActivationMarker(t *testing.T) {
+// An unresolved earlier attempt must be reconciled before a fresh install.
+func TestFreshInstallRejectsUnresolvedActivationMarker(t *testing.T) {
 	events := []string{}
-	u := newInstallGateTestUpdater("dbc", &fakeDBCInstallGuard{events: &events}, nil, &events)
+	u := newInstallGateTestUpdater(t, "dbc", &fakeDBCInstallGuard{events: &events}, nil, &events)
 	u.activationAttempt = filepath.Join(t.TempDir(), "dbc-activation-attempt")
 	if err := dbcstate.SaveActivationAttempt(u.activationAttempt, dbcstate.ActivationAttempt{
 		Artifact: pendingArtifact,
@@ -129,10 +144,10 @@ func TestFreshInstallClearsStaleActivationMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := u.installMender("/tmp/artifact.mender"); err != nil {
-		t.Fatalf("installMender: %v", err)
+	if err := u.installMender("/tmp/artifact.mender"); err == nil {
+		t.Fatal("install overwrote unresolved activation marker")
 	}
-	if _, err := dbcstate.LoadActivationAttempt(u.activationAttempt); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("stale activation marker survived a fresh install, got err=%v", err)
+	if _, err := dbcstate.LoadActivationAttempt(u.activationAttempt); err != nil {
+		t.Errorf("unresolved marker was lost: %v", err)
 	}
 }

@@ -1,6 +1,5 @@
-// Package dbcstate persists the last stable dashboard version/update facts on
-// the MDB so they remain observable while the dashboard is powered off and
-// after Redis data loss.
+// Package dbcstate persists dashboard observations on the MDB and activation
+// attempts on each component, independently of Redis and the rootfs slot.
 package dbcstate
 
 import (
@@ -38,9 +37,19 @@ func Load(path string) (Snapshot, error) {
 	return snapshot, nil
 }
 
+// ActivationAttempt is shared by both component updaters. Schema zero is the
+// historical DBC reboot marker; it needs local Mender evidence before migration.
 type ActivationAttempt struct {
-	Artifact string `json:"artifact"`
-	BootID   string `json:"boot_id"`
+	Schema            int    `json:"schema,omitempty"`
+	AttemptID         string `json:"attempt_id,omitempty"`
+	Component         string `json:"component,omitempty"`
+	Artifact          string `json:"artifact"`
+	BootID            string `json:"boot_id"`
+	CommittedArtifact string `json:"committed_artifact,omitempty"`
+	OriginalSlot      string `json:"original_slot,omitempty"`
+	TargetSlot        string `json:"target_slot,omitempty"`
+	Phase             string `json:"phase,omitempty"`
+	ObservedBootID    string `json:"observed_boot_id,omitempty"`
 }
 
 func LoadActivationAttempt(path string) (ActivationAttempt, error) {
@@ -50,22 +59,22 @@ func LoadActivationAttempt(path string) (ActivationAttempt, error) {
 	}
 	var attempt ActivationAttempt
 	if err := json.Unmarshal(data, &attempt); err != nil {
-		return ActivationAttempt{}, fmt.Errorf("decode DBC activation attempt: %w", err)
+		return ActivationAttempt{}, fmt.Errorf("decode activation attempt: %w", err)
 	}
-	if attempt.Artifact == "" || attempt.BootID == "" {
-		return ActivationAttempt{}, fmt.Errorf("incomplete DBC activation attempt")
+	if err := validateAttempt(attempt); err != nil {
+		return ActivationAttempt{}, err
 	}
 	return attempt, nil
 }
 
 func SaveActivationAttempt(path string, attempt ActivationAttempt) error {
-	if attempt.Artifact == "" || attempt.BootID == "" {
-		return fmt.Errorf("refusing to save an incomplete activation attempt")
+	if err := validateAttempt(attempt); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".dbc-activation-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".activation-*")
 	if err != nil {
 		return err
 	}
@@ -98,11 +107,42 @@ func SaveActivationAttempt(path string, attempt ActivationAttempt) error {
 	return dir.Sync()
 }
 
-func ClearActivationAttempt(path string) error {
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
+func validateAttempt(a ActivationAttempt) error {
+	if a.Artifact == "" {
+		return fmt.Errorf("activation attempt has no artifact")
+	}
+	if a.Schema == 0 && a.BootID != "" {
+		return nil
+	}
+	if a.Schema != 1 || a.AttemptID == "" || (a.Component != "mdb" && a.Component != "dbc") ||
+		a.CommittedArtifact == "" || a.OriginalSlot == "" || a.TargetSlot == "" || a.OriginalSlot == a.TargetSlot {
+		return fmt.Errorf("incomplete activation attempt")
+	}
+	switch a.Phase {
+	case "installing", "staged":
+		if a.BootID == "" {
+			return fmt.Errorf("activation attempt has no originating boot ID")
+		}
+	case "adopted", "rolling-back", "committed", "rolled-back", "not-staged":
+	default:
+		return fmt.Errorf("unknown activation phase %q", a.Phase)
 	}
 	return nil
+}
+
+func ClearActivationAttempt(path string) error {
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 // Save atomically replaces path using a temporary file in the same directory,

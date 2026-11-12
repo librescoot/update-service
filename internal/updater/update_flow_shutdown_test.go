@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/librescoot/update-service/internal/commitgate"
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/inhibitor"
 	"github.com/librescoot/update-service/internal/mender"
@@ -48,6 +49,20 @@ func newUpdateFlowUpdater(t *testing.T) (*Updater, *miniredis.Miniredis) {
 		logger:     logger,
 		mender:     mender.NewManager(t.TempDir(), func() mender.Budget { return mender.Budget{} }, logger),
 		ctx:        context.Background(),
+	}
+	dir := t.TempDir()
+	u.activationAttempt = filepath.Join(dir, "activation")
+	u.gateStore = commitgate.NewStoreAt(filepath.Join(dir, "gate"), filepath.Join(dir, "quarantine"))
+	u.bootID = func() (string, error) { return "boot-a", nil }
+	u.runningVersion = func() (string, error) { return "v1.3.1", nil }
+	u.bootState = func() (mender.BootState, error) {
+		return mender.BootState{RunningSlot: "slot-a", OtherSlot: "slot-b", SelectedSlot: "slot-a"}, nil
+	}
+	u.artifactInfo = func(string) (*mender.ArtifactInfo, error) {
+		return &mender.ArtifactInfo{ArtifactName: "release-nightly-20260912T062254"}, nil
+	}
+	u.observeUpdate = func() (mender.UpdateObservation, error) {
+		return mender.UpdateObservation{State: mender.StateNoUpdate, CommittedArtifact: "release-v1.3.1", CommittedVersion: "v1.3.1"}, nil
 	}
 	return u, mr
 }

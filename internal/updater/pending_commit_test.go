@@ -5,11 +5,13 @@ import (
 	"errors"
 	"io"
 	"log"
-	"reflect"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
 
+	"github.com/librescoot/update-service/internal/commitgate"
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/mender"
 	"github.com/librescoot/update-service/internal/redis"
@@ -25,7 +27,17 @@ func newPendingCommitUpdater(t *testing.T) (*Updater, *miniredis.Miniredis) {
 	}
 	t.Cleanup(func() { _ = rc.Close() })
 	logger := log.New(io.Discard, "", 0)
+	dir := t.TempDir()
 	return &Updater{
+		activationAttempt: filepath.Join(dir, "activation"),
+		gateStore:         commitgate.NewStoreAt(filepath.Join(dir, "gate"), filepath.Join(dir, "quarantine")),
+		bootID:            func() (string, error) { return "boot-current", nil },
+		bootState: func() (mender.BootState, error) {
+			return mender.BootState{RunningSlot: "slot-b", OtherSlot: "slot-a", SelectedSlot: "slot-b", UpgradeAvailable: true}, nil
+		},
+		rootfsOrigin: func() (mender.RootfsOrigin, error) {
+			return mender.RootfsOrigin{OriginalSlot: "slot-a", Artifact: "release-v1.4.0", CommittedArtifact: "release-v1.3.1"}, nil
+		},
 		config: &config.Config{Component: "mdb"},
 		redis:  rc,
 		status: status.NewReporter(rc.GetClient(), "mdb", logger),
@@ -53,6 +65,9 @@ func TestPendingCommitVerifiesBeforeAndAfterCommit(t *testing.T) {
 	}
 	u.commitUpdate = func() error {
 		calls = append(calls, "commit")
+		u.bootState = func() (mender.BootState, error) {
+			return mender.BootState{RunningSlot: "slot-b", OtherSlot: "slot-a", SelectedSlot: "slot-b"}, nil
+		}
 		return nil
 	}
 
@@ -63,8 +78,8 @@ func TestPendingCommitVerifiesBeforeAndAfterCommit(t *testing.T) {
 	if reconciliation.NeedsReboot {
 		t.Fatal("commit-complete update still needs reboot")
 	}
-	if want := []string{"observe", "running", "commit", "observe"}; !reflect.DeepEqual(calls, want) {
-		t.Fatalf("calls = %v, want %v", calls, want)
+	if got := strings.Join(calls, ","); !strings.HasPrefix(got, "observe,running,") || !strings.HasSuffix(got, "commit,observe") {
+		t.Fatalf("commit was not surrounded by verification: %v", calls)
 	}
 	if got := mr.HGet("ota", "status:mdb"); got != "idle" {
 		t.Fatalf("status = %q, want idle", got)
@@ -76,6 +91,9 @@ func TestPendingCommitVerifiesBeforeAndAfterCommit(t *testing.T) {
 
 func TestPendingCommitRecognizesPreRebootCommittedRootfs(t *testing.T) {
 	u, _ := newPendingCommitUpdater(t)
+	u.bootState = func() (mender.BootState, error) {
+		return mender.BootState{RunningSlot: "slot-a", OtherSlot: "slot-b", SelectedSlot: "slot-b", UpgradeAvailable: true}, nil
+	}
 	u.observeUpdate = func() (mender.UpdateObservation, error) {
 		return mender.UpdateObservation{
 			State: mender.StateNeedsCommit, CommittedArtifact: "release-v1.3.1",

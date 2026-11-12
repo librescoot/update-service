@@ -2,15 +2,12 @@ package updater
 
 import (
 	"errors"
-	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
-	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/mender"
 )
 
@@ -100,25 +97,48 @@ func (g *fakeDBCInstallGuard) RemoveDBCInstallInhibit() error {
 	return g.removeErr
 }
 
-func newInstallGateTestUpdater(component string, guard dbcInstallGuard, installErr error, events *[]string) *Updater {
-	return &Updater{
-		config:          &config.Config{Component: component},
-		dbcInstallGuard: guard,
-		installArtifact: func(path string, progress mender.InstallProgressCallback) error {
-			*events = append(*events, "install:"+path)
-			if progress == nil {
-				panic("install progress callback is nil")
-			}
-			return installErr
-		},
-		logger: log.New(io.Discard, "", 0),
+func newInstallGateTestUpdater(t *testing.T, component string, guard dbcInstallGuard, installErr error, events *[]string) *Updater {
+	t.Helper()
+	u, _ := newPendingCommitUpdater(t)
+	u.config.Component = component
+	u.artifactInfo = func(string) (*mender.ArtifactInfo, error) {
+		return &mender.ArtifactInfo{ArtifactName: "release-v1.4.0"}, nil
 	}
+	u.runningVersion = func() (string, error) { return "v1.3.1", nil }
+	staged := false
+	u.bootState = func() (mender.BootState, error) {
+		b := mender.BootState{RunningSlot: "slot-a", OtherSlot: "slot-b", SelectedSlot: "slot-a"}
+		if staged {
+			b.SelectedSlot = "slot-b"
+			b.UpgradeAvailable = true
+		}
+		return b, nil
+	}
+	u.observeUpdate = func() (mender.UpdateObservation, error) {
+		o := mender.UpdateObservation{State: mender.StateNoUpdate, CommittedArtifact: "release-v1.3.1", CommittedVersion: "v1.3.1"}
+		if staged {
+			o.State = mender.StateNeedsCommit
+			o.PendingArtifact = "release-v1.4.0"
+			o.PendingVersion = "v1.4.0"
+		}
+		return o, nil
+	}
+	u.dbcInstallGuard = guard
+	u.installArtifact = func(path string, progress mender.InstallProgressCallback) error {
+		*events = append(*events, "install:"+path)
+		if progress == nil {
+			panic("install progress callback is nil")
+		}
+		staged = installErr == nil
+		return installErr
+	}
+	return u
 }
 
 func TestInstallMenderDBCOrdersBlockAroundInstall(t *testing.T) {
 	var events []string
 	guard := &fakeDBCInstallGuard{events: &events}
-	u := newInstallGateTestUpdater("dbc", guard, nil, &events)
+	u := newInstallGateTestUpdater(t, "dbc", guard, nil, &events)
 
 	if err := u.installMender("image.mender"); err != nil {
 		t.Fatalf("installMender() failed: %v", err)
@@ -132,7 +152,7 @@ func TestInstallMenderDBCRejectsInstallWithoutBlock(t *testing.T) {
 	var events []string
 	blockErr := errors.New("redis unavailable")
 	guard := &fakeDBCInstallGuard{events: &events, addErr: blockErr}
-	u := newInstallGateTestUpdater("dbc", guard, nil, &events)
+	u := newInstallGateTestUpdater(t, "dbc", guard, nil, &events)
 
 	if err := u.installMender("image.mender"); !errors.Is(err, blockErr) {
 		t.Fatalf("installMender() error = %v, want wrapped block error", err)
@@ -146,7 +166,7 @@ func TestInstallMenderDBCReleasesBlockAfterInstallFailure(t *testing.T) {
 	var events []string
 	installErr := errors.New("mender failed")
 	guard := &fakeDBCInstallGuard{events: &events}
-	u := newInstallGateTestUpdater("dbc", guard, installErr, &events)
+	u := newInstallGateTestUpdater(t, "dbc", guard, installErr, &events)
 
 	if err := u.installMender("image.mender"); !errors.Is(err, installErr) {
 		t.Fatalf("installMender() error = %v, want install error", err)
@@ -159,7 +179,7 @@ func TestInstallMenderDBCReleasesBlockAfterInstallFailure(t *testing.T) {
 func TestInstallMenderMDBDoesNotUseDBCBlock(t *testing.T) {
 	var events []string
 	guard := &fakeDBCInstallGuard{events: &events}
-	u := newInstallGateTestUpdater("mdb", guard, nil, &events)
+	u := newInstallGateTestUpdater(t, "mdb", guard, nil, &events)
 
 	if err := u.installMender("image.mender"); err != nil {
 		t.Fatalf("installMender() failed: %v", err)

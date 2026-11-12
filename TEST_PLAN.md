@@ -601,6 +601,23 @@ The update-service is **moderately difficult to test** but not impossible. The m
 
 With proper interfaces, mocks, and test utilities, you can achieve good test coverage (70-80% overall). Some components (external commands, complex timing) may be better suited for integration/E2E tests rather than unit tests.
 
+## Activation recovery
+
+`internal/updater/activation_test.go` uses a temporary durable store, scripted Mender and boot-state observations, and miniredis. It covers both components: same-boot staging, trial boot, verified fallback, legacy-marker adoption, missing-marker recovery, same-version reinstall, install intent before the installer runs, and failure before any rootfs write. Contradictory identities, slots, boot IDs and bootloader flags must not commit or roll back. Rollback errors, surviving pending state, wrong post-rollback selection and quarantine write failures retain evidence and report errors.
+
+Crash-gap cases retain the on-disk attempt while reconstructing Redis: intent before install, install staged before marker finalization, commit completed before record removal, rollback completed before record removal, and outcome saved before active-record removal. Quarantine tests reject the failed cached artifact at the installer and discovery boundaries while permitting a newer release.
+
+`internal/mender/bootstate_test.go` checks strict decimal/hex environment parsing, malformed original-partition records, module-tree identities and block-device validation. The original-partition record is parsed as data, never executed.
+
+Hardware acceptance is separate from these automated tests. On an explicitly authorized bench:
+
+1. Commit a bridge image containing the recovery reader in the fallback slot before testing subsequent failed activations.
+2. Verify the mounted rootfs device, configured A/B devices, rootfs module `tmp/orig-part`, exact artifact identities and all three boot environment fields during install, trial boot and fallback.
+3. Exercise a successful full and delta update, then an intentionally failed activation. Confirm the original slot remains selected after verified Mender rollback, the failed artifact is quarantined and a newer update can install.
+4. Repeat UMS staging with its MDB reboot ownership in place and with an updater restart between staging and reboot. No updater reboot may interrupt the DBC installation UMS is waiting for.
+5. Interrupt the process before and after intent persistence, Mender staging, commit, rollback and outcome persistence. Flush Redis separately. Contradictions and write failures must retain the active record and must not report idle or repeatedly reboot.
+6. Confirm the optional gate still commits healthy trials and requests only one verified rollback reboot. A rollback that cannot be verified must retain evidence without another destructive retry.
+
 ## Commit Gate
 
 `internal/commitgate/store.go` is pure file state and is covered directly: round trips, an absent marker, refusing an incomplete marker, idempotent quarantine adds, pruning that keeps entries at or above the running version, and the component-scoped paths. `internal/updater/commitgate_test.go` drives the decision with a scripted probe set, an injected clock, an injected reboot, and a store in a temporary directory:
@@ -612,12 +629,12 @@ With proper interfaces, mocks, and test utilities, you can achieve good test cov
 - the kill switch commits without a verdict
 - a reboot inside the window resumes it, keeping the original deadline and adopting the new boot, and the resumed window still commits; the same reboot past the deadline rolls back once
 - a boot after a requested rollback holds and reports without rebooting
-- a second boot on the committed slot finalises the revert to `idle` and does not reboot
+- a second boot on the committed slot verifies rollback, reports `activation-failed` and does not reboot
 - a stale marker for another artifact is discarded
 - a failed commit, an artifact Mender replaced, and a marker that cannot be written each reach their own terminal outcome
 - the quarantine keeps a rejected version out of the staged path and out of release selection, and leaves a newer release alone
 - the window flag is observable while the gate runs and closed with it, under `-race`
-- the component split: the MDB gates on its own power-manager state while the DBC does not read it, the required units are component-scoped, the DBC's window closes its activation-attempt marker on commit, on a revert and when the gate holds, and a verified DBC commit still hands `complete-dbc` to vehicle-service
+- the component split: the MDB gates on its own power-manager state while the DBC does not read it, the required units are component-scoped, verified commits and reverts close the activation record, unverified rollbacks retain it, and verified DBC completion still hands `complete-dbc` to vehicle-service
 - the default in the gate snapshot: nightly MDB gates, nightly DBC and every other combination does not, an explicit setting wins in both directions, clearing `commit-gate` returns the device to its default, and a channel change moves that default with it
 - the floor is component-scoped: three minutes on the MDB and one minute on the DBC
 

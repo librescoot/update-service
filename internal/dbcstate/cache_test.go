@@ -45,6 +45,41 @@ func TestActivationAttemptRoundTrip(t *testing.T) {
 	}
 }
 
+func TestComponentActivationAttemptRoundTrip(t *testing.T) {
+	for _, component := range []string{"mdb", "dbc"} {
+		t.Run(component, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), component+"-activation-attempt")
+			a := ActivationAttempt{Schema: 1, AttemptID: "unique-attempt", Component: component, Artifact: "release-new", CommittedArtifact: "release-old", BootID: "boot-original", OriginalSlot: "slot-a", TargetSlot: "slot-b", Phase: "installing"}
+			if err := SaveActivationAttempt(path, a); err != nil {
+				t.Fatal(err)
+			}
+			got, err := LoadActivationAttempt(path)
+			if err != nil || got != a {
+				t.Fatalf("got %+v %v", got, err)
+			}
+			// Bad writes cannot replace the last complete record.
+			bad := a
+			bad.TargetSlot = bad.OriginalSlot
+			if err := SaveActivationAttempt(path, bad); err == nil {
+				t.Fatal("accepted identical slots")
+			}
+			got, err = LoadActivationAttempt(path)
+			if err != nil || got != a {
+				t.Fatal("bad write replaced durable evidence", err)
+			}
+			a.BootID = ""
+			a.Phase = "adopted"
+			if err := SaveActivationAttempt(path, a); err != nil {
+				t.Fatal("legacy unknown boot ID was not retained", err)
+			}
+			a.Schema = 2
+			if err := SaveActivationAttempt(path, a); err == nil {
+				t.Fatal("accepted unknown schema")
+			}
+		})
+	}
+}
+
 func TestSaveRejectsEmptyRunningVersion(t *testing.T) {
 	if err := Save(filepath.Join(t.TempDir(), "dbc-state.json"), Snapshot{}); err == nil {
 		t.Fatal("expected empty running version to be rejected")

@@ -52,6 +52,9 @@ type Updater struct {
 	dbcStateCache     string
 	activationAttempt string
 	bootID            func() (string, error)
+	bootState         func() (mender.BootState, error)
+	rootfsOrigin      func() (mender.RootfsOrigin, error)
+	artifactInfo      func(string) (*mender.ArtifactInfo, error)
 	// Commit gate. gateEvaluate is nil in production and falls back to
 	// evaluateCommitGateProbes; the gate tests substitute it, as they do
 	// observeUpdate and runningVersion above.
@@ -140,16 +143,34 @@ func (u *Updater) installMender(path string) error {
 				u.logger.Printf("Failed to remove DBC install inhibit: %v", err)
 			}
 		}()
-		// A fresh install supersedes any activation attempt left behind by an
-		// earlier one for the same artifact. Without this, a stale marker whose
-		// boot ID differs from the current one would make the next startup
-		// finalise a rollback before the new activation is even attempted.
-		if err := dbcstate.ClearActivationAttempt(u.activationAttempt); err != nil {
-			return fmt.Errorf("clear stale DBC activation attempt: %w", err)
-		}
 	}
 
-	return u.installArtifact(path, u.menderInstallProgressCb())
+	if err := u.recordInstallIntent(path); err != nil {
+		return fmt.Errorf("persist activation intent before install: %w", err)
+	}
+	installErr := u.installArtifact(path, u.menderInstallProgressCb())
+	if u.ctx.Err() != nil {
+		return installErr
+	}
+	observation, err := u.observeUpdate()
+	if err != nil {
+		return fmt.Errorf("observe install result (install error %v): %w", installErr, err)
+	}
+	if _, err := u.reconcileActivation(observation); err != nil {
+		return fmt.Errorf("verify install result (install error %v): %w", installErr, err)
+	}
+	if installErr != nil {
+		return installErr
+	}
+	if observation.PendingArtifact == "" || observation.State != mender.StateNeedsCommit {
+		return fmt.Errorf("install did not leave a staged Mender artifact")
+	}
+	attempt, err := dbcstate.LoadActivationAttempt(u.activationAttempt)
+	if err != nil {
+		return err
+	}
+	attempt.Phase = "staged"
+	return dbcstate.SaveActivationAttempt(u.activationAttempt, attempt)
 }
 
 // New creates a new component-aware updater
@@ -210,7 +231,10 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 			return localRebootCommand().Run()
 		},
 		dbcStateCache:     dbcstate.DefaultPath,
-		activationAttempt: dbcstate.DefaultActivationAttempt,
+		activationAttempt: filepath.Join("/data/ota", cfg.Component+"-activation-attempt"),
+		bootState:         func() (mender.BootState, error) { return mender.ReadBootState(updaterCtx) },
+		rootfsOrigin:      mender.ReadRootfsOrigin,
+		artifactInfo:      mender.ReadArtifactInfo,
 		bootID: func() (string, error) {
 			data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 			return strings.TrimSpace(string(data)), err
@@ -265,6 +289,10 @@ func (u *Updater) checkAndCommitPendingUpdate(expectedArtifact string) (needsReb
 			"Mender pending artifact changed from %q to %q during recovery", expectedArtifact, observation.PendingArtifact))
 	}
 
+	if settled, err := u.reconcileActivation(observation); err != nil || settled {
+		return false, err
+	}
+
 	if observation.PendingVersion != "" {
 		if err := u.reconstructPendingState(observation); err != nil {
 			return false, err
@@ -281,39 +309,15 @@ func (u *Updater) checkAndCommitPendingUpdate(expectedArtifact string) (needsReb
 		if err != nil {
 			return false, u.pendingCommitError(fmt.Errorf("read running version: %w", err))
 		}
-		if !sameObservedVersion(runningVersion, observation.PendingVersion) {
+		active, err := u.pendingImageRunning()
+		if err != nil {
+			return false, u.pendingCommitError(err)
+		}
+		if !active || !sameObservedVersion(runningVersion, observation.PendingVersion) {
 			// Mender enters Before_ArtifactCommit_Enter before reboot as well as
 			// after it. Seeing the still-committed rootfs means the reboot request
 			// was interrupted; it is not a failed activation yet.
 			if sameObservedVersion(runningVersion, observation.CommittedVersion) {
-				if u.config.Component == "dbc" {
-					attempted, err := dbcstate.LoadActivationAttempt(u.activationAttempt)
-					if err == nil && attempted.Artifact == observation.PendingArtifact {
-						bootID, bootErr := u.bootID()
-						if bootErr != nil {
-							return false, u.pendingCommitError(fmt.Errorf("read current boot ID: %w", bootErr))
-						}
-						if attempted.BootID != bootID {
-							// The reboot for this activation already happened and we
-							// came back on the committed rootfs: Mender's commit-pending
-							// state is stale (the bootloader reverted or never
-							// switched). Finalise the rollback instead of rebooting
-							// forever. See librescoot-rj87.
-							if err := u.finalizeRolledBackActivation(observation); err != nil {
-								return false, err
-							}
-							return false, nil
-						}
-						// The reboot request was never completed. Clear the same-boot
-						// marker and safely retry it instead of declaring rollback.
-						if err := dbcstate.ClearActivationAttempt(u.activationAttempt); err != nil {
-							return false, u.pendingCommitError(fmt.Errorf("clear unperformed activation attempt: %w", err))
-						}
-					}
-					if err != nil && !errors.Is(err, os.ErrNotExist) {
-						return false, u.pendingCommitError(fmt.Errorf("read DBC activation attempt: %w", err))
-					}
-				}
 				u.logger.Printf("Pending artifact %s is not active yet; reboot still required", observation.PendingArtifact)
 				return true, nil
 			}
@@ -448,6 +452,17 @@ func (u *Updater) reconstructPendingState(observation mender.UpdateObservation) 
 // commitVerifiedUpdate runs the commit and proves Mender recorded it: nothing is
 // pending any more and the committed artifact is the one that was running.
 func (u *Updater) commitVerifiedUpdate(observation mender.UpdateObservation) error {
+	if settled, err := u.reconcileActivation(observation); err != nil || settled {
+		return u.pendingCommitError(fmt.Errorf("activation changed before commit (settled=%v): %v", settled, err))
+	}
+	active, err := u.pendingImageRunning()
+	if err != nil || !active {
+		return u.pendingCommitError(fmt.Errorf("pending slot is not verified running: %v", err))
+	}
+	attempt, err := dbcstate.LoadActivationAttempt(u.activationAttempt)
+	if err != nil {
+		return u.pendingCommitError(err)
+	}
 	if err := u.commitUpdate(); err != nil {
 		return u.pendingCommitError(fmt.Errorf("commit pending update: %w", err))
 	}
@@ -463,6 +478,10 @@ func (u *Updater) commitVerifiedUpdate(observation mender.UpdateObservation) err
 			verified.PendingArtifact, verified.CommittedArtifact, verified.State))
 	}
 
+	boot, err := u.bootState()
+	if err != nil || !settledBoot(boot) || boot.RunningSlot != attempt.TargetSlot || boot.OtherSlot != attempt.OriginalSlot {
+		return u.pendingCommitError(fmt.Errorf("committed boot selection is not verified: %v", err))
+	}
 	if err := u.finishVerifiedUpdate(verified.CommittedArtifact); err != nil {
 		return err
 	}
@@ -480,13 +499,13 @@ func (u *Updater) finishVerifiedUpdate(committedArtifact string) error {
 		return fmt.Errorf("publish committed update: %w", err)
 	}
 	if u.config.Component != "dbc" {
-		return nil
+		return u.completeActivation(committedArtifact)
 	}
 	if err := u.redis.PushUpdateCommand("complete-dbc"); err != nil {
 		return fmt.Errorf("complete DBC update lifecycle: %w", err)
 	}
-	if err := dbcstate.ClearActivationAttempt(u.activationAttempt); err != nil {
-		return fmt.Errorf("clear DBC activation attempt: %w", err)
+	if err := u.completeActivation(committedArtifact); err != nil {
+		return fmt.Errorf("close activation attempt: %w", err)
 	}
 	if err := u.redis.SetPendingLifecycleCompletion("dbc", ""); err != nil {
 		return fmt.Errorf("clear DBC lifecycle completion: %w", err)
@@ -494,24 +513,64 @@ func (u *Updater) finishVerifiedUpdate(committedArtifact string) error {
 	return nil
 }
 
-// finalizeRolledBackActivation closes out an update whose activation reboot
-// completed but left the DBC running the committed rootfs again: the bootloader
-// reverted (or never switched), so Mender's commit-pending state is stale.
-// Discard the pending state and stop, instead of rebooting forever.
+// finalizeRolledBackActivation only invokes rollback after proving its saved
+// destination is already the mounted and selected rootfs. Rollback is not just
+// bookkeeping: rootfs-image can change the next boot selection.
 func (u *Updater) finalizeRolledBackActivation(observation mender.UpdateObservation) error {
+	attempt, err := dbcstate.LoadActivationAttempt(u.activationAttempt)
+	if err != nil {
+		return u.pendingCommitError(err)
+	}
+	origin, err := u.activationOrigin(observation)
+	if err != nil {
+		return u.pendingCommitError(err)
+	}
+	boot, err := u.bootState()
+	if err != nil {
+		return u.pendingCommitError(err)
+	}
+	if attempt.Schema != 1 || attempt.Component != u.config.Component || attempt.Artifact != observation.PendingArtifact ||
+		attempt.CommittedArtifact != observation.CommittedArtifact || origin.OriginalSlot != attempt.OriginalSlot ||
+		!settledBoot(boot) || boot.RunningSlot != attempt.OriginalSlot || boot.OtherSlot != attempt.TargetSlot {
+		return u.pendingCommitError(fmt.Errorf("refusing rollback without corroborated fallback evidence"))
+	}
+	current, err := u.observeUpdate()
+	if err != nil {
+		return u.pendingCommitError(err)
+	}
+	runningBefore, err := u.runningVersion()
+	if err != nil || current.PendingArtifact != attempt.Artifact || current.CommittedArtifact != attempt.CommittedArtifact ||
+		current.State != observation.State || !sameObservedVersion(runningBefore, current.CommittedVersion) {
+		return u.pendingCommitError(fmt.Errorf("Mender or running image changed before rollback (%v)", err))
+	}
+	attempt.Phase = "rolling-back"
+	if err := dbcstate.SaveActivationAttempt(u.activationAttempt, attempt); err != nil {
+		return u.pendingCommitError(err)
+	}
+	if u.gateStore == nil {
+		return u.pendingCommitError(fmt.Errorf("activation quarantine unavailable"))
+	}
+	if err := u.quarantineArtifact(attempt.Artifact); err != nil {
+		return u.pendingCommitError(err)
+	}
 	if err := u.rollbackUpdate(); err != nil {
-		// Mender may already have settled the standalone state; that is fine.
-		u.logger.Printf("Mender rollback after failed DBC activation: %v", err)
+		return u.pendingCommitError(fmt.Errorf("rollback failed activation: %w", err))
 	}
-	if err := dbcstate.ClearActivationAttempt(u.activationAttempt); err != nil {
-		return u.pendingCommitError(fmt.Errorf("clear DBC activation attempt after rollback: %w", err))
+	verified, err := u.observeUpdate()
+	if err != nil {
+		return u.pendingCommitError(err)
 	}
-	if err := u.status.SetIdle(u.ctx); err != nil {
-		return u.pendingCommitError(fmt.Errorf("publish rolled-back DBC activation: %w", err))
+	boot, err = u.bootState()
+	if err != nil {
+		return u.pendingCommitError(err)
 	}
-	u.logger.Printf("DBC activation of %s rolled back to %s; not rebooting",
-		observation.PendingArtifact, observation.CommittedArtifact)
-	return nil
+	running, err := u.runningVersion()
+	if err != nil || verified.State != mender.StateNoUpdate || verified.PendingArtifact != "" ||
+		verified.CommittedArtifact != attempt.CommittedArtifact || !sameObservedVersion(running, verified.CommittedVersion) ||
+		!settledBoot(boot) || boot.RunningSlot != attempt.OriginalSlot || boot.OtherSlot != attempt.TargetSlot {
+		return u.pendingCommitError(fmt.Errorf("rollback did not leave verified committed rootfs and boot selection (%v)", err))
+	}
+	return u.finishFailedActivation(attempt, "rolled-back")
 }
 
 // completeDBCLifecycleIfSafe releases the MDB-owned lifecycle only when the
@@ -766,10 +825,9 @@ func (u *Updater) Start(rec Reconciliation) error {
 		go u.monitorDBCStateCache()
 	}
 
-	// A process crash can occur after Mender records the inactive slot but
-	// before the original reboot request. Recover that gap on the DBC without
-	// asking the MDB to cycle dashboard power.
-	if menderNeedsReboot && u.config.Component == "dbc" && !u.config.DryRun {
+	// Recover a crash after staging but before the original activation request.
+	// TriggerReboot preserves the MDB's UMS ownership and vehicle-state policy.
+	if menderNeedsReboot && !u.config.DryRun {
 		u.wg.Add(1)
 		go func() {
 			defer u.wg.Done()
@@ -779,8 +837,8 @@ func (u *Updater) Start(rec Reconciliation) error {
 				return
 			case <-time.After(time.Second):
 			}
-			if err := u.TriggerReboot("dbc", false); err != nil {
-				u.pendingCommitError(fmt.Errorf("recover pending DBC reboot: %w", err))
+			if err := u.TriggerReboot(u.config.Component, false); err != nil {
+				u.pendingCommitError(fmt.Errorf("recover pending %s reboot: %w", u.config.Component, err))
 			}
 		}()
 	}
@@ -979,6 +1037,10 @@ func (u *Updater) recoverFromStuckState(menderNeedsReboot, gateOpen bool) error 
 		}
 
 	case status.StatusError:
+		if u.hasUnresolvedActivation() {
+			u.logger.Printf("Retaining recovery error for unresolved activation")
+			return nil
+		}
 		u.logger.Printf("Clearing error status to allow retry")
 		if err := u.status.SetIdle(u.ctx); err != nil {
 			return fmt.Errorf("failed to clear error status: %w", err)
@@ -2765,6 +2827,10 @@ func (u *Updater) checkForUpdates(manual bool) {
 	// service restarts. Clear it and carry on so a transient failure costs one
 	// cycle rather than all of them.
 	if currentStatus == status.StatusError {
+		if u.hasUnresolvedActivation() {
+			u.logger.Printf("Deferring update check: activation recovery is unresolved")
+			return
+		}
 		u.logger.Printf("Component %s is in error state from a previous attempt, clearing it to retry", u.config.Component)
 		if err := u.status.SetIdle(u.ctx); err != nil {
 			u.logger.Printf("Failed to clear error status: %v", err)
@@ -4224,13 +4290,8 @@ func (u *Updater) triggerDBCLocalRebootContext(ctx context.Context, requireMende
 		if observation.PendingArtifact == "" {
 			return fmt.Errorf("refusing DBC rootfs reboot without a pending Mender artifact")
 		}
-		bootID, err := u.bootID()
-		if err != nil {
-			return fmt.Errorf("read DBC boot ID: %w", err)
-		}
-		attempt := dbcstate.ActivationAttempt{Artifact: observation.PendingArtifact, BootID: bootID}
-		if err := dbcstate.SaveActivationAttempt(u.activationAttempt, attempt); err != nil {
-			return fmt.Errorf("persist DBC activation attempt: %w", err)
+		if settled, err := u.reconcileActivation(observation); err != nil || settled {
+			return fmt.Errorf("DBC activation is not reboot-ready (settled=%v): %v", settled, err)
 		}
 	}
 

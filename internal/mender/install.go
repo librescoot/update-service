@@ -35,6 +35,8 @@ type UpdateObservation struct {
 	PendingArtifact   string
 	PendingVersion    string
 	MenderState       string
+	Failed            bool
+	RolledBack        bool
 }
 
 // VersionFromArtifact converts this project's Mender artifact names to the
@@ -267,6 +269,8 @@ func observeStatus(status *menderstatus.Status) UpdateObservation {
 	observation.PendingArtifact = status.State.ArtifactName
 	observation.PendingVersion = VersionFromArtifact(status.State.ArtifactName)
 	observation.MenderState = status.State.InState
+	observation.Failed = status.State.Failed
+	observation.RolledBack = status.State.RolledBack
 
 	switch {
 	case status.NeedsCommit() && !status.State.Failed:

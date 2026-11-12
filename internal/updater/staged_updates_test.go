@@ -14,6 +14,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 
+	"github.com/librescoot/update-service/internal/commitgate"
 	"github.com/librescoot/update-service/internal/config"
 	"github.com/librescoot/update-service/internal/inhibitor"
 	"github.com/librescoot/update-service/internal/mender"
@@ -21,6 +22,7 @@ import (
 	"github.com/librescoot/update-service/internal/power"
 	"github.com/librescoot/update-service/internal/redis"
 	"github.com/librescoot/update-service/internal/status"
+	"github.com/librescoot/update-service/internal/version"
 )
 
 // newStagedTestUpdater wires just enough of an Updater to drive the local
@@ -61,6 +63,41 @@ func newStagedTestUpdater(t *testing.T, component string) (*Updater, *miniredis.
 		logger:          logger,
 		ctx:             ctx,
 		cancel:          cancel,
+	}
+	stagedArtifact := ""
+	activationDir := t.TempDir()
+	u.activationAttempt = filepath.Join(activationDir, "activation")
+	u.gateStore = commitgate.NewStoreAt(filepath.Join(activationDir, "gate"), filepath.Join(activationDir, "quarantine"))
+	u.bootID = func() (string, error) { return "install-boot", nil }
+	u.runningVersion = func() (string, error) { return mr.HGet("version:"+component, "version_id"), nil }
+	currentArtifact := func() string { return "release-" + mr.HGet("version:"+component, "version_id") }
+	u.artifactInfo = func(path string) (*mender.ArtifactInfo, error) {
+		return &mender.ArtifactInfo{ArtifactName: "release-" + version.FromFilename(path)}, nil
+	}
+	u.bootState = func() (mender.BootState, error) {
+		b := mender.BootState{RunningSlot: "slot-a", OtherSlot: "slot-b", SelectedSlot: "slot-a"}
+		if stagedArtifact != "" {
+			b.SelectedSlot = "slot-b"
+			b.UpgradeAvailable = true
+		}
+		return b, nil
+	}
+	u.rootfsOrigin = func() (mender.RootfsOrigin, error) {
+		return mender.RootfsOrigin{OriginalSlot: "slot-a", Artifact: stagedArtifact, CommittedArtifact: currentArtifact()}, nil
+	}
+	u.observeUpdate = func() (mender.UpdateObservation, error) {
+		o := mender.UpdateObservation{State: mender.StateNoUpdate, CommittedArtifact: currentArtifact(), CommittedVersion: mr.HGet("version:"+component, "version_id")}
+		if stagedArtifact != "" {
+			o.State = mender.StateNeedsCommit
+			o.PendingArtifact = stagedArtifact
+			o.PendingVersion = mender.VersionFromArtifact(stagedArtifact)
+		}
+		return o, nil
+	}
+	u.installArtifact = func(path string, progress mender.InstallProgressCallback) error {
+		*installs = append(*installs, path)
+		stagedArtifact = "release-" + version.FromFilename(path)
+		return nil
 	}
 	// Registered after the client, so it runs first (t.Cleanup is LIFO): the
 	// heartbeat goroutine a file install starts must finish before the client

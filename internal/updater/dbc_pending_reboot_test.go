@@ -34,8 +34,12 @@ func TestTriggerRebootDBCRunsLocalReboot(t *testing.T) {
 	u.activationAttempt = filepath.Join(t.TempDir(), "activation")
 	u.bootID = func() (string, error) { return "boot-a", nil }
 	u.observeUpdate = func() (mender.UpdateObservation, error) {
-		return mender.UpdateObservation{PendingArtifact: "release-v1.4.0"}, nil
+		return mender.UpdateObservation{State: mender.StateNeedsCommit, PendingArtifact: "release-v1.4.0", PendingVersion: "v1.4.0", CommittedArtifact: "release-v1.3.1", CommittedVersion: "v1.3.1"}, nil
 	}
+	u.bootState = func() (mender.BootState, error) {
+		return mender.BootState{RunningSlot: "slot-a", OtherSlot: "slot-b", SelectedSlot: "slot-b", UpgradeAvailable: true}, nil
+	}
+	u.runningVersion = func() (string, error) { return "v1.3.1", nil }
 	mr.HSet("vehicle", "state", "stand-by")
 	if err := u.status.SetPendingReboot(u.ctx); err != nil {
 		t.Fatal(err)

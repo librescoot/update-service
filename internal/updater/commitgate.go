@@ -101,11 +101,8 @@ func (u *Updater) ReconcilePendingUpdate() (Reconciliation, error) {
 // nothing for the ordinary startup path to do, and a GatedCommit when the gate
 // must now earn the commit.
 //
-// The component shows up in three places: which units are required, whether the
-// MDB's power state is a health signal at all, and which finaliser closes out a
-// window the bootloader reverted. The DBC additionally carries an
-// activation-attempt marker from before its reboot, which the gate now owns the
-// outcome of.
+// Activation recovery verifies component identities and slots before the gate
+// can open or resume its health window.
 func (u *Updater) reconcileCommitGate() (*GatedCommit, bool, error) {
 	cfg := u.config.CommitGateSettings()
 	marker, haveMarker, err := u.loadGateMarker()
@@ -124,6 +121,9 @@ func (u *Updater) reconcileCommitGate() (*GatedCommit, bool, error) {
 		return nil, false, fmt.Errorf("observe Mender state: %w", err)
 	}
 
+	if settled, err := u.reconcileActivation(observation); err != nil || settled {
+		return nil, settled, err
+	}
 	if !haveMarker {
 		return u.openCommitGate(observation)
 	}
@@ -147,8 +147,12 @@ func (u *Updater) reconcileCommitGate() (*GatedCommit, bool, error) {
 		return nil, false, u.pendingCommitError(fmt.Errorf("read running version: %w", err))
 	}
 
+	active, err := u.pendingImageRunning()
+	if err != nil {
+		return nil, false, u.pendingCommitError(err)
+	}
 	if marker.BootID != bootID {
-		if sameObservedVersion(running, observation.CommittedVersion) {
+		if !active && sameObservedVersion(running, observation.CommittedVersion) {
 			return nil, true, u.finalizeRevertedGate(marker, observation)
 		}
 		if marker.RollbackAttempted {
@@ -166,7 +170,7 @@ func (u *Updater) reconcileCommitGate() (*GatedCommit, bool, error) {
 		}
 	}
 
-	if !sameObservedVersion(running, observation.PendingVersion) {
+	if !active || !sameObservedVersion(running, observation.PendingVersion) {
 		// Same boot, committed slot: the reboot for this activation never
 		// happened. The interrupted-reboot decision belongs to the ordinary
 		// recovery path, which owns it for every boot, gated or not.
@@ -198,7 +202,11 @@ func (u *Updater) openCommitGate(observation mender.UpdateObservation) (*GatedCo
 		// own error code and recovery.
 		return nil, false, nil
 	}
-	if !sameObservedVersion(running, observation.PendingVersion) {
+	active, err := u.pendingImageRunning()
+	if err != nil {
+		return nil, false, u.pendingCommitError(err)
+	}
+	if !active || !sameObservedVersion(running, observation.PendingVersion) {
 		return nil, false, nil
 	}
 	if err := u.reconstructPendingState(observation); err != nil {
@@ -458,13 +466,8 @@ func (u *Updater) rollbackGatedUpdate(marker commitgate.Marker, reason string) e
 		return u.holdGatedUpdate(marker, reason, "cannot record the rollback attempt")
 	}
 
-	if err := u.quarantineArtifact(marker.Artifact); err != nil {
-		u.logger.Printf("Commit gate cannot quarantine %s: %v", marker.Artifact, err)
-	}
-	if err := u.rollbackUpdate(); err != nil {
-		// Mender may have settled the standalone state already; the reboot and
-		// the boot-ID comparison on the next boot are what decide the outcome.
-		u.logger.Printf("Mender rollback after a failed gate window: %v", err)
+	if err := u.rollbackGateArtifact(marker.Artifact); err != nil {
+		return u.holdGatedUpdate(marker, reason, fmt.Sprintf("cannot verify gate rollback: %v", err))
 	}
 	if err := u.status.SetError(u.ctx, gateErrorRollback, reason); err != nil {
 		u.logger.Printf("Failed to publish the commit gate rollback: %v", err)
@@ -481,28 +484,13 @@ func (u *Updater) rollbackGatedUpdate(marker commitgate.Marker, reason string) e
 	return nil
 }
 
-// finalizeRevertedGate closes out a window the bootloader ended by reverting to
-// the previously committed slot. Mender's standalone state is stale in that
-// case, and nothing else can clear it: the generic recovery path answers
-// "reboot still required", and no MDB path ever reboots.
+// finalizeRevertedGate closes a window only after verified fallback cleanup.
 func (u *Updater) finalizeRevertedGate(marker commitgate.Marker, observation mender.UpdateObservation) error {
 	if err := u.quarantineArtifact(marker.Artifact); err != nil {
 		u.logger.Printf("Commit gate cannot quarantine the reverted artifact %s: %v", marker.Artifact, err)
 	}
-	if u.config.Component == "dbc" {
-		// The activation-attempt marker from before the reboot is the other half
-		// of this window's record, and the DBC finaliser already owns closing it:
-		// it rolls Mender back, clears that marker and publishes idle together.
-		if err := u.finalizeRolledBackActivation(observation); err != nil {
-			return err
-		}
-	} else {
-		if err := u.rollbackUpdate(); err != nil {
-			u.logger.Printf("Mender rollback after a reverted gate window: %v", err)
-		}
-		if err := u.status.SetIdle(u.ctx); err != nil {
-			return u.pendingCommitError(fmt.Errorf("publish reverted gate window: %w", err))
-		}
+	if err := u.finalizeRolledBackActivation(observation); err != nil {
+		return err
 	}
 	if err := u.clearGateMarker(); err != nil {
 		return u.pendingCommitError(fmt.Errorf("clear reverted commit gate marker: %w", err))
@@ -512,9 +500,8 @@ func (u *Updater) finalizeRevertedGate(marker commitgate.Marker, observation men
 	return nil
 }
 
-// finalizeStuckGate ends an attempt whose rollback never landed: the vehicle is
-// running the image the gate rejected. Rebooting again would loop, so clear the
-// pending state, keep the artifact out of reinstalls, and report.
+// finalizeStuckGate retains an attempt whose rollback never landed. Rebooting
+// again would loop; another rollback would discard evidence of the failure.
 func (u *Updater) finalizeStuckGate(marker commitgate.Marker, reason string) error {
 	if err := u.holdGatedUpdate(marker, reason, reason); err != nil {
 		return err
@@ -523,26 +510,14 @@ func (u *Updater) finalizeStuckGate(marker commitgate.Marker, reason string) err
 	return nil
 }
 
-// holdGatedUpdate is the outcome for a rollback that cannot be carried out or
-// recorded: stop, keep the artifact quarantined, and leave an error status that
-// the next startup clears so the artifact can be retried by a newer release.
+// holdGatedUpdate stops an unverified rollback without erasing its evidence.
+// A later startup must reconcile the durable state before allowing installs.
 func (u *Updater) holdGatedUpdate(marker commitgate.Marker, reason, detail string) error {
 	if err := u.quarantineArtifact(marker.Artifact); err != nil {
 		u.logger.Printf("Commit gate cannot quarantine %s: %v", marker.Artifact, err)
 	}
-	if err := u.rollbackUpdate(); err != nil {
-		u.logger.Printf("Mender rollback while holding a gated update: %v", err)
-	}
-	if err := u.clearGateMarker(); err != nil {
-		u.logger.Printf("Commit gate cannot clear its marker: %v", err)
-	}
-	// The gate has decided this activation's outcome, so the DBC's record of
-	// having asked for it must go too: left behind it would outlive its purpose
-	// and, being read only in the pending-commit branch, would never be examined
-	// again either.
-	if err := u.clearActivationMarker(); err != nil {
-		u.logger.Printf("Commit gate cannot clear the DBC activation attempt: %v", err)
-	}
+	// An unverified rollback must retain both durable records. Retrying a
+	// destructive command or clearing evidence here can hide a slot mismatch.
 	message := reason
 	if detail != "" && detail != reason {
 		message = fmt.Sprintf("%s: %s", reason, detail)
@@ -592,13 +567,7 @@ func (u *Updater) pruneCommitGateQuarantine() {
 	}
 }
 
-// clearActivationMarker closes the DBC activation-attempt record. The gate owns
-// that record's outcome while a window is open, and there is no such record on
-// the MDB.
 func (u *Updater) clearActivationMarker() error {
-	if u.config.Component != "dbc" {
-		return nil
-	}
 	return dbcstate.ClearActivationAttempt(u.activationAttempt)
 }
 

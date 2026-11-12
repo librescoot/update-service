@@ -49,6 +49,7 @@ type gateHarness struct {
 	bootID     string
 	running    string
 	committed  string
+	rolledBack bool
 	runningErr error
 }
 
@@ -107,6 +108,23 @@ func newGateHarnessFor(t *testing.T, component string, opts ...func(*gateHarness
 			h.trialBoots++
 			return nil
 		},
+		bootState: func() (mender.BootState, error) {
+			b := mender.BootState{RunningSlot: "slot-b", OtherSlot: "slot-a", SelectedSlot: "slot-b", UpgradeAvailable: h.committed != gateArtifact && !h.rolledBack}
+			if h.rolledBack {
+				b.SelectedSlot = "slot-a"
+			}
+			if h.running == gatePrevious {
+				b.RunningSlot, b.OtherSlot = "slot-a", "slot-b"
+				if h.bootID != gateBootA || h.rolledBack {
+					b.SelectedSlot = "slot-a"
+					b.UpgradeAvailable = false
+				}
+			}
+			return b, nil
+		},
+		rootfsOrigin: func() (mender.RootfsOrigin, error) {
+			return mender.RootfsOrigin{OriginalSlot: "slot-a", Artifact: gateArtifact, CommittedArtifact: "release-" + gatePrevious}, nil
+		},
 		bootID: func() (string, error) { return h.bootID, nil },
 		runningVersion: func() (string, error) {
 			return h.running, h.runningErr
@@ -116,6 +134,7 @@ func newGateHarnessFor(t *testing.T, component string, opts ...func(*gateHarness
 		rollbackUpdate: func() error {
 			h.rollbacks++
 			h.committed = ""
+			h.rolledBack = true
 			return nil
 		},
 	}
@@ -131,6 +150,9 @@ func newGateHarnessFor(t *testing.T, component string, opts ...func(*gateHarness
 // commit for gateArtifact while it is staged, and nothing once it is committed
 // or rolled back.
 func (h *gateHarness) observation() mender.UpdateObservation {
+	if h.rolledBack {
+		return mender.UpdateObservation{State: mender.StateNoUpdate, CommittedArtifact: "release-" + gatePrevious, CommittedVersion: gatePrevious}
+	}
 	if h.committed == gateArtifact {
 		return mender.UpdateObservation{
 			State:             mender.StateNoUpdate,
@@ -620,8 +642,8 @@ func TestSecondBootAfterAnAttemptedRollbackDoesNotRebootAgain(t *testing.T) {
 	if h.reboots != 0 {
 		t.Fatalf("reboot requests = %d, want 0: an unlanded rollback must not loop", h.reboots)
 	}
-	if h.rollbacks != 1 {
-		t.Fatalf("rollback calls = %d, want 1", h.rollbacks)
+	if h.rollbacks != 0 {
+		t.Fatalf("rollback calls = %d, want 0: do not repeat an unverified rollback", h.rollbacks)
 	}
 	if got := h.gateField("error:mdb"); got != gateErrorStuck {
 		t.Errorf("error:mdb = %q, want %q", got, gateErrorStuck)
@@ -629,8 +651,8 @@ func TestSecondBootAfterAnAttemptedRollbackDoesNotRebootAgain(t *testing.T) {
 	if got := h.gateField("commit-gate:mdb"); got != gateStateRollbackStuck {
 		t.Errorf("commit-gate:mdb = %q, want %q", got, gateStateRollbackStuck)
 	}
-	if _, err := h.store.Load(); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the marker should be cleared so this cannot repeat, got err=%v", err)
+	if _, err := h.store.Load(); err != nil {
+		t.Errorf("the marker must retain the unverified rollback evidence: %v", err)
 	}
 }
 
@@ -661,8 +683,8 @@ func TestRevertedGateWindowFinalisesWithoutRebooting(t *testing.T) {
 	if h.rollbacks != 1 {
 		t.Fatalf("rollback calls = %d, want 1: Mender's stale state must be cleared", h.rollbacks)
 	}
-	if got := h.gateField("status:mdb"); got != "idle" {
-		t.Errorf("status:mdb = %q, want idle", got)
+	if got := h.gateField("status:mdb"); got != "error" {
+		t.Errorf("status:mdb = %q, want error", got)
 	}
 	if got := h.gateField("commit-gate:mdb"); got != gateStateRolledBack {
 		t.Errorf("commit-gate:mdb = %q, want %q", got, gateStateRolledBack)
@@ -1070,7 +1092,7 @@ func (h *gateHarness) saveActivation(t *testing.T) {
 	t.Helper()
 	if err := dbcstate.SaveActivationAttempt(h.updater.activationAttempt, dbcstate.ActivationAttempt{
 		Artifact: gateArtifact,
-		BootID:   gateBootA,
+		BootID:   "install-boot",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1207,18 +1229,17 @@ func TestRevertedGateWindowOnTheDBCClosesTheActivationAttempt(t *testing.T) {
 	if _, err := h.store.Load(); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("gate marker should be cleared, got err=%v", err)
 	}
-	if got := h.redis.HGet("ota", "status:dbc"); got != "idle" {
-		t.Errorf("status:dbc = %q, want idle", got)
+	if got := h.redis.HGet("ota", "status:dbc"); got != "error" {
+		t.Errorf("status:dbc = %q, want error", got)
 	}
 	if quarantined, err := h.store.Quarantined(gateArtifact); err != nil || !quarantined {
 		t.Errorf("the reverted artifact should be quarantined, got %v (err %v)", quarantined, err)
 	}
 }
 
-// A second boot still on the pending artifact after a requested rollback: the
-// DBC activation record has to go too, or it would outlive the gate's decision
-// and never be examined again.
-func TestStuckGateOnTheDBCClosesTheActivationAttempt(t *testing.T) {
+// A second boot still on the pending artifact after a requested rollback must
+// retain both records and must not issue another destructive retry.
+func TestStuckGateOnTheDBCRetainsActivationEvidence(t *testing.T) {
 	h := newGateHarnessFor(t, "dbc")
 	h.bootID = gateBootB
 	h.saveActivation(t)
@@ -1236,17 +1257,17 @@ func TestStuckGateOnTheDBCClosesTheActivationAttempt(t *testing.T) {
 	if h.reboots != 0 {
 		t.Errorf("reboot requests = %d, want 0: an unlanded rollback must not loop", h.reboots)
 	}
-	if h.rollbacks != 1 {
-		t.Errorf("rollback calls = %d, want 1", h.rollbacks)
+	if h.rollbacks != 0 {
+		t.Errorf("rollback calls = %d, want 0", h.rollbacks)
 	}
-	if h.activationOpen() {
-		t.Error("the activation attempt must be closed when the gate holds")
+	if !h.activationOpen() {
+		t.Error("the activation attempt must retain unverified rollback evidence")
 	}
 	if got := h.redis.HGet("ota", "error:dbc"); got != gateErrorStuck {
 		t.Errorf("error:dbc = %q, want %q", got, gateErrorStuck)
 	}
-	if _, err := h.store.Load(); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("gate marker should be cleared, got err=%v", err)
+	if _, err := h.store.Load(); err != nil {
+		t.Errorf("gate marker must retain unverified rollback evidence: %v", err)
 	}
 }
 
