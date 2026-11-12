@@ -51,6 +51,7 @@ func buildArtifact(t *testing.T, deviceTypes []string, payloadName string, paylo
 	t.Helper()
 
 	hi := headerInfo{}
+	hi.ArtifactProvides.ArtifactName = "release-v1.4.0"
 	hi.ArtifactDepends.DeviceType = deviceTypes
 	hiJSON, err := json.Marshal(hi)
 	if err != nil {
@@ -87,6 +88,9 @@ func TestReadArtifactInfo(t *testing.T) {
 	info, err := ReadArtifactInfo(path)
 	if err != nil {
 		t.Fatalf("ReadArtifactInfo: %v", err)
+	}
+	if got, want := info.ArtifactName, "release-v1.4.0"; got != want {
+		t.Errorf("ArtifactName = %q, want %q", got, want)
 	}
 	if got, want := info.PayloadSize, int64(4096); got != want {
 		t.Errorf("PayloadSize = %d, want %d", got, want)

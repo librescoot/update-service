@@ -20,6 +20,8 @@ var ErrArtifactTooLarge = errors.New("rootfs payload does not fit the target par
 // ArtifactInfo holds the parts of a Mender artifact we inspect before handing
 // the file to mender-update.
 type ArtifactInfo struct {
+	// ArtifactName is the exact identity recorded by Mender on installation.
+	ArtifactName string
 	// DeviceTypes is artifact_depends.device_type from header-info. Present
 	// for completeness; mender-update enforces it itself, see
 	// ArtifactMatchesContext in the client's context.cpp.
@@ -33,6 +35,9 @@ type ArtifactInfo struct {
 
 // headerInfo mirrors the fields we read out of header-info.
 type headerInfo struct {
+	ArtifactProvides struct {
+		ArtifactName string `json:"artifact_name"`
+	} `json:"artifact_provides"`
 	ArtifactDepends struct {
 		DeviceType []string `json:"device_type"`
 	} `json:"artifact_depends"`
@@ -67,11 +72,12 @@ func ReadArtifactInfo(path string) (*ArtifactInfo, error) {
 
 		switch {
 		case hdr.Name == "header.tar.gz":
-			types, err := readDeviceTypes(tr)
+			header, err := readArtifactHeader(tr)
 			if err != nil {
 				return nil, err
 			}
-			info.DeviceTypes = types
+			info.ArtifactName = header.ArtifactProvides.ArtifactName
+			info.DeviceTypes = header.ArtifactDepends.DeviceType
 			sawHeader = true
 
 		case strings.HasPrefix(hdr.Name, "data/0000."):
@@ -98,11 +104,11 @@ func ReadArtifactInfo(path string) (*ArtifactInfo, error) {
 	return info, nil
 }
 
-// readDeviceTypes pulls artifact_depends.device_type out of header.tar.gz.
-func readDeviceTypes(r io.Reader) ([]string, error) {
+// readArtifactHeader reads the identity and device types from header.tar.gz.
+func readArtifactHeader(r io.Reader) (headerInfo, error) {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
-		return nil, fmt.Errorf("open header.tar.gz: %w", err)
+		return headerInfo{}, fmt.Errorf("open header.tar.gz: %w", err)
 	}
 	defer gz.Close()
 
@@ -110,19 +116,19 @@ func readDeviceTypes(r io.Reader) ([]string, error) {
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return nil, errors.New("header.tar.gz has no header-info")
+			return headerInfo{}, errors.New("header.tar.gz has no header-info")
 		}
 		if err != nil {
-			return nil, fmt.Errorf("read header.tar.gz: %w", err)
+			return headerInfo{}, fmt.Errorf("read header.tar.gz: %w", err)
 		}
 		if hdr.Name != "header-info" {
 			continue
 		}
 		var hi headerInfo
 		if err := json.NewDecoder(tr).Decode(&hi); err != nil {
-			return nil, fmt.Errorf("parse header-info: %w", err)
+			return headerInfo{}, fmt.Errorf("parse header-info: %w", err)
 		}
-		return hi.ArtifactDepends.DeviceType, nil
+		return hi, nil
 	}
 }
 
