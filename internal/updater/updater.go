@@ -55,6 +55,8 @@ type Updater struct {
 	bootState         func() (mender.BootState, error)
 	rootfsOrigin      func() (mender.RootfsOrigin, error)
 	artifactInfo      func(string) (*mender.ArtifactInfo, error)
+	readV2Marker      func() ([]byte, error)
+	checkV2Decoder    func() error
 	// Commit gate. gateEvaluate is nil in production and falls back to
 	// evaluateCommitGateProbes; the gate tests substitute it, as they do
 	// observeUpdate and runningVersion above.
@@ -235,6 +237,8 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		bootState:         func() (mender.BootState, error) { return mender.ReadBootState(updaterCtx) },
 		rootfsOrigin:      mender.ReadRootfsOrigin,
 		artifactInfo:      mender.ReadArtifactInfo,
+		readV2Marker:      readV2Marker,
+		checkV2Decoder:    checkV2Decoder,
 		bootID: func() (string, error) {
 			data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 			return strings.TrimSpace(string(data)), err
@@ -254,6 +258,7 @@ func New(ctx context.Context, cfg *config.Config, redisClient *redis.Client, inh
 		checkIntervalChanged: make(chan struct{}, 1),
 	}
 
+	u.githubAPI.selectBaseURL = u.releaseFeedBase
 	u.localBootUpdate = u.performLocalBootUpdate
 
 	// Initialize update method from Redis

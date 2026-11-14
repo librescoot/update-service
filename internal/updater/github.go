@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -37,10 +38,11 @@ type Release struct {
 
 // GitHubAPI handles fetching release data from a release index
 type GitHubAPI struct {
-	ctx     context.Context
-	baseURL string
-	client  *http.Client
-	logger  Logger
+	ctx           context.Context
+	baseURL       string
+	selectBaseURL func(string) string
+	client        *http.Client
+	logger        Logger
 }
 
 // Logger interface for logging
@@ -106,16 +108,23 @@ func (g *GitHubAPI) fetch(ctx context.Context, name string, out any) error {
 		lastError error
 	)
 
-	// Create the request outside the retry loop
-	url := g.baseURL + "/" + name
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	baseURL := g.baseURL
+	if g.selectBaseURL != nil {
+		baseURL = g.selectBaseURL(baseURL)
+	}
+	newRequest := func(base string) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(base, "/")+"/"+name, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "librescoot-update-service")
+		return req, nil
+	}
+	req, err := newRequest(baseURL)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
-
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "librescoot-update-service")
 
 	// Retry loop with exponential backoff
 	for retries <= maxRetries {
@@ -126,6 +135,17 @@ func (g *GitHubAPI) fetch(ctx context.Context, name string, out any) error {
 
 		// Make the request
 		resp, err = g.client.Do(req)
+		// The bridge may boot before v2 is published. A missing v2 document
+		// falls back to the legacy feed, which remains gzip-compatible.
+		if err == nil && resp.StatusCode == http.StatusNotFound && baseURL != g.baseURL {
+			_ = resp.Body.Close()
+			baseURL = g.baseURL
+			req, err = newRequest(baseURL)
+			if err != nil {
+				return fmt.Errorf("create legacy feed request: %w", err)
+			}
+			continue
+		}
 
 		// If request succeeded
 		if err == nil && resp.StatusCode == http.StatusOK {

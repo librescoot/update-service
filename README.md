@@ -70,6 +70,12 @@ Running versions are read from `version:<component>` field `version_id`; the rel
 
 Boot status recovery runs independently of settled rootfs status at startup. A successful DBC boot flash retains the DBC lifecycle and heartbeat while waiting for a standby-gated local reboot. Recovery emits `complete-dbc` and clears `pending-reboot` only after the DBC boot identity changes; a same-boot service restart resumes the reboot wait. A legacy pending status without an identity gets a fresh local reboot rather than being assumed complete. An interrupted DBC boot flash left in `installing` remains unresolved. MDB reboot still requires terminal DBC rootfs and boot statuses, a finished DBC lifecycle, and dashboard power off.
 
+### Versioned release feed
+
+The official release index has a legacy feed at `/releases` and a new feed at `/releases/v2`. Each board switches independently: the updater requires the v2 image marker to name the exact committed Mender artifact, the running version to match that artifact, no pending Mender update or unresolved activation record, and a native `zstd` executable. The marker is installed in the rootfs by an image built with this feed-aware updater. A separately replaced updater binary or an intermediate delta-chain hop does not establish that the bridge image booted and committed.
+
+Before the v2 index is published, a `404` for a v2 document falls back to the legacy feed. Other errors follow normal retry handling. Explicitly configured non-default release URLs are left unchanged. The bridge full images and the legacy index must remain gzip-compatible, and the legacy index must be capped at the appropriate channel bridge before any future zstd-only `.mender` is published.
+
 ### Activation recovery
 
 Both components atomically save `/data/ota/<component>-activation-attempt` before calling Mender, with a unique attempt ID, exact incoming and committed artifact names, originating kernel boot ID, original and target rootfs slots, and install phase. The record covers full images, assembled deltas and UMS installs. UMS delegates installation to update-service and owns its MDB reboot; it does not need a separate activation record. Startup retries an interrupted activation request through the existing vehicle-state and UMS ownership checks.
