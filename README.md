@@ -74,7 +74,7 @@ Boot status recovery runs independently of settled rootfs status at startup. A s
 
 The official release index has a legacy feed at `/releases` and a new feed at `/releases/v2`. Each board switches independently: the updater requires the v2 image marker to name the exact committed Mender artifact, the running version to match that artifact, no pending Mender update or unresolved activation record, and a native `zstd` executable. The marker is installed in the rootfs by an image built with this feed-aware updater. A separately replaced updater binary or an intermediate delta-chain hop does not establish that the bridge image booted and committed.
 
-Before the v2 index is published, a `404` for a v2 document falls back to the legacy feed. Other errors follow normal retry handling. Explicitly configured non-default release URLs are left unchanged. The bridge full images and the legacy index must remain gzip-compatible, and the legacy index must be capped at the appropriate channel bridge before any future zstd-only `.mender` is published.
+Once the bridge is committed and v2 is selected, a missing v2 document is an error and follows normal bounded retry handling; the updater does not fall back to legacy. The v2 index must therefore be published before a feed-aware bridge is offered. Explicitly configured non-default release URLs are left unchanged. The bridge full images and the legacy index must remain gzip-compatible, and the legacy index must be capped at the appropriate channel bridge before any future zstd-only `.mender` is published.
 
 ### Activation recovery
 

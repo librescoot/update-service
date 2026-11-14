@@ -135,18 +135,6 @@ func (g *GitHubAPI) fetch(ctx context.Context, name string, out any) error {
 
 		// Make the request
 		resp, err = g.client.Do(req)
-		// The bridge may boot before v2 is published. A missing v2 document
-		// falls back to the legacy feed, which remains gzip-compatible.
-		if err == nil && resp.StatusCode == http.StatusNotFound && baseURL != g.baseURL {
-			_ = resp.Body.Close()
-			baseURL = g.baseURL
-			req, err = newRequest(baseURL)
-			if err != nil {
-				return fmt.Errorf("create legacy feed request: %w", err)
-			}
-			continue
-		}
-
 		// If request succeeded
 		if err == nil && resp.StatusCode == http.StatusOK {
 			defer resp.Body.Close()

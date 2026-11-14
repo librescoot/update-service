@@ -1,12 +1,15 @@
 package updater
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/librescoot/update-service/internal/dbcstate"
 	"github.com/librescoot/update-service/internal/mender"
@@ -67,26 +70,28 @@ func TestOfficialFeedRequiresCommittedBridge(t *testing.T) {
 	}
 }
 
-func TestMissingV2FallsBackToLegacy(t *testing.T) {
-	var paths []string
+func TestMissingV2NeverFallsBackToLegacy(t *testing.T) {
+	var v2Requests, legacyRequests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		paths = append(paths, r.URL.Path)
 		if r.URL.Path == "/v2/latest.json" {
+			v2Requests.Add(1)
 			http.NotFound(w, r)
 			return
 		}
+		legacyRequests.Add(1)
 		_, _ = w.Write([]byte(`{"stable":{"tag_name":"v1.4.3"}}`))
 	}))
 	defer srv.Close()
 	u, _ := newPendingCommitUpdater(t)
 	api := NewGitHubAPI(u.ctx, srv.URL, u.logger)
 	api.selectBaseURL = func(base string) string { return base + "/v2" }
-	got, err := api.GetLatestByChannel()
-	if err != nil || got["stable"].TagName != "v1.4.3" {
-		t.Fatalf("legacy fallback %v %v", got, err)
+	ctx, cancel := context.WithTimeout(u.ctx, 100*time.Millisecond)
+	defer cancel()
+	if _, err := api.GetLatestByChannelContext(ctx); err == nil {
+		t.Fatal("a missing v2 feed must fail the update check")
 	}
-	if len(paths) != 2 || paths[0] != "/v2/latest.json" || paths[1] != "/latest.json" {
-		t.Fatal(paths)
+	if v2Requests.Load() != 1 || legacyRequests.Load() != 0 {
+		t.Fatalf("requests: v2=%d legacy=%d", v2Requests.Load(), legacyRequests.Load())
 	}
 }
 
