@@ -187,9 +187,9 @@ func TestZstdWithoutToolIsRefused(t *testing.T) {
 }
 
 // buildChainFixture writes a base artifact in the requested payload format and a
-// delta from it to a changed rootfs. The delta names the payload
-// data/0000.tar.gz whatever the artifacts use, the way the generator does.
-func buildChainFixture(t *testing.T, dir string, format PayloadFormat) (base, delta string, newRootfs []byte, newTar []byte) {
+// delta from it to a changed rootfs. The change name is the target artifact's
+// member, which can differ from the base compression.
+func buildChainFixture(t *testing.T, dir string, format PayloadFormat, changeName string) (base, delta string, newRootfs []byte, newTar []byte) {
 	t.Helper()
 	oldRootfs := bytes.Repeat([]byte("old rootfs block "), 30000)
 	newRootfs = append(bytes.Clone(oldRootfs), []byte("and something new")...)
@@ -225,7 +225,7 @@ func buildChainFixture(t *testing.T, dir string, format PayloadFormat) (base, de
 		NewPayloadChecksum: hexSum(newRootfs),
 		Version:            3,
 		Changes: map[string]ChangeInfo{
-			"data/0000.tar.gz": {
+			changeName: {
 				Type:    "modified",
 				Patch:   "data_0000.tar.gz.xdelta",
 				OldMeta: FileMeta{Compressed: true, DecompressedSize: int64(len(oldTar))},
@@ -252,13 +252,20 @@ func buildChainFixture(t *testing.T, dir string, format PayloadFormat) (base, de
 
 func TestApplyChainKeepsBasePayloadFormat(t *testing.T) {
 	requireTools(t, "xdelta3", "gzip", "tar")
-	for _, format := range []PayloadFormat{PayloadGzip, PayloadZstd} {
-		t.Run(string(format), func(t *testing.T) {
+	for _, tc := range []struct {
+		format     PayloadFormat
+		changeName string
+	}{
+		{PayloadGzip, "data/0000.tar.gz"}, {PayloadGzip, "data/0000.tar.zst"},
+		{PayloadZstd, "data/0000.tar.gz"}, {PayloadZstd, "data/0000.tar.zst"},
+	} {
+		format := tc.format
+		t.Run(string(format)+"/"+filepath.Ext(tc.changeName), func(t *testing.T) {
 			if format == PayloadZstd {
 				requireTools(t, "zstd")
 			}
 			dir := t.TempDir()
-			base, delta, _, newTar := buildChainFixture(t, dir, format)
+			base, delta, _, newTar := buildChainFixture(t, dir, format, tc.changeName)
 			out := filepath.Join(dir, "out.mender")
 			if err := testApplier().ApplyChain(context.Background(), base, []string{delta}, out, func(int, string) {}); err != nil {
 				t.Fatal(err)
